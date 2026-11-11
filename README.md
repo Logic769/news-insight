@@ -205,15 +205,32 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 -
 | `runs` | 每次批处理的统计 |
 | `analysis_jobs` | 异步分析作业状态与结果（`queued`/`running`/`succeeded`/`failed`） |
 
-## 测试
+## 测试与 CI
 
 ```bash
-# 宿主机（需要 pip install -e ".[dev]"）
+# 宿主机（dev 依赖已固定 ruff/mypy/pyyaml 版本，与 CI 一致）
+pip install -e ".[dev]"
+ruff check .
+mypy
+python tools/yaml_lint.py   # 与 CI 的 yaml lint job 跑同一份脚本
 pytest -q
 
-# 或在镜像里跑（tests/ 不进镜像，必须挂载；镜像也不带 pytest）
-docker compose run --rm -v "$(pwd)/tests:/app/tests" --entrypoint sh insight -c "pip install --user -q pytest && python -m pytest tests -q"
+# 或在镜像里跑（tests/ 与 tools/ 不进镜像，必须挂载；镜像也不带 pytest）
+docker compose run --rm -v "$(pwd)/tests:/app/tests" -v "$(pwd)/tools:/app/tools" \
+  --entrypoint sh insight -c "pip install --user -q pytest pyyaml && python -m pytest tests -q"
 ```
+
+`.github/workflows/ci.yml` 在 PR 与 master 推送时跑三个 job，全部为合并前必须通过的检查：
+
+| job | 内容 |
+| --- | --- |
+| `python 3.10`–`3.14` | compileall + ruff + mypy（仅 3.12）+ pytest，五个版本矩阵 |
+| `yaml lint` | 用 `tools/yaml_lint.py` 解析仓库内所有 YAML：拒绝重复映射键、支持多文档、不误杀 `<<` 合并键 |
+| `docker build + container smoke` | 构建镜像、容器内跑 pytest、启动容器请求 `/health` |
+
+配合仓库规则集 `pr-protection`（`master`）：禁止删除分支与强推、要求上述 7 个 GitHub Actions 检查全绿、要求所有 review thread 已解决、CodeRabbit 机器人为必过检查。`required_approving_review_count` 为 0——GitHub 不允许仓库所有者批准自己的 PR，若设为 1 会让单人维护的 PR 永久卡住。
+
+规则集保留了 `bypass_actors`（RepositoryRole / always），单人维护时只有这一条路可走。允许 bypass 的情形仅限：**CodeRabbit 侧故障或配额耗尽导致 required check 永久 pending**，且此时必须人工确认本地 `ruff check .`、`mypy`、`pytest -q` 与 `docker build` 全部通过后再合入。GitHub Actions 的 7 个检查不允许 bypass——它们是本地可复现的。
 
 覆盖：日期归一（绝对/相对/跨年/月底/无基准）、闭集守卫（词表外丢弃、去重、max_tags）、demo 模式端到端（打标 + 申报抽取 + `due_before` 查询）、申报准备清单（规则顺序、`excerpt` 原文定位校验、「LLM 不可用 → 规则」降级、清单端点 404/200）、重跑幂等。
 

@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 import httpx
 
@@ -71,7 +72,7 @@ class NewsArticle:
         return (self.raw_content or self.content or "").strip()
 
     @classmethod
-    def from_payload(cls, row: dict[str, Any]) -> "NewsArticle":
+    def from_payload(cls, row: dict[str, Any]) -> NewsArticle:
         return cls(
             id=str(row.get("id") or ""),
             source=str(row.get("source") or ""),
@@ -114,7 +115,12 @@ class NewsClient:
 
     def _live_list(self, page: int, page_size: int, order: str) -> dict[str, Any]:
         url = f"{self.settings.news_base_url}/v1/articles"
-        params = {"status": "ok", "page": page, "page_size": page_size, "order": order}
+        params: dict[str, str | int] = {
+            "status": "ok",
+            "page": page,
+            "page_size": page_size,
+            "order": order,
+        }
         try:
             resp = self._client().get(url, params=params, headers=self._headers())
         except httpx.HTTPError as exc:  # network/DNS/timeout
@@ -180,7 +186,7 @@ class NewsClient:
 
         try:
             page_size = max(1, min(max(limit, self.settings.news_page_size), _MAX_PAGE_SIZE))
-            rows: list[dict[str, Any]] = []
+            rows = []
             page = 1
             while len(rows) < offset + limit:
                 payload = self._live_list(page=page, page_size=page_size, order="published_desc")
