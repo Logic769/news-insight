@@ -1,0 +1,122 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一 PR 的连续推送只保留最新一次，避免排队烧 runner。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-checks:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q app tests
+
+      # 规则集与排除项在 pyproject.toml 的 [tool.ruff] 中，CI 与本地保持一致。
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: Mypy
+        if: matrix.python-version == '3.12'
+        run: python -m mypy
+
+      # 全部用例离线：LLM 与上游 HTTP 都在测试里被替身替换，不消耗额度。
+      - name: Pytest
+        run: python -m pytest -q -p no:cacheprovider
+
+  yaml-lint:
+    name: yaml lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate YAML files
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+          python - <<'PY'
+          import pathlib, sys, yaml
+          bad = []
+          for path in sorted(pathlib.Path(".").rglob("*.yml")) + sorted(pathlib.Path(".").rglob("*.yaml")):
+              if any(p in {".git", "backups", "data", "data_live"} for p in path.parts):
+                  continue
+              try:
+                  yaml.safe_load(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  bad.append(f"{path}: {exc}")
+          print("\n".join(bad) if bad else "all YAML files parsed")
+          sys.exit(1 if bad else 0)
+          PY
+
+  docker-build:
+    name: docker build + container smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate compose config
+        run: docker compose config >/dev/null
+
+      - name: Build image
+        run: docker build -t news-insight:ci .
+
+      - name: Container healthcheck and tests
+        run: |
+          # 容器内没有 pytest：用一次性覆盖层装依赖，避免把测试依赖塞进生产镜像。
+          docker run --rm \
+            -v "$PWD/tests:/app/tests:ro" \
+            -e DATA_DIR=/tmp/data \
+            news-insight:ci sh -c "
+              pip install --no-cache-dir -q pytest &&
+              python -m pytest -q -p no:cacheprovider /app/tests
+            "
+
+      - name: Container boots and serves /health
+        run: |
+          docker run -d --name insight-ci -p 18020:8020 -e DATA_DIR=/tmp/data news-insight:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18020/health >/dev/null 2>&1; then
+              echo "health OK"
+              curl -sS http://127.0.0.1:18020/health
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "container never became healthy"
+          docker logs insight-ci
+          exit 1

@@ -12,9 +12,10 @@ import datetime as dt
 import json
 import logging
 import sqlite3
+from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 LOG = logging.getLogger("news_insight.db")
 
@@ -241,7 +242,9 @@ def analyzed_ids(conn: sqlite3.Connection) -> set[str]:
 def record_run_start(conn: sqlite3.Connection, mode: str) -> int:
     cur = conn.execute("INSERT INTO runs (started_at, mode) VALUES (?,?)", (_now(), mode))
     conn.commit()
-    return int(cur.lastrowid)
+    # lastrowid 在 sqlite3 的类型存根里是 int | None；INSERT 成功后必然有值。
+    assert cur.lastrowid is not None
+    return cur.lastrowid
 
 
 def record_run_finish(

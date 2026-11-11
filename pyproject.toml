@@ -17,7 +17,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# 版本与 CI（.github/workflows/ci.yml）保持一致，避免本地与 CI 结论不同。
+dev = ["pytest>=8.0", "ruff==0.17.3", "mypy==2.4.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
@@ -25,7 +26,15 @@ packages = ["app"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["backups", "data", "data_live", "fixtures"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501 不启用：既有代码有 55 处超长行，为一次"加 CI"改 55 行会淹没真实 diff。
+# 需要收紧时先单独跑 ruff format，再移除这一行。
 ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+files = ["app"]

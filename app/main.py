@@ -272,7 +272,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/jobs")
     def create_job(body: AnalyzeJobRequest):
         """Submit an async analysis batch. Same payload while queued/running reuses the job."""
-        s: Settings = app.state.settings
         jobs: JobManager = app.state.jobs
         try:
             job = jobs.submit(limit=body.limit, force=body.force, concurrency=body.concurrency)

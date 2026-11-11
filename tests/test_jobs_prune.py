@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 import pytest
-
-from dataclasses import replace
 
 from app import db
 from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull

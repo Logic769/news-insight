@@ -251,7 +251,7 @@ def extract_with_llm(
                 LOG.warning("日期区间右端无法解析，跳过该字段: %s %r", name, raw_text)
                 continue
             if end_value is not None:
-                derived = end_value
+                derived: str | None = end_value
                 if str(value) != end_value:
                     LOG.info("日期区间取右端: %s %r -> %s", name, value, end_value)
                     # 代码改写了模型给的值，必须降级为“待人工确认”：即使右端来自原文，

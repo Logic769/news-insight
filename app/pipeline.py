@@ -245,9 +245,9 @@ def analyze_batch(
                     except Exception:
                         LOG.exception("补生成清单失败 %s", item.article.id)
             else:
-                with ThreadPoolExecutor(max_workers=regen_workers) as executor:
+                with ThreadPoolExecutor(max_workers=regen_workers) as regen_executor:
                     futures = {
-                        executor.submit(_build_missing_checklist, settings, llm, item): item
+                        regen_executor.submit(_build_missing_checklist, settings, llm, item): item
                         for item in regen_pending
                     }
                     for future in as_completed(futures):
@@ -271,15 +271,15 @@ def analyze_batch(
             conn.commit()
 
         LOG.info("开始分析 %d 篇，并发=%d", len(pending), workers)
+        executor: ThreadPoolExecutor | None = None
         if workers == 1 or len(pending) <= 1:
             results_iter = (_analyze_one(settings, llm, tags, schemas, art) for art in pending)
-            executor = None
         else:
             executor = ThreadPoolExecutor(max_workers=min(workers, len(pending)))
-            futures = [
+            analyze_futures = [
                 executor.submit(_analyze_one, settings, llm, tags, schemas, art) for art in pending
             ]
-            results_iter = (f.result() for f in as_completed(futures))
+            results_iter = (f.result() for f in as_completed(analyze_futures))
 
         uncommitted = 0
         done = 0
