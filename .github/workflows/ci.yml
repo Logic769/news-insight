@@ -75,8 +75,8 @@ jobs:
       - name: Validate YAML files
         run: |
           python -m pip install --upgrade pip
-          # 装 dev 组：pyyaml 只在 pyproject.toml 声明一处，避免与 CI 里的版本漂移。
-          pip install ".[dev]"
+          # 只装 yaml 组：版本声明留在 pyproject.toml 一处，又不把 YAML 门禁耦合到运行依赖。
+          pip install ".[yaml]"
           # 校验逻辑放在 tools/yaml_lint.py，本地与 CI 跑的是同一份代码。
           python tools/yaml_lint.py
 

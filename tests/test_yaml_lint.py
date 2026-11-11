@@ -59,11 +59,25 @@ def test_accepts_valid_yaml(text: str) -> None:
         "z:\n  <<: {a: 1, a: 2}\n",
         # 嵌套映射里的重复
         "outer:\n  inner:\n    a: 1\n    a: 2\n",
+        # 多文档里各自独立判重
+        "a: 1\n---\nb: 2\nb: 3\n",
+    ],
+)
+def test_rejects_duplicate_mapping_key(text: str) -> None:
+    with pytest.raises(ValueError, match="duplicate mapping key"):
+        TOOL_MODULE.validate(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         # 0x1 与 1 构造后是同一个整数键，后者会静默覆盖前者
         "1: a\n0x1: b\n",
         # true 与 yes 构造后都是布尔 True
         "true: a\nyes: b\n",
-        # 复合键（列表）重复：旧实现按「仅标量」判重会完全跳过
+        # null 与 ~ 构造后都是 None
+        "null: a\n~: b\n",
+        # 复合键（列表）：safe_load 本身拒绝不可 hash 的键
         "? [a, b]\n: 1\n? [a, b]\n: 2\n",
         # 未知 tag 的键：判重时构造失败，必须由完整构造步骤报错而不是抛 NameError
         "!!foo bar: 1\n",
@@ -72,7 +86,7 @@ def test_accepts_valid_yaml(text: str) -> None:
         "z:\n  <<: [1, 2]\n",
     ],
 )
-def test_rejects_duplicate_or_invalid_yaml(text: str) -> None:
+def test_rejects_invalid_yaml(text: str) -> None:
     with pytest.raises(ValueError):
         TOOL_MODULE.validate(text)
 
@@ -85,7 +99,6 @@ def _run_main(monkeypatch, tmp_path: pathlib.Path, capsys):
 
 def test_main_reports_filtered_file_count(monkeypatch, tmp_path, capsys) -> None:
     (tmp_path / "ok.yml").write_text("a: 1\n", encoding="utf-8")
-    # backups/ 在 SKIP 里，里面的坏文件不应参与统计
     (tmp_path / "backups").mkdir()
     (tmp_path / "backups" / "bad.yml").write_text("a: 1\na: 2\n", encoding="utf-8")
 
@@ -93,6 +106,33 @@ def test_main_reports_filtered_file_count(monkeypatch, tmp_path, capsys) -> None
 
     assert code == 0
     assert out.strip() == "all 1 YAML files parsed"
+
+
+@pytest.mark.parametrize("skip_dir", sorted(TOOL_MODULE.SKIP))
+def test_every_skip_dir_is_filtered(monkeypatch, tmp_path, capsys, skip_dir: str) -> None:
+    """SKIP 里每一条都要真的被跳过，写错或删掉任一条都会红。"""
+    (tmp_path / "ok.yml").write_text("a: 1\n", encoding="utf-8")
+    (tmp_path / skip_dir).mkdir(parents=True)
+    (tmp_path / skip_dir / "bad.yml").write_text("a: 1\na: 2\n", encoding="utf-8")
+
+    code, out = _run_main(monkeypatch, tmp_path, capsys)
+
+    assert code == 0, f"{skip_dir} 未被跳过: {out}"
+    assert "all 1 YAML files parsed" in out
+
+
+def test_main_ignores_working_directory(monkeypatch, tmp_path, capsys) -> None:
+    """扫描范围取脚本所在仓库，与 CWD 无关。"""
+    (tmp_path / "ok.yml").write_text("a: 1\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setattr(TOOL_MODULE, "ROOT", tmp_path)
+    monkeypatch.chdir(elsewhere)
+
+    code = TOOL_MODULE.main()
+
+    assert code == 0
+    assert "all 1 YAML files parsed" in capsys.readouterr().out
 
 
 def test_main_fails_on_duplicate_key(monkeypatch, tmp_path, capsys) -> None:
@@ -114,16 +154,17 @@ def test_main_reports_non_utf8_file(monkeypatch, tmp_path, capsys) -> None:
     assert "不是 UTF-8 编码" in out
 
 
-def test_repository_yaml_files_pass() -> None:
-    root = pathlib.Path(__file__).resolve().parents[1]
-    candidates = sorted(root.rglob("*.yml")) + sorted(root.rglob("*.yaml"))
-    paths = [
-        p
-        for p in candidates
-        if not any(part in TOOL_MODULE.SKIP for part in p.relative_to(root).parts)
-    ]
-    if not paths:
-        # 容器里只挂载了 tests/ 与 tools/，没有仓库级 YAML 可校验；CI 的 yaml lint job 会覆盖。
+def test_main_fails_when_no_yaml_found(monkeypatch, tmp_path, capsys) -> None:
+    """一个 YAML 都没扫到说明路径或 SKIP 配错了，不能静默变绿。"""
+    code, out = _run_main(monkeypatch, tmp_path, capsys)
+
+    assert code == 1
+    assert "no YAML files found" in out
+
+
+def test_repository_yaml_files_pass(monkeypatch) -> None:
+    """直接跑 main() 校验真实仓库，不复制候选文件逻辑。"""
+    if not TOOL_MODULE.candidate_files():
+        # 容器里只挂载了 tests/ 与 tools/，没有仓库级 YAML；CI 的 yaml lint job 会覆盖。
         pytest.skip("当前目录下没有 YAML 文件")
-    for path in paths:
-        TOOL_MODULE.validate(path.read_text(encoding="utf-8"))
+    assert TOOL_MODULE.main() == 0
