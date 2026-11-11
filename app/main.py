@@ -23,7 +23,7 @@ from app.tagging import load_vocab
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 LOG = logging.getLogger("news_insight.main")
 
-# 同步分析是重资源操作（每篇最多两次 LLM 调用）。并发触发只会重复烧 token，
+# 同步分析是重资源操作（每篇最多三次 LLM 调用：打标/抽取/清单）。并发触发只会重复烧 token，
 # 这里串行化：第二个请求立刻 409，而不是排队几十分钟。
 _ANALYZE_LOCK = threading.Lock()
 
@@ -164,6 +164,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail=f"未找到已分析文章: {article_id}")
         return {"data": row}
+
+    @app.get("/v1/articles/{article_id}/checklist")
+    def article_checklist(article_id: str):
+        """申报准备清单：由已抽取事实派生，按执行顺序排列。"""
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            row = db.get_article(conn, article_id)
+            checklist = db.get_checklist(conn, article_id)
+        finally:
+            conn.close()
+        if row is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "article_not_found",
+                        "status": 404,
+                        "message": f"未找到已分析文章: {article_id}",
+                    }
+                },
+            )
+        if checklist is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "checklist_not_found",
+                        "status": 404,
+                        "message": "该文章没有申报准备清单（未命中申报标签或生成失败）",
+                    }
+                },
+            )
+        return {
+            "data": {
+                "article_id": article_id,
+                "title": row["title"],
+                "url": row["url"],
+                "engine": checklist["engine"],
+                "generated_at": checklist["generated_at"],
+                "items": checklist["items"],
+            }
+        }
 
     @app.get("/v1/schemas")
     def schemas() -> dict:

@@ -38,6 +38,26 @@ def test_wrong_key_rejected(client):
     assert client.get("/v1/schemas", headers={"X-API-Key": "nope"}).status_code == 401
 
 
+def test_checklist_endpoint(client):
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    resp = client.get("/v1/articles/a1f0c3e2b7d94a51/checklist", headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["article_id"] == "a1f0c3e2b7d94a51"
+    assert data["engine"] == "rules"
+    assert any("2026-04-20" in item["text"] for item in data["items"])
+
+    # 非申报文章没有清单，返回 404 而不是空数组；两种 404 用不同错误码区分
+    no_checklist = client.get("/v1/articles/c3a2e5f4d9b06c73/checklist", headers=headers)
+    assert no_checklist.status_code == 404
+    assert no_checklist.json()["error"]["code"] == "checklist_not_found"
+    missing = client.get("/v1/articles/notexist/checklist", headers=headers)
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "article_not_found"
+
+
 def test_analyze_limit_capped(client):
     resp = client.post(
         "/v1/analyze", params={"limit": 500}, headers={"X-API-Key": "secret"}

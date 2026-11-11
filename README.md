@@ -4,7 +4,8 @@
 
 1. **打标签** —— 只能从你自己写好的标签词表里选（闭集多标签），模型不许自己造标签；
 2. **抽关键线索** —— 命中 `project_application` 这类标签后，进入 schema 驱动的事实抽取，例如项目申报的申报主体、材料清单、**截止时间**、资助额度、申报渠道；
-3. **落库 + 出接口** —— 结果存独立 SQLite，通过 HTTP API 查询，供后续业务系统消费。
+3. **出准备清单** —— 把抽到的事实按申报执行顺序排成可直接照做的清单（确认项目 → 核对资格 → 备材料 → 系统填报 → 截止提交），每条标注原文依据或「流程建议」；
+4. **落库 + 出接口** —— 结果存独立 SQLite，通过 HTTP API 查询，供后续业务系统消费。
 
 它不抓网页、不解析正文、不碰爬虫的数据库。与 news-crawler 之间只有一条 HTTP 契约。
 
@@ -118,6 +119,7 @@ LLM_API_KEY=ollama
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步返回统计，`limit` 上限 50） |
 | GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
+| GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | GET | `/v1/tags` | 标签词表 + 每个标签的命中数 |
 | GET | `/v1/tags/stats` | 标签分布与平均置信度 |
 | GET | `/v1/schemas` | 已注册的抽取 schema |
@@ -167,7 +169,8 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10`�
 3. **相对时间以发布时间为基准。** 「自发布之日起30日内」「本月底」如果用抓取时间换算，会随重跑静默漂移。抽取提示词里显式传入 `published_at_utc`（缺失时回退 `published_at`），`normalize_deadline()` 按下这个基准推算。
 4. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关的子串校验，定位不到的值保留但标 `verified=false`，供人工复核，而不是静默采信。模型给出的日期还会用原文重算一遍，与原文对不上就降级可信度；规则引擎（无 LLM 降级）产出的一切恒为 `verified=false`——正则只证明文本出现过，不证明语义正确（「3月1日至4月20日」取左端就是活生生的反例）。
 5. **结果独立成库。** 见上文对照表。
-6. **单篇失败不拖垮批次，但「没拿到正文」不算成功。** 单篇异常计入 `errors` 并继续，运行统计落到 `runs` 表。详情接口没取到正文的文章只拿标题打标会把「确无截止日」永久定档，所以这类文章**不入库**、计入 `errors`，下次运行自然重试；`save_analysis` 整体在一个事务里，中途失败立即回滚，不会留下「有主行、无标签」的脏状态。
+6. **清单是派生视图，不是新事实。** 清单项要么引用已抽取的事实（`basis="excerpt"`：原文片段必须能在正文定位，且 `text` 里的日期/金额/电话等事实 token 必须被该片段支持，否则丢弃），要么显式标成 `suggested`（盖章、留存回执这类流程建议，禁止出现任何数字）。规则引擎生成的项沿用抽取行的 `verified` 标记（通常为 `false`），不会冒充已核验事实。它单独存在 `article_checklists`，重新生成不重写标签/抽取表；已分析但缺清单的文章会在下次运行自动补生成。
+7. **单篇失败不拖垮批次，但「没拿到正文」不算成功。** 单篇异常计入 `errors` 并继续，运行统计落到 `runs` 表。详情接口没取到正文的文章只拿标题打标会把「确无截止日」永久定档，所以这类文章**不入库**、计入 `errors`，下次运行自然重试；`save_analysis` 整体在一个事务里，中途失败立即回滚，不会留下「有主行、无标签」的脏状态。
 
 ## 数据表
 
@@ -176,6 +179,7 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10`�
 | `analyzed_articles` | 已分析文章元数据（`article_id` 主键，与上游对齐） |
 | `article_tags` | `(article_id, tag)` 主键，含置信度、原文依据、引擎 |
 | `extractions` | `(article_id, schema_id, field)` 主键，含值、原文片段、置信度、是否定位成功 |
+| `article_checklists` | `article_id` 主键，清单项 JSON（`text`/`basis`/`source_text`）、生成引擎与时间 |
 | `runs` | 每次批处理的统计 |
 
 ## 测试
@@ -188,13 +192,14 @@ pytest -q
 docker compose run --rm --entrypoint sh insight -c "pip install --user -q pytest && python -m pytest tests -q"
 ```
 
-覆盖：日期归一（绝对/相对/跨年/月底/无基准）、闭集守卫（词表外丢弃、去重、max_tags）、demo 模式端到端（打标 + 申报抽取 + `due_before` 查询）、重跑幂等。
+覆盖：日期归一（绝对/相对/跨年/月底/无基准）、闭集守卫（词表外丢弃、去重、max_tags）、demo 模式端到端（打标 + 申报抽取 + `due_before` 查询）、申报准备清单（规则顺序、`excerpt` 原文定位校验、「LLM 不可用 → 规则」降级、清单端点 404/200）、重跑幂等。
 
 ## 已知限制
 
 - 抽取质量取决于模型与 prompt，本项目只保证「不越界」（不造标签、不造字段、值可定位），不保证召回；
 - 相对截止时间只覆盖常见表述（`N日内`/`N个工作日`/`本月底`），「公示结束后5个工作日」这类链式表述仍会漏；
 - `/v1/analyze` 同步执行（进程内已有互斥锁，并发第二个请求 409），长批次需要外部调度，或改成任务队列；
+- 清单生成按篇多一次 LLM 调用（正文按 `EXTRACT_BODY_CHARS` 截断），10 篇批次实测约 10 分钟，吞吐敏感时可改为规则清单或异步补齐；
 - 单进程单 SQLite，不适合多副本水平扩展；
 - 演示数据与规则引擎只用于跑通链路，不作为效果基线。
 

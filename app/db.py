@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
+
+LOG = logging.getLogger("news_insight.db")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS analyzed_articles (
@@ -59,6 +62,14 @@ CREATE TABLE IF NOT EXISTS runs (
     skipped     INTEGER NOT NULL DEFAULT 0,
     errors      INTEGER NOT NULL DEFAULT 0,
     detail      TEXT
+);
+
+-- 清单是抽取结果的派生视图：单独成表，重新生成不会碰事实表。
+CREATE TABLE IF NOT EXISTS article_checklists (
+    article_id   TEXT PRIMARY KEY,
+    engine       TEXT NOT NULL,
+    items_json   TEXT NOT NULL,
+    generated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON article_tags(tag);
@@ -271,6 +282,61 @@ def get_article(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | N
         }
     item["extractions"] = ext
     return item
+
+
+def save_checklist(
+    conn: sqlite3.Connection,
+    *,
+    article_id: str,
+    engine: str,
+    items: Iterable[dict[str, Any]],
+) -> None:
+    """Insert or replace one article's checklist (idempotent re-runs)."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO article_checklists (article_id, engine, items_json, generated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(article_id) DO UPDATE SET
+                engine=excluded.engine, items_json=excluded.items_json,
+                generated_at=excluded.generated_at
+            """,
+            (article_id, engine, json.dumps(list(items), ensure_ascii=False), _now()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def delete_checklist(conn: sqlite3.Connection, article_id: str) -> None:
+    """Drop a stale checklist when a re-analysis no longer triggers the schema."""
+    try:
+        conn.execute("DELETE FROM article_checklists WHERE article_id = ?", (article_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_checklist(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT engine, items_json, generated_at FROM article_checklists WHERE article_id = ?",
+        (article_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    items = _load_json(row["items_json"])
+    if not isinstance(items, list):
+        LOG.warning("清单 JSON 损坏，按空清单处理 article_id=%s", article_id)
+        items = []
+    # 旧版清单没有 verified 字段：按未核验处理，避免下游把历史数据当已核验事实。
+    items = [{**item, "verified": bool(item.get("verified", False))} if isinstance(item, dict) else item for item in items]
+    return {
+        "engine": row["engine"],
+        "items": items,
+        "generated_at": row["generated_at"],
+    }
 
 
 def tag_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:

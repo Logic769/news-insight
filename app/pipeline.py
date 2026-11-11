@@ -6,6 +6,7 @@ import logging
 import sqlite3
 
 from app import db
+from app.checklist import build_checklist, to_dicts
 from app.extraction import extract_article, load_schemas
 from app.llm import LLMClient
 from app.news_client import NewsClient, UpstreamError
@@ -13,6 +14,55 @@ from app.settings import Settings
 from app.tagging import load_vocab, tag_article
 
 LOG = logging.getLogger("news_insight.pipeline")
+
+
+def _field_payload(fields) -> tuple[dict, dict, dict]:
+    """Split FieldValue objects into value/raw_text/verified maps for the checklist."""
+    values = {f.name: f.value for f in fields}
+    raw_texts = {f.name: f.raw_text for f in fields if f.raw_text}
+    verified = {f.name: f.verified for f in fields}
+    return values, raw_texts, verified
+
+
+def _maybe_regenerate_checklist(settings: Settings, llm: LLMClient, conn, art) -> None:
+    """Regenerate a missing checklist for an already-analyzed article.
+
+    Idempotent skip would otherwise make a transient checklist failure permanent:
+    the article is marked analyzed, so later runs never touch it again. Only the
+    derived checklist is rebuilt -- tags and extractions stay untouched.
+    """
+    detail = db.get_article(conn, art.id)
+    if not detail:
+        return
+    if "project_application" not in {t["tag"] for t in detail.get("tags", [])}:
+        return
+    if db.get_checklist(conn, art.id) is not None:
+        return
+    block = detail.get("extractions", {}).get("project_application") or {}
+    if not block or not art.body.strip():
+        return
+    fields = {name: info["value"] for name, info in block.items()}
+    raw_texts = {name: info["raw_text"] for name, info in block.items() if info.get("raw_text")}
+    verified = {name: info["verified"] for name, info in block.items()}
+    try:
+        checklist = build_checklist(
+            llm,
+            art.title,
+            art.body,
+            fields,
+            raw_texts=raw_texts,
+            verified=verified,
+            body_chars=settings.extract_body_chars,
+        )
+        db.save_checklist(
+            conn,
+            article_id=art.id,
+            engine=checklist.engine,
+            items=to_dicts(checklist.items),
+        )
+        LOG.info("补生成缺失清单 %s", art.id)
+    except Exception:  # 补生成失败不影响本次 skip 语义
+        LOG.exception("补生成清单失败 %s", art.id)
 
 
 def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dict:
@@ -53,6 +103,8 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
                 skipped += 1
                 continue
             if not force and db.is_analyzed(conn, art.id):
+                # 已分析但缺清单（上次生成失败）时补生成，否则清单会永久缺失
+                _maybe_regenerate_checklist(settings, llm, conn, art)
                 skipped += 1
                 continue
             if not art.body.strip():
@@ -94,6 +146,35 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
                     tags=[(h.tag_id, h.confidence, h.evidence, h.engine) for h in hits],
                     extractions=flat,
                 )
+                # 清单是派生视图：生成失败只记日志，不影响已入库的事实
+                app_result = next(
+                    (r for r in results if r.schema_id == "project_application" and r.fields),
+                    None,
+                )
+                if app_result is not None:
+                    try:
+                        fields, raw_texts, verified = _field_payload(app_result.fields)
+                        checklist = build_checklist(
+                            llm,
+                            art.title,
+                            art.body,
+                            fields,
+                            raw_texts=raw_texts,
+                            verified=verified,
+                            body_chars=settings.extract_body_chars,
+                        )
+                        db.save_checklist(
+                            conn,
+                            article_id=art.id,
+                            engine=checklist.engine,
+                            items=to_dicts(checklist.items),
+                        )
+                    except Exception:  # 清单失败不能把整篇标记为错误
+                        LOG.exception("生成申报清单失败 %s", art.id)
+                elif not any(h.tag_id == "project_application" for h in hits):
+                    # 只有本次打标也确认不再命中时才作废旧清单，避免抽取抖动误删
+                    if db.get_checklist(conn, art.id) is not None:
+                        db.delete_checklist(conn, art.id)
                 analyzed += 1
             except Exception as exc:  # one bad article must not sink the batch
                 errors += 1
