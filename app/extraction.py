@@ -393,6 +393,10 @@ def _pick_range(raw_text: str) -> tuple[str, str] | None:
     if single:
         # 用 (date, date) 表示单个截止日，交给 _resolve_range_end 统一归一化。
         return single.group(1), single.group(1)
+    # 文本有「截止」但没有可解析的截止日期时，不要拿申报/受理区间顶替；
+    # 那可能是报名或评审时间，保留模型值更安全。
+    if _DEADLINE_HINT_RE.search(raw_text):
+        return None
     m = _APPLICATION_RANGE_RE.search(raw_text)
     if m:
         return m.group(1), m.group(2)

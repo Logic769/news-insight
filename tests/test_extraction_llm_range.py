@@ -230,3 +230,10 @@ def test_deadline_prefix_does_not_cross_comma_into_evaluation_range():
     from app.extraction import _pick_range
 
     assert _pick_range("截止后不再受理，评审时间2026年3月1日至2026年3月5日") is None
+
+
+def test_deadline_hint_blocks_unrelated_application_range():
+    """截止日期另行通知时，不能拿申报区间顶替截止日期。"""
+    from app.extraction import _pick_range
+
+    assert _pick_range("截止时间另行通知，申报时间2026年3月1日至3月5日") is None
