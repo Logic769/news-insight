@@ -127,7 +127,7 @@ class NewsClient:
             return [NewsArticle.from_payload(r) for r in rows[offset : offset + limit]], "demo"
 
         try:
-            payload = self._live_list(page=1, page_size=max(limit, self.settings.news_page_size), order="published_at_desc")
+            payload = self._live_list(page=1, page_size=max(limit, self.settings.news_page_size), order="published_desc")
             rows = payload.get("data") or []
             return [NewsArticle.from_payload(r) for r in rows][offset : offset + limit], "live"
         except UpstreamError as exc:

@@ -9,3 +9,5 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+# 本地备份可能含 .env / 站点配置，绝不入库
+backups/

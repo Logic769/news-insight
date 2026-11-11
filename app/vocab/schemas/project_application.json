@@ -29,7 +29,7 @@
     {
       "name": "deadline",
       "type": "date",
-      "description": "申报截止日期，归一化为 YYYY-MM-DD"
+      "description": "申报截止日期，归一化为 YYYY-MM-DD；原文为起止区间时取区间结束日期"
     },
     {
       "name": "deadline_raw",

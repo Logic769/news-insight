@@ -59,6 +59,40 @@ curl "http://localhost:8020/v1/extractions?schema=project_application&due_before
 | `live` | 只走真实上游，失败直接报错（生产用） |
 | `demo` | 完全不联网（CI / 演示用） |
 
+### 接真实上游（示例：项目申报公告站点）
+
+上游 [`news-crawler`](https://github.com/Logic769/news-crawler) 先按站点配置抓一批进 SQLite，再让本服务读它的 `/v1`。真实站点配置只放本地 `sources.local.json`（已被 `.gitignore` 忽略），不要提交：
+
+```jsonc
+// sources.local.json —— 站点配置（本地私有，不进 Git）
+{
+  "name": "example_notice",
+  "list_url": "https://example.com/notice/",
+  "item_xpath": "//table[contains(@class,'notice-list')]/tr",
+  "title_xpath": ".//a/@title",
+  "url_xpath": ".//a/@href",
+  "date_xpath": ".//td[contains(@class,'date')]",
+  "date_format": "%Y-%m-%d",
+  "article_title_xpath": "//h1[contains(@class,'article-title')]/text()"
+}
+```
+
+两个坑（一个已在代码里处理，一个靠配置约定）：
+
+- 有些站点的 `<title>` 是站点名，真标题在正文 `h1` 里：配置 `article_title_xpath`，推荐以 `/text()` 结尾（写元素节点也能兜底，但不要用 `string()`，它只返回第一个字符）；
+- 上游 `/v1/articles` 的 `order` 只接受 `published_desc` / `published_asc` / `updated_desc`，传别的会 422（本服务已固定用 `published_desc`）。
+
+跑通后：
+
+```bash
+curl -s -X POST -H "X-API-Key: $INSIGHT_API_KEY" \
+  "http://127.0.0.1:8020/v1/analyze?limit=10&force=true"
+# {"mode":"live","scanned":10,"analyzed":10,"errors":0,"tag_engines":{"llm":10,"rules":0}}
+
+curl -s -H "X-API-Key: $INSIGHT_API_KEY" "http://127.0.0.1:8020/v1/extractions?field=deadline"
+# 申报截止日按区间右端取值：2025年11月25日17:00至2025年12月1日9:00 → 2025-12-01
+```
+
 ### LLM 配置
 
 任何 OpenAI 兼容接口都行：
