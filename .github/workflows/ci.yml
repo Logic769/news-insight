@@ -11,14 +11,16 @@ permissions:
   contents: read
 
 concurrency:
-  # 同一 PR 的连续推送只保留最新一次，避免排队烧 runner。
+  # 只在 PR 上取消旧跑：master 的每次 push 都要留下被验证过的记录，
+  # 否则连续 push 会取消前一次，合并进来的提交实际从未经过 CI。
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   python-checks:
     name: python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +33,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install dependencies
         run: |
@@ -55,6 +59,7 @@ jobs:
   yaml-lint:
     name: yaml lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,18 +72,27 @@ jobs:
       - name: Validate YAML files
         run: |
           python -m pip install --upgrade pip
-          pip install pyyaml
+          pip install "pyyaml>=6,<7"
           python - <<'PY'
-          import pathlib, sys, yaml
+          import pathlib
+          import sys
+
+          import yaml
+
+          MERGE_TAG = "tag:yaml.org,2002:merge"
 
 
           class UniqueKeyLoader(yaml.SafeLoader):
-              """safe_load 会静默保留重复键的最后一个值，这里改成直接报错。"""
+              """拒绝重复映射键，同时不误杀合法的 << merge key。"""
 
 
           def _construct_mapping(loader, node, deep=False):
               seen = set()
               for key_node, _ in node.value:
+                  # << 由 SafeConstructor.flatten_mapping 展开，不能在这里单独构造；
+                  # 显式键覆盖 merge 进来的同名键是 YAML 允许的写法，不算重复。
+                  if key_node.tag == MERGE_TAG:
+                      continue
                   key = loader.construct_object(key_node, deep=deep)
                   if key in seen:
                       raise yaml.constructor.ConstructorError(
@@ -93,15 +107,20 @@ jobs:
           )
 
           SKIP = {".git", "backups", "data", "data_live"}
+          candidates = sorted(pathlib.Path(".").rglob("*.yml")) + sorted(
+              pathlib.Path(".").rglob("*.yaml")
+          )
+          paths = [p for p in candidates if not any(part in SKIP for part in p.parts)]
+
           bad = []
-          paths = sorted(pathlib.Path(".").rglob("*.yml")) + sorted(pathlib.Path(".").rglob("*.yaml"))
           for path in paths:
-              if any(part in SKIP for part in path.parts):
-                  continue
+              text = path.read_text(encoding="utf-8")
               try:
-                  yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyLoader)
-              except Exception as exc:
+                  yaml.load(text, Loader=UniqueKeyLoader)
+              except yaml.YAMLError as exc:
                   bad.append(f"{path}: {exc}")
+              except UnicodeDecodeError as exc:
+                  bad.append(f"{path}: 不是 UTF-8 编码: {exc}")
           print("\n".join(bad) if bad else f"all {len(paths)} YAML files parsed")
           sys.exit(1 if bad else 0)
           PY
@@ -109,6 +128,7 @@ jobs:
   docker-build:
     name: docker build + container smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -119,27 +139,29 @@ jobs:
       - name: Build image
         run: docker build -t news-insight:ci .
 
-      - name: Container healthcheck and tests
+      - name: Container tests
         run: |
           # 容器内没有 pytest：用一次性覆盖层装依赖，避免把测试依赖塞进生产镜像。
           docker run --rm \
             -v "$PWD/tests:/app/tests:ro" \
             -e DATA_DIR=/tmp/data \
             news-insight:ci sh -c "
-              pip install --no-cache-dir -q pytest &&
+              python -m pip install --user --no-cache-dir -q pytest &&
               python -m pytest -q -p no:cacheprovider /app/tests
             "
 
       - name: Container boots and serves /health
         run: |
           docker run -d --name insight-ci -p 18020:8020 -e DATA_DIR=/tmp/data news-insight:ci
-          for i in $(seq 1 30); do
+          # 冷 runner 上 uvicorn 启动 + init_db + 启动期 prune 偶尔超过 30s，
+          # 给到 60 次 × 2s，避免把慢启动误判成坏镜像。
+          for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:18020/health >/dev/null 2>&1; then
               echo "health OK"
               curl -sS http://127.0.0.1:18020/health
               exit 0
             fi
-            sleep 1
+            sleep 2
           done
           echo "container never became healthy"
           docker logs insight-ci
