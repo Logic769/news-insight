@@ -11,9 +11,10 @@ permissions:
   contents: read
 
 concurrency:
-  # 只在 PR 上取消旧跑：master 的每次 push 都要留下被验证过的记录，
-  # 否则连续 push 会取消前一次，合并进来的提交实际从未经过 CI。
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # 只在 PR 上取消旧跑，且 PR 共用一个并发组。
+  # master 的每次 push 用独立组（带 sha）：同一组最多保留一个等待中的运行，
+  # 连续两次 push 会把中间那次从队列里挤掉，那个提交就永远没有 CI 记录。
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -73,57 +74,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "pyyaml>=6,<7"
-          python - <<'PY'
-          import pathlib
-          import sys
-
-          import yaml
-
-          MERGE_TAG = "tag:yaml.org,2002:merge"
-
-
-          class UniqueKeyLoader(yaml.SafeLoader):
-              """拒绝重复映射键，同时不误杀合法的 << merge key。"""
-
-
-          def _construct_mapping(loader, node, deep=False):
-              seen = set()
-              for key_node, _ in node.value:
-                  # << 由 SafeConstructor.flatten_mapping 展开，不能在这里单独构造；
-                  # 显式键覆盖 merge 进来的同名键是 YAML 允许的写法，不算重复。
-                  if key_node.tag == MERGE_TAG:
-                      continue
-                  key = loader.construct_object(key_node, deep=deep)
-                  if key in seen:
-                      raise yaml.constructor.ConstructorError(
-                          None, None, f"duplicate mapping key: {key!r}", key_node.start_mark
-                      )
-                  seen.add(key)
-              return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
-
-
-          UniqueKeyLoader.add_constructor(
-              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
-          )
-
-          SKIP = {".git", "backups", "data", "data_live"}
-          candidates = sorted(pathlib.Path(".").rglob("*.yml")) + sorted(
-              pathlib.Path(".").rglob("*.yaml")
-          )
-          paths = [p for p in candidates if not any(part in SKIP for part in p.parts)]
-
-          bad = []
-          for path in paths:
-              text = path.read_text(encoding="utf-8")
-              try:
-                  yaml.load(text, Loader=UniqueKeyLoader)
-              except yaml.YAMLError as exc:
-                  bad.append(f"{path}: {exc}")
-              except UnicodeDecodeError as exc:
-                  bad.append(f"{path}: 不是 UTF-8 编码: {exc}")
-          print("\n".join(bad) if bad else f"all {len(paths)} YAML files parsed")
-          sys.exit(1 if bad else 0)
-          PY
+          # 校验逻辑放在 tools/yaml_lint.py，本地与 CI 跑的是同一份代码。
+          python tools/yaml_lint.py
 
   docker-build:
     name: docker build + container smoke
@@ -141,12 +93,14 @@ jobs:
 
       - name: Container tests
         run: |
-          # 容器内没有 pytest：用一次性覆盖层装依赖，避免把测试依赖塞进生产镜像。
+          # 容器内没有 pytest/pyyaml：一次性装进 --user 目录，避免把测试依赖塞进生产镜像。
+          # tools/ 要一起挂进去，test_yaml_lint.py 会加载它。
           docker run --rm \
             -v "$PWD/tests:/app/tests:ro" \
+            -v "$PWD/tools:/app/tools:ro" \
             -e DATA_DIR=/tmp/data \
             news-insight:ci sh -c "
-              python -m pip install --user --no-cache-dir -q pytest &&
+              python -m pip install --user --no-cache-dir -q pytest 'pyyaml>=6,<7' &&
               python -m pytest -q -p no:cacheprovider /app/tests
             "
 
