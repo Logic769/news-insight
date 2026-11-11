@@ -1,0 +1,541 @@
+{
+  "version": 1,
+  "description": "受控标签词表。模型只能从 defects.id 中选，不得自造标签。",
+  "groups": [
+    {
+      "id": "domain",
+      "name": "领域",
+      "description": "新闻所属行业/领域，一篇可命中多个"
+    },
+    {
+      "id": "event",
+      "name": "事件类型",
+      "description": "发生了什么"
+    },
+    {
+      "id": "policy",
+      "name": "政策工具",
+      "description": "政府行为的具体形式"
+    }
+  ],
+  "tags": [
+    {
+      "id": "politics",
+      "name": "时政",
+      "group": "domain",
+      "keywords": [
+        "会议",
+        "讲话",
+        "调研",
+        "部署",
+        "常委会"
+      ]
+    },
+    {
+      "id": "policy_release",
+      "name": "政策发布",
+      "group": "event",
+      "keywords": [
+        "印发",
+        "出台",
+        "发布",
+        "通知",
+        "实施意见",
+        "若干措施"
+      ]
+    },
+    {
+      "id": "economy",
+      "name": "经济",
+      "group": "domain",
+      "keywords": [
+        "GDP",
+        "经济增长",
+        "消费",
+        "投资",
+        "进出口"
+      ]
+    },
+    {
+      "id": "finance",
+      "name": "金融",
+      "group": "domain",
+      "keywords": [
+        "银行",
+        "保险",
+        "证券",
+        "利率",
+        "信贷"
+      ]
+    },
+    {
+      "id": "tech",
+      "name": "科技",
+      "group": "domain",
+      "keywords": [
+        "技术",
+        "研发",
+        "创新",
+        "专利",
+        "攻关"
+      ]
+    },
+    {
+      "id": "ai",
+      "name": "人工智能",
+      "group": "domain",
+      "keywords": [
+        "人工智能",
+        "大模型",
+        "AI",
+        "算法",
+        "算力"
+      ]
+    },
+    {
+      "id": "semiconductor",
+      "name": "芯片半导体",
+      "group": "domain",
+      "keywords": [
+        "芯片",
+        "半导体",
+        "集成电路",
+        "晶圆"
+      ]
+    },
+    {
+      "id": "biomedicine",
+      "name": "生物医药",
+      "group": "domain",
+      "keywords": [
+        "生物医药",
+        "创新药",
+        "临床试验",
+        "医疗器械"
+      ]
+    },
+    {
+      "id": "new_energy",
+      "name": "新能源",
+      "group": "domain",
+      "keywords": [
+        "光伏",
+        "风电",
+        "储能",
+        "动力电池",
+        "氢能"
+      ]
+    },
+    {
+      "id": "carbon",
+      "name": "双碳",
+      "group": "domain",
+      "keywords": [
+        "碳达峰",
+        "碳中和",
+        "碳排放",
+        "绿色低碳"
+      ]
+    },
+    {
+      "id": "digital",
+      "name": "数字经济",
+      "group": "domain",
+      "keywords": [
+        "数字化",
+        "数字经济",
+        "智能制造",
+        "工业互联网"
+      ]
+    },
+    {
+      "id": "education",
+      "name": "教育",
+      "group": "domain",
+      "keywords": [
+        "教育",
+        "高校",
+        "招生",
+        "学科",
+        "教师"
+      ]
+    },
+    {
+      "id": "health",
+      "name": "医疗健康",
+      "group": "domain",
+      "keywords": [
+        "医院",
+        "医保",
+        "就医",
+        "药品",
+        "公共卫生"
+      ]
+    },
+    {
+      "id": "livelihood",
+      "name": "民生",
+      "group": "domain",
+      "keywords": [
+        "社保",
+        "养老",
+        "住房",
+        "低保",
+        "便民"
+      ]
+    },
+    {
+      "id": "society",
+      "name": "社会",
+      "group": "domain",
+      "keywords": [
+        "社区",
+        "志愿",
+        "文明",
+        "基层治理"
+      ]
+    },
+    {
+      "id": "law",
+      "name": "法治",
+      "group": "domain",
+      "keywords": [
+        "条例",
+        "执法",
+        "司法",
+        "判决",
+        "立法"
+      ]
+    },
+    {
+      "id": "international",
+      "name": "国际",
+      "group": "domain",
+      "keywords": [
+        "外交",
+        "双边",
+        "会谈",
+        "国际组织"
+      ]
+    },
+    {
+      "id": "military",
+      "name": "国防军事",
+      "group": "domain",
+      "keywords": [
+        "国防",
+        "军队",
+        "演习",
+        "征兵"
+      ]
+    },
+    {
+      "id": "sports",
+      "name": "体育",
+      "group": "domain",
+      "keywords": [
+        "赛事",
+        "运动员",
+        "联赛",
+        "比赛"
+      ]
+    },
+    {
+      "id": "culture",
+      "name": "文化",
+      "group": "domain",
+      "keywords": [
+        "文化",
+        "非遗",
+        "文物",
+        "演出",
+        "出版"
+      ]
+    },
+    {
+      "id": "tourism",
+      "name": "文旅",
+      "group": "domain",
+      "keywords": [
+        "旅游",
+        "景区",
+        "文旅",
+        "游客"
+      ]
+    },
+    {
+      "id": "agriculture",
+      "name": "农业农村",
+      "group": "domain",
+      "keywords": [
+        "农业",
+        "乡村",
+        "种植",
+        "粮食",
+        "农户"
+      ]
+    },
+    {
+      "id": "transport",
+      "name": "交通",
+      "group": "domain",
+      "keywords": [
+        "铁路",
+        "高速",
+        "机场",
+        "公交",
+        "航运"
+      ]
+    },
+    {
+      "id": "realestate",
+      "name": "房地产",
+      "group": "domain",
+      "keywords": [
+        "楼市",
+        "房地产",
+        "公积金",
+        "住房贷款"
+      ]
+    },
+    {
+      "id": "auto",
+      "name": "汽车",
+      "group": "domain",
+      "keywords": [
+        "汽车",
+        "新能源车",
+        "整车",
+        "智能网联"
+      ]
+    },
+    {
+      "id": "energy",
+      "name": "能源",
+      "group": "domain",
+      "keywords": [
+        "电力",
+        "煤炭",
+        "油气",
+        "电网"
+      ]
+    },
+    {
+      "id": "environment",
+      "name": "生态环境",
+      "group": "domain",
+      "keywords": [
+        "环保",
+        "污染",
+        "生态",
+        "治理攻坚"
+      ]
+    },
+    {
+      "id": "hr_talent",
+      "name": "人才就业",
+      "group": "domain",
+      "keywords": [
+        "招聘",
+        "人才",
+        "就业",
+        "引才",
+        "技能培训"
+      ]
+    },
+    {
+      "id": "project_application",
+      "name": "项目申报",
+      "group": "event",
+      "keywords": [
+        "申报",
+        "征集",
+        "立项",
+        "评审",
+        "推荐申报",
+        "申报指南",
+        "项目库"
+      ]
+    },
+    {
+      "id": "tender",
+      "name": "招标采购",
+      "group": "event",
+      "keywords": [
+        "招标",
+        "中标",
+        "采购",
+        "询价",
+        "公开招标"
+      ]
+    },
+    {
+      "id": "subsidy",
+      "name": "补贴奖励",
+      "group": "policy",
+      "keywords": [
+        "补贴",
+        "奖励",
+        "补助",
+        "扶持资金",
+        "奖补"
+      ]
+    },
+    {
+      "id": "certification",
+      "name": "资质认定",
+      "group": "policy",
+      "keywords": [
+        "认定",
+        "资质",
+        "评审认定",
+        "备案",
+        "高新技术企业"
+      ]
+    },
+    {
+      "id": "standard",
+      "name": "标准规范",
+      "group": "policy",
+      "keywords": [
+        "标准",
+        "规范",
+        "导则",
+        "团体标准"
+      ]
+    },
+    {
+      "id": "funding",
+      "name": "资金支持",
+      "group": "policy",
+      "keywords": [
+        "资金",
+        "专项资金",
+        "基金",
+        "拨款",
+        "贴息"
+      ]
+    },
+    {
+      "id": "enterprise_dynamic",
+      "name": "企业动态",
+      "group": "event",
+      "keywords": [
+        "公司",
+        "集团",
+        "签约",
+        "合作",
+        "揭牌"
+      ]
+    },
+    {
+      "id": "product_launch",
+      "name": "产品发布",
+      "group": "event",
+      "keywords": [
+        "发布",
+        "上市",
+        "量产",
+        "新品",
+        "上线"
+      ]
+    },
+    {
+      "id": "investment",
+      "name": "投融资",
+      "group": "event",
+      "keywords": [
+        "融资",
+        "投资",
+        "轮次",
+        "增资",
+        "并购"
+      ]
+    },
+    {
+      "id": "ipo",
+      "name": "上市IPO",
+      "group": "event",
+      "keywords": [
+        "IPO",
+        "上市",
+        "科创板",
+        "创业板",
+        "过会"
+      ]
+    },
+    {
+      "id": "financial_report",
+      "name": "财报业绩",
+      "group": "event",
+      "keywords": [
+        "营收",
+        "净利润",
+        "业绩",
+        "财报",
+        "同比增长"
+      ]
+    },
+    {
+      "id": "safety",
+      "name": "安全生产",
+      "group": "event",
+      "keywords": [
+        "事故",
+        "安全生产",
+        "隐患",
+        "排查",
+        "应急"
+      ]
+    },
+    {
+      "id": "disaster",
+      "name": "气象灾害",
+      "group": "event",
+      "keywords": [
+        "暴雨",
+        "台风",
+        "高温",
+        "预警",
+        "地震"
+      ]
+    },
+    {
+      "id": "anti_corruption",
+      "name": "反腐",
+      "group": "event",
+      "keywords": [
+        "违纪",
+        "违法",
+        "审查",
+        "开除党籍",
+        "双开"
+      ]
+    },
+    {
+      "id": "public_service",
+      "name": "政务服务",
+      "group": "policy",
+      "keywords": [
+        "政务服务",
+        "一网通办",
+        "办理",
+        "窗口",
+        "便民服务"
+      ]
+    },
+    {
+      "id": "planning",
+      "name": "规划计划",
+      "group": "policy",
+      "keywords": [
+        "规划",
+        "行动计划",
+        "实施方案",
+        "三年行动",
+        "十四五",
+        "十五五"
+      ]
+    }
+  ]
+}

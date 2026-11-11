@@ -1,0 +1,176 @@
+"""HTTP surface for news-insight.
+
+Kept deliberately small: trigger an analysis batch, read results back, and
+query extracted facts (the "project application deadline" example).
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+
+from app import __version__, db
+from app.extraction import load_schemas
+from app.pipeline import analyze_batch, connect
+from app.settings import Settings, load_settings
+from app.tagging import load_vocab
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+LOG = logging.getLogger("news_insight.main")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings: Settings = app.state.settings
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    db.init_db(settings.db_path)
+    LOG.info("db ready at %s", settings.db_path)
+    yield
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    app = FastAPI(
+        title="news-insight",
+        version=__version__,
+        description="闭集标签打标 + 关键线索抽取，数据源为 news-crawler /v1",
+        lifespan=lifespan,
+    )
+    app.state.settings = settings or load_settings()
+
+    @app.get("/health")
+    def health() -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM analyzed_articles").fetchone()[0]
+        finally:
+            conn.close()
+        return {
+            "status": "ok",
+            "version": __version__,
+            "analyzed_articles": n,
+            "llm_enabled": s.llm_enabled,
+            "news_source_mode": s.news_source_mode,
+            "news_base_url": s.news_base_url,
+        }
+
+    @app.get("/v1/tags")
+    def tags() -> dict:
+        s: Settings = app.state.settings
+        payload, defs = load_vocab(s.vocab_dir)
+        conn = connect(s)
+        try:
+            stats = {r["tag"]: r for r in db.tag_stats(conn)}
+        finally:
+            conn.close()
+        data = [
+            {
+                "id": t.id,
+                "name": t.name,
+                "group": t.group,
+                "keywords": list(t.keywords),
+                "article_count": stats.get(t.id, {}).get("count", 0),
+            }
+            for t in defs
+        ]
+        return {"data": data, "meta": {"total": len(data), "vocab_version": payload.get("version")}}
+
+    @app.get("/v1/tags/stats")
+    def tags_stats() -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            return {"data": db.tag_stats(conn)}
+        finally:
+            conn.close()
+
+    @app.post("/v1/analyze")
+    def analyze(
+        limit: int = Query(default=10, ge=1, le=200),
+        force: bool = Query(default=False),
+    ) -> dict:
+        s: Settings = app.state.settings
+        try:
+            result = analyze_batch(s, limit=limit, force=force)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"分析失败: {exc}") from exc
+        return {"data": result}
+
+    @app.get("/v1/articles")
+    def articles(
+        tag: str | None = Query(default=None),
+        limit: int = Query(default=20, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            rows, total = db.list_analyzed(conn, tag=tag, limit=limit, offset=offset)
+        finally:
+            conn.close()
+        return {"data": rows, "meta": {"total": total, "limit": limit, "offset": offset}}
+
+    @app.get("/v1/articles/{article_id}")
+    def article_detail(article_id: str) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            row = db.get_article(conn, article_id)
+        finally:
+            conn.close()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"未找到已分析文章: {article_id}")
+        return {"data": row}
+
+    @app.get("/v1/schemas")
+    def schemas() -> dict:
+        s: Settings = app.state.settings
+        data = [
+            {
+                "schema_id": sc.schema_id,
+                "name": sc.name,
+                "trigger_tags": list(sc.trigger_tags),
+                "fields": [f["name"] for f in sc.fields],
+            }
+            for sc in load_schemas(s.vocab_dir / "schemas")
+        ]
+        return {"data": data}
+
+    @app.get("/v1/extractions")
+    def extractions(
+        schema: str = Query(default="project_application"),
+        field: str | None = Query(default=None),
+        due_before: str | None = Query(default=None, description="仅返回截止日期早于该值的记录 (YYYY-MM-DD)"),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            rows = db.list_extractions(conn, schema_id=schema, field=field, due_before=due_before, limit=limit)
+        finally:
+            conn.close()
+        return {"data": rows, "meta": {"total": len(rows), "schema": schema}}
+
+    @app.get("/v1/runs")
+    def runs(limit: int = Query(default=20, ge=1, le=100)) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            return {"data": db.list_runs(conn, limit)}
+        finally:
+            conn.close()
+
+    @app.exception_handler(HTTPException)
+    async def http_exc_handler(request, exc: HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"code": exc.status_code, "message": exc.detail}},
+        )
+
+    return app
+
+
+app = create_app()

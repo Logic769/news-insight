@@ -1,0 +1,55 @@
+{
+  "schema_id": "project_application",
+  "name": "项目申报关键线索",
+  "description": "从项目申报类新闻中抽取申报要件。原文没有的字段必须返回 null，禁止推测。",
+  "trigger_tags": [
+    "project_application"
+  ],
+  "fields": [
+    {
+      "name": "program_name",
+      "type": "string",
+      "description": "申报/征集的项目名称或计划名称"
+    },
+    {
+      "name": "issuing_authority",
+      "type": "string",
+      "description": "发布或组织申报的单位"
+    },
+    {
+      "name": "eligible_applicants",
+      "type": "string",
+      "description": "申报主体资格，如企业、高校、科研院所"
+    },
+    {
+      "name": "materials",
+      "type": "array",
+      "description": "申报所需材料清单，逐项列出"
+    },
+    {
+      "name": "deadline",
+      "type": "date",
+      "description": "申报截止日期，归一化为 YYYY-MM-DD"
+    },
+    {
+      "name": "deadline_raw",
+      "type": "string",
+      "description": "截止时间的原文表述，如「自发布之日起30日内」"
+    },
+    {
+      "name": "funding_amount",
+      "type": "string",
+      "description": "资助金额或支持额度"
+    },
+    {
+      "name": "application_channel",
+      "type": "string",
+      "description": "申报渠道、系统名称或网址"
+    },
+    {
+      "name": "contact",
+      "type": "string",
+      "description": "联系人及联系电话"
+    }
+  ]
+}
