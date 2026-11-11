@@ -70,15 +70,39 @@ jobs:
           pip install pyyaml
           python - <<'PY'
           import pathlib, sys, yaml
+
+
+          class UniqueKeyLoader(yaml.SafeLoader):
+              """safe_load 会静默保留重复键的最后一个值，这里改成直接报错。"""
+
+
+          def _construct_mapping(loader, node, deep=False):
+              seen = set()
+              for key_node, _ in node.value:
+                  key = loader.construct_object(key_node, deep=deep)
+                  if key in seen:
+                      raise yaml.constructor.ConstructorError(
+                          None, None, f"duplicate mapping key: {key!r}", key_node.start_mark
+                      )
+                  seen.add(key)
+              return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+
+          UniqueKeyLoader.add_constructor(
+              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
+          )
+
+          SKIP = {".git", "backups", "data", "data_live"}
           bad = []
-          for path in sorted(pathlib.Path(".").rglob("*.yml")) + sorted(pathlib.Path(".").rglob("*.yaml")):
-              if any(p in {".git", "backups", "data", "data_live"} for p in path.parts):
+          paths = sorted(pathlib.Path(".").rglob("*.yml")) + sorted(pathlib.Path(".").rglob("*.yaml"))
+          for path in paths:
+              if any(part in SKIP for part in path.parts):
                   continue
               try:
-                  yaml.safe_load(path.read_text(encoding="utf-8"))
+                  yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyLoader)
               except Exception as exc:
                   bad.append(f"{path}: {exc}")
-          print("\n".join(bad) if bad else "all YAML files parsed")
+          print("\n".join(bad) if bad else f"all {len(paths)} YAML files parsed")
           sys.exit(1 if bad else 0)
           PY
 
