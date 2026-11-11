@@ -11,9 +11,9 @@ permissions:
   contents: read
 
 concurrency:
-  # 只在 PR 上取消旧跑，且 PR 共用一个并发组。
-  # master 的每次 push 用独立组（带 sha）：同一组最多保留一个等待中的运行，
-  # 连续两次 push 会把中间那次从队列里挤掉，那个提交就永远没有 CI 记录。
+  # PR 共用一个并发组并在新 push 时取消旧跑，省 runner。
+  # master 每次 push 独立成组（带 sha）、互不取消，保证每个提交都留下 CI 记录；
+  # 代价是连续 push 会并行占用多个 runner。
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -43,7 +43,7 @@ jobs:
           pip install ".[dev]"
 
       - name: Byte-compile all sources
-        run: python -m compileall -q app tests
+        run: python -m compileall -q app tests tools
 
       # 规则集与排除项在 pyproject.toml 的 [tool.ruff] 中，CI 与本地保持一致。
       - name: Ruff
@@ -69,11 +69,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Validate YAML files
         run: |
           python -m pip install --upgrade pip
-          pip install "pyyaml>=6,<7"
+          # 装 dev 组：pyyaml 只在 pyproject.toml 声明一处，避免与 CI 里的版本漂移。
+          pip install ".[dev]"
           # 校验逻辑放在 tools/yaml_lint.py，本地与 CI 跑的是同一份代码。
           python tools/yaml_lint.py
 
