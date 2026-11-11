@@ -1,5 +1,7 @@
 """HTTP 面：入站鉴权与错误格式。"""
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -65,3 +67,24 @@ def test_analyze_limit_capped(client):
     assert resp.status_code == 422
     body = resp.json()["error"]
     assert body["code"] == 422 and body["details"]
+
+
+def test_async_job_lifecycle(client):
+    headers = {"X-API-Key": "secret"}
+    resp = client.post("/v1/jobs", json={"limit": 4}, headers=headers)
+    assert resp.status_code == 202
+    job = resp.json()["data"]
+    assert job["status"] in ("queued", "running", "succeeded")
+    job_id = job["id"]
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        current = client.get(f"/v1/jobs/{job_id}", headers=headers).json()["data"]
+        if current["status"] in ("succeeded", "failed"):
+            break
+        time.sleep(0.05)
+    assert current["status"] == "succeeded", current
+    assert current["result"]["analyzed"] == 4
+
+    listing = client.get("/v1/jobs", headers=headers).json()["data"]
+    assert any(item["id"] == job_id for item in listing)

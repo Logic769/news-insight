@@ -107,6 +107,9 @@ def test_empty_body_is_not_persisted(settings, monkeypatch):
                 art.body_ok = False
             return articles
 
+        def close(self):
+            pass
+
     monkeypatch.setattr(pipeline, "NewsClient", FakeClient)
     result = pipeline.analyze_batch(settings, limit=1)
     assert result["analyzed"] == 0
@@ -137,6 +140,50 @@ def test_one_bad_article_does_not_sink_batch(settings, monkeypatch):
     assert result["analyzed"] == 3
 
 
+def test_failed_commit_records_only_committed_count(settings, monkeypatch):
+    """中途提交失败时，runs.analyzed 只能记已 COMMIT 的篇数，不能把回滚掉的算进去。"""
+    from dataclasses import replace
+
+    import app.pipeline as pipeline
+
+    class FlakyCommitConnection:
+        def __init__(self, conn, fail_on: int):
+            self._conn = conn
+            self._commits = 0
+            self._fail_on = fail_on
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def commit(self):
+            self._commits += 1
+            if self._commits == self._fail_on:
+                self._fail_on = 0
+                raise RuntimeError("commit boom")
+            return self._conn.commit()
+
+    real_connect = db.connect
+    holder = {}
+
+    def connect(path):
+        wrapper = FlakyCommitConnection(real_connect(path), fail_on=4)
+        holder["conn"] = wrapper
+        return wrapper
+
+    monkeypatch.setattr(pipeline.db, "connect", connect)
+    crash_settings = replace(settings, analyze_write_batch=1)
+    with pytest.raises(RuntimeError, match="commit boom"):
+        pipeline.analyze_batch(crash_settings, limit=4)
+
+    conn = real_connect(crash_settings.db_path)
+    try:
+        row = conn.execute("select analyzed from runs order by id desc limit 1").fetchone()
+        assert row is not None and row["analyzed"] == 1
+        assert conn.execute("select count(*) from analyzed_articles").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
 def test_auto_fallback_reason_lands_in_run_detail(settings, monkeypatch):
     """auto 模式回退演示数据时，runs.detail 要能看出回退原因。"""
     from dataclasses import replace
@@ -154,6 +201,9 @@ def test_auto_fallback_reason_lands_in_run_detail(settings, monkeypatch):
 
         def hydrate_bodies(self, articles, mode):
             return articles
+
+        def close(self):
+            pass
 
     monkeypatch.setattr(pipeline, "NewsClient", FakeClient)
     auto = replace(settings, news_source_mode="auto")

@@ -48,10 +48,9 @@ def test_llm_range_start_is_replaced_by_right_end():
     )
     values = {f.name: f for f in result.fields}
     assert values["deadline"].value == "2025-12-01"
-    # 值被代码从模型给的起点改写成右端：verified 仍成立，但置信度封顶 0.85，
-    # 避免下游把「正则推出来的值」当成模型 0.9 的高置信结论。
-    assert values["deadline"].confidence == 0.85
-    assert values["deadline"].verified is True
+    # 值被代码从模型给的起点改写成右端：必须降级为待人工确认，不能 verified=True。
+    assert values["deadline"].confidence == 0.5
+    assert values["deadline"].verified is False
 
 
 def test_llm_single_date_is_kept():
@@ -177,9 +176,57 @@ def test_llm_deadline_range_wins_over_earlier_range():
     assert values["deadline"].value == "2025-12-01"
 
 
+def test_llm_unrelated_earlier_range_does_not_override_single_deadline():
+    """B1 回归：早期报名区间 + 截止只写单个日期，不能取报名区间的右端。"""
+    raw = "报名时间2026年3月1日至3月5日，申报截止2026年4月20日"
+    llm = _StubLLM(
+        {"deadline": {"value": "2026-04-20", "raw_text": raw, "confidence": 0.9}}
+    )
+    result = extract_with_llm(
+        llm,
+        _schema(),
+        title="申报通知",
+        body=raw + "，逾期不予受理。",
+        base=dt.date(2026, 3, 10),
+        body_chars=6000,
+    )
+    values = {f.name: f for f in result.fields}
+    assert values["deadline"].value == "2026-04-20"
+    # 模型值本来就对，代码不需要改写，可保持高置信
+    assert values["deadline"].confidence == 0.9
+    assert values["deadline"].verified is True
+
+
+def test_llm_training_range_plus_single_deadline_prefers_deadline():
+    """培训区间 + 截止单日期：即使模型取错，也不能被无关区间覆盖。"""
+    raw = "培训时间 2026年3月2日至3月4日；截止日期为2026年4月20日。"
+    llm = _StubLLM(
+        {"deadline": {"value": "2026-03-02", "raw_text": raw, "confidence": 0.9}}
+    )
+    result = extract_with_llm(
+        llm,
+        _schema(),
+        title="申报通知",
+        body=raw,
+        base=dt.date(2026, 3, 1),
+        body_chars=6000,
+    )
+    values = {f.name: f for f in result.fields}
+    assert values["deadline"].value == "2026-04-20"
+    assert values["deadline"].confidence == 0.5
+    assert values["deadline"].verified is False
+
+
 def test_range_regex_ignores_phone_and_clock():
     """电话与「8:00-17:00」不能被当成日期区间。"""
     from app.extraction import _pick_range
 
     assert _pick_range("联系人 0571-88886666") is None
     assert _pick_range("每天 8:00-17:00 开放") is None
+
+
+def test_deadline_prefix_does_not_cross_comma_into_evaluation_range():
+    """「截止」后没有日期、下一句是评审区间时，不能把评审区间当截止区间。"""
+    from app.extraction import _pick_range
+
+    assert _pick_range("截止后不再受理，评审时间2026年3月1日至2026年3月5日") is None

@@ -120,6 +120,35 @@ def test_llm_drops_too_short_source():
     assert parse_llm_items(payload, BODY) == []
 
 
+def test_llm_rejects_date_that_is_numeric_subsequence_of_another_date():
+    body = "申报截止时间为2026年4月20日，请通过国科管系统提交项目申报书。"
+    payload = {
+        "items": [
+            {
+                "text": "截止时间 2026-04-02",
+                "basis": "excerpt",
+                "source_text": "申报截止时间为2026年4月20日",
+            }
+        ]
+    }
+    # 旧实现按数字子串匹配，04-02 的三个数字都能在 2026-04-20 里找到而误通过。
+    assert parse_llm_items(payload, body) == []
+
+
+def test_llm_accepts_same_date_in_different_separator_style():
+    body = "申报截止时间为2026年4月20日，请通过国科管系统提交项目申报书。"
+    payload = {
+        "items": [
+            {
+                "text": "截止时间 2026-04-20",
+                "basis": "excerpt",
+                "source_text": "申报截止时间为2026年4月20日",
+            }
+        ]
+    }
+    assert len(parse_llm_items(payload, body)) == 1
+
+
 def test_llm_checklist_engine():
     payload = {
         "items": [

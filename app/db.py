@@ -72,7 +72,20 @@ CREATE TABLE IF NOT EXISTS article_checklists (
     generated_at TEXT NOT NULL
 );
 
+-- 异步分析作业：API 提交后立即返回，后台线程执行；状态落库，进程重启后能看出中断。
+CREATE TABLE IF NOT EXISTS analysis_jobs (
+    id          TEXT PRIMARY KEY,
+    status      TEXT NOT NULL,   -- queued/running/succeeded/failed
+    payload     TEXT NOT NULL,   -- {"limit":..,"force":..,"concurrency":..}
+    result      TEXT,
+    error       TEXT,
+    created_at  TEXT NOT NULL,
+    started_at  TEXT,
+    finished_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON article_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON analysis_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_analyzed_published ON analyzed_articles(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_extractions_schema ON extractions(schema_id, field);
 """
@@ -94,8 +107,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # 先设 busy_timeout，再只在非 WAL 时切模式：每次连接都执行 journal_mode=WAL
+    # 在并发读写下会多拿一次写锁，且对已是 WAL 的库没有收益。
     conn.execute("PRAGMA busy_timeout=30000")
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    if str(mode).lower() != "wal":
+        conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -120,13 +137,20 @@ def save_analysis(
     extract_engine: str,
     tags: Iterable[tuple[str, float, str, str]],
     extractions: Iterable[tuple[str, str, Any, str, float, bool]],
+    commit: bool = True,
 ) -> None:
     """Replace any previous analysis for this article (idempotent re-runs).
 
-    整体在一个事务里完成；中途失败立刻回滚，避免调用方吞掉异常后，
-    下一篇的 commit 把这里已执行的 DELETE 一起提交，留下「有主行、无标签」的脏状态。
+    使用 SAVEPOINT 而不是整库 rollback：批量写入时一篇失败只回滚这一篇，
+    不能让同一批里已经写好的文章被调用方的下一次 commit 连带回滚。
+    commit=False 供批量事务使用，由调用方统一提交。
     """
     now = _now()
+    # SAVEPOINT 在无外层事务时是“最外层”，RELEASE 会立即提交；
+    # commit=False 的批量场景必须先显式开事务，否则批量提交退化为逐篇提交。
+    if not commit and not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute("SAVEPOINT save_analysis")
     try:
         _replace_analysis(
             conn,
@@ -143,10 +167,14 @@ def save_analysis(
             extractions=extractions,
             now=now,
         )
-        conn.commit()
     except Exception:
-        conn.rollback()
+        conn.execute("ROLLBACK TO save_analysis")
+        conn.execute("RELEASE save_analysis")
         raise
+    else:
+        conn.execute("RELEASE save_analysis")
+        if commit:
+            conn.commit()
 
 
 def _replace_analysis(
@@ -202,6 +230,14 @@ def is_analyzed(conn: sqlite3.Connection, article_id: str) -> bool:
     return row is not None
 
 
+def analyzed_ids(conn: sqlite3.Connection) -> set[str]:
+    """一次取全量已分析 ID，避免 10000 篇时逐篇 SELECT。"""
+    return {
+        str(row[0])
+        for row in conn.execute("SELECT article_id FROM analyzed_articles").fetchall()
+    }
+
+
 def record_run_start(conn: sqlite3.Connection, mode: str) -> int:
     cur = conn.execute("INSERT INTO runs (started_at, mode) VALUES (?,?)", (_now(), mode))
     conn.commit()
@@ -223,6 +259,99 @@ def record_run_finish(
         (_now(), scanned, analyzed, skipped, errors, detail[:2000], run_id),
     )
     conn.commit()
+
+
+# ------------------------------------------------------------------ jobs
+def create_analysis_job(conn: sqlite3.Connection, *, job_id: str, payload: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO analysis_jobs (id, status, payload, created_at) VALUES (?,?,?,?)",
+        (job_id, "queued", json.dumps(payload, ensure_ascii=False, sort_keys=True), _now()),
+    )
+    conn.commit()
+
+
+def update_analysis_job(
+    conn: sqlite3.Connection,
+    job_id: str,
+    *,
+    status: str | None = None,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+    started: bool = False,
+    finished: bool = False,
+) -> None:
+    sets: list[str] = []
+    args: list[Any] = []
+    if status is not None:
+        sets.append("status = ?")
+        args.append(status)
+    if result is not None:
+        sets.append("result = ?")
+        args.append(json.dumps(result, ensure_ascii=False))
+    if error is not None:
+        sets.append("error = ?")
+        args.append(error[:2000])
+    if started:
+        sets.append("started_at = ?")
+        args.append(_now())
+    if finished:
+        sets.append("finished_at = ?")
+        args.append(_now())
+    if not sets:
+        return
+    args.append(job_id)
+    conn.execute(f"UPDATE analysis_jobs SET {', '.join(sets)} WHERE id = ?", args)
+    conn.commit()
+
+
+def _job_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    for key in ("payload", "result"):
+        if item.get(key):
+            item[key] = _load_json(item[key])
+    return item
+
+
+def get_analysis_job(conn: sqlite3.Connection, job_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+    return _job_row(row) if row is not None else None
+
+
+def list_analysis_jobs(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM analysis_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [_job_row(r) for r in rows]
+
+
+def find_active_job(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Same-parameter queued/running job reuse: double-clicking POST must not burn tokens twice."""
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    row = conn.execute(
+        "SELECT * FROM analysis_jobs WHERE status IN ('queued','running') AND payload = ?"
+        " ORDER BY created_at LIMIT 1",
+        (raw,),
+    ).fetchone()
+    return _job_row(row) if row is not None else None
+
+
+def count_active_analysis_jobs(conn: sqlite3.Connection) -> int:
+    """queued + running：用于 POST /v1/jobs 的排队上限保护。"""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM analysis_jobs WHERE status IN ('queued','running')"
+    ).fetchone()
+    return int(row[0])
+
+
+def mark_stale_jobs_failed(conn: sqlite3.Connection) -> int:
+    """The in-process executor cannot resume after a restart; surface that instead of a silent stuck job."""
+    cur = conn.execute(
+        "UPDATE analysis_jobs SET status='failed', error=COALESCE(error, '进程重启，任务中断'), finished_at=?"
+        " WHERE status IN ('queued','running')",
+        (_now(),),
+    )
+    conn.commit()
+    return int(cur.rowcount)
 
 
 def list_analyzed(
@@ -290,8 +419,12 @@ def save_checklist(
     article_id: str,
     engine: str,
     items: Iterable[dict[str, Any]],
+    commit: bool = True,
 ) -> None:
     """Insert or replace one article's checklist (idempotent re-runs)."""
+    if not commit and not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute("SAVEPOINT save_checklist")
     try:
         conn.execute(
             """
@@ -303,20 +436,31 @@ def save_checklist(
             """,
             (article_id, engine, json.dumps(list(items), ensure_ascii=False), _now()),
         )
-        conn.commit()
     except Exception:
-        conn.rollback()
+        conn.execute("ROLLBACK TO save_checklist")
+        conn.execute("RELEASE save_checklist")
         raise
+    else:
+        conn.execute("RELEASE save_checklist")
+        if commit:
+            conn.commit()
 
 
-def delete_checklist(conn: sqlite3.Connection, article_id: str) -> None:
+def delete_checklist(conn: sqlite3.Connection, article_id: str, *, commit: bool = True) -> None:
     """Drop a stale checklist when a re-analysis no longer triggers the schema."""
+    if not commit and not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute("SAVEPOINT delete_checklist")
     try:
         conn.execute("DELETE FROM article_checklists WHERE article_id = ?", (article_id,))
-        conn.commit()
     except Exception:
-        conn.rollback()
+        conn.execute("ROLLBACK TO delete_checklist")
+        conn.execute("RELEASE delete_checklist")
         raise
+    else:
+        conn.execute("RELEASE delete_checklist")
+        if commit:
+            conn.commit()
 
 
 def get_checklist(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | None:
@@ -392,3 +536,88 @@ def list_extractions(
 def list_runs(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
     rows = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------- retention
+def _retention_cutoff(retention_days: int) -> str:
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def prune_old_data(
+    conn: sqlite3.Connection, *, retention_days: int, dry_run: bool = False
+) -> dict[str, Any]:
+    """Delete analysis results older than retention_days.
+
+    SQLite has no foreign keys here, so child rows are removed explicitly before
+    the article row. All deletes share one transaction; a failure leaves nothing
+    half-deleted. VACUUM is a separate step because it cannot run in a transaction.
+    """
+    cutoff = _retention_cutoff(retention_days)
+    article_subquery = "SELECT article_id FROM analyzed_articles WHERE analyzed_at < ?"
+    tables = ("article_tags", "extractions", "article_checklists")
+    counts: dict[str, int] = {}
+    try:
+        for table in tables:
+            if dry_run:
+                counts[table] = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE article_id IN ({article_subquery})",
+                        (cutoff,),
+                    ).fetchone()[0]
+                )
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE article_id IN ({article_subquery})", (cutoff,)
+                )
+                counts[table] = int(cur.rowcount)
+        if dry_run:
+            counts["analyzed_articles"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM analyzed_articles WHERE analyzed_at < ?", (cutoff,)
+                ).fetchone()[0]
+            )
+            counts["runs"] = int(
+                conn.execute("SELECT COUNT(*) FROM runs WHERE started_at < ?", (cutoff,)).fetchone()[0]
+            )
+            counts["analysis_jobs"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM analysis_jobs"
+                    " WHERE status IN ('succeeded','failed')"
+                    " AND COALESCE(finished_at, created_at) < ?",
+                    (cutoff,),
+                ).fetchone()[0]
+            )
+        else:
+            counts["analyzed_articles"] = int(
+                conn.execute("DELETE FROM analyzed_articles WHERE analyzed_at < ?", (cutoff,)).rowcount
+            )
+            counts["runs"] = int(
+                conn.execute("DELETE FROM runs WHERE started_at < ?", (cutoff,)).rowcount
+            )
+            counts["analysis_jobs"] = int(
+                conn.execute(
+                    "DELETE FROM analysis_jobs"
+                    " WHERE status IN ('succeeded','failed')"
+                    " AND COALESCE(finished_at, created_at) < ?",
+                    (cutoff,),
+                ).rowcount
+            )
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "cutoff": cutoff,
+        "retention_days": retention_days,
+        "dry_run": dry_run,
+        "deleted": counts,
+    }
+
+
+def vacuum(conn: sqlite3.Connection) -> None:
+    """Reclaim file space after a large prune. Caller must have no open transaction."""
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("VACUUM")

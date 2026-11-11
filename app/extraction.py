@@ -254,7 +254,10 @@ def extract_with_llm(
                 derived = end_value
                 if str(value) != end_value:
                     LOG.info("日期区间取右端: %s %r -> %s", name, value, end_value)
-                    conf = min(conf, 0.85)
+                    # 代码改写了模型给的值，必须降级为“待人工确认”：即使右端来自原文，
+                    # 也不能把一次模型与原文的冲突包装成 verified=True。
+                    conf = min(conf, 0.5)
+                    date_mismatch = True
             else:
                 # 以原文为准重算：模型自算的 ISO 日期如果与原文对不上，降级可信度
                 derived = normalize_deadline(raw_text, base) or normalize_deadline(
@@ -307,9 +310,36 @@ _DEADLINE_PREFIX = r"(?:截止|截至|报送截止|申报截止|受理截止|需
 
 _DEADLINE_RANGE_RE = re.compile(
     _DEADLINE_PREFIX
-    + r"[^。；\n]{0,30}?"
+    # 不跨逗号：否则「截止后不再受理，评审时间3月1日至3月5日」会把评审区间
+    # 当成截止区间。真实写法「截止时间：4月20日」没有逗号，不受影响。
+    + r"[^。；，\n]{0,20}?"
     + rf"({_DATE_PART})"
     + rf"\s*{_RANGE_SEP}\s*({_DATE_PART}|{_DAY_ONLY})"
+)
+
+# 文本里出现「截止」字样时，全文唯一区间的兜底必须让位给模型判断：
+# 该区间可能是评审/培训区间，而不是截止区间。
+_DEADLINE_HINT_RE = re.compile(_DEADLINE_PREFIX)
+
+# 「截止 2026年4月20日」这类单个日期：不能因为文本前面还有一个报名/培训区间
+# 就把那个无关区间的右端当成截止日（上一轮 B1 回归）。
+_DEADLINE_SINGLE_RE = re.compile(
+    _DEADLINE_PREFIX
+    + r"[^。；，\n]{0,30}?("
+    + _DATE_PART
+    + r")(?![0-9年月日])(?!\s*"
+    + _RANGE_SEP
+    + r")"
+)
+
+# 「申报时间/填报时间 A 至 B」：多区间公告里优先认这类带业务前缀的区间，
+# 避免误取更早的培训、评审区间。
+_APPLICATION_RANGE_RE = re.compile(
+    r"(?:网上填报|网络填报|申报|填报|报送|受理|提交)(?:时间|日期|期限)?"
+    # 同样不跨逗号：避免把「不再受理，评审时间...」里的「受理」当成申报前缀。
+    + r"[^。；，\n]{0,20}?"
+    + rf"({_DATE_PART})(?:\s*\d{{1,2}}[:：]\d{{2}})?\s*{_RANGE_SEP}\s*"
+    + rf"({_DATE_PART}|{_DAY_ONLY})"
 )
 
 
@@ -350,18 +380,31 @@ def _resolve_range_end(start_raw: str, end_raw: str, base: dt.date | None) -> st
 
 
 def _pick_range(raw_text: str) -> tuple[str, str] | None:
-    """优先取带「截止」语义的区间；否则取文本中最后一个区间。
+    """优先取带「截止」语义的区间；其次取带申报/填报前缀的区间。
 
     公告常把申报/截止写在最后，而 raw_text 里可能同时出现培训、评审等多个区间。
+    「早期报名区间 + 截止只写单个日期」是上一轮 B1 回归的典型场景：此时必须
+    优先识别单日期，不能把报名区间的右端当成截止日。
     """
     m = _DEADLINE_RANGE_RE.search(raw_text)
     if m:
         return m.group(1), m.group(2)
-    matches = list(_RANGE_RE.finditer(raw_text))
-    if not matches:
+    single = _DEADLINE_SINGLE_RE.search(raw_text)
+    if single:
+        # 用 (date, date) 表示单个截止日，交给 _resolve_range_end 统一归一化。
+        return single.group(1), single.group(1)
+    m = _APPLICATION_RANGE_RE.search(raw_text)
+    if m:
+        return m.group(1), m.group(2)
+    # 全文只有一个普通区间时也不能无条件采信：如果句子另有「截止」字样，
+    # 这个区间更可能是评审/培训时间，保留模型值让人工复核。
+    if _DEADLINE_HINT_RE.search(raw_text):
         return None
-    last = matches[-1]
-    return last.group(1), last.group(2)
+    matches = list(_RANGE_RE.finditer(raw_text))
+    if len(matches) == 1:
+        return matches[0].group(1), matches[0].group(2)
+    # 多个无业务前缀的区间无法判断哪个是截止：保留模型值，避免猜错。
+    return None
 
 _RULE_PATTERNS: tuple[tuple[str, str], ...] = (
     (

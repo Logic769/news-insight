@@ -7,27 +7,33 @@ query extracted facts (the "project application deadline" example).
 from __future__ import annotations
 
 import logging
-import threading
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from app import __version__, db
 from app.extraction import load_schemas
+from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull
 from app.pipeline import analyze_batch, connect
+from app.prune import prune
 from app.settings import Settings, load_settings
 from app.tagging import load_vocab
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 LOG = logging.getLogger("news_insight.main")
 
-# 同步分析是重资源操作（每篇最多三次 LLM 调用：打标/抽取/清单）。并发触发只会重复烧 token，
-# 这里串行化：第二个请求立刻 409，而不是排队几十分钟。
-_ANALYZE_LOCK = threading.Lock()
-
 _OPEN_PATHS = ("/health", "/docs", "/redoc", "/openapi.json")
+
+
+class AnalyzeJobRequest(BaseModel):
+    type: Literal["analyze"] = "analyze"
+    limit: int = Field(default=100, ge=1, le=10000)
+    force: bool = False
+    concurrency: int | None = Field(default=None, ge=1, le=200)
 
 
 @asynccontextmanager
@@ -36,7 +42,17 @@ async def lifespan(app: FastAPI):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     db.init_db(settings.db_path)
     LOG.info("db ready at %s", settings.db_path)
+    manager = JobManager(settings)
+    manager.start()
+    app.state.jobs = manager
+    try:
+        result = prune(settings)
+        if not result.get("skipped"):
+            LOG.info("启动清理: %s", result.get("deleted"))
+    except Exception:
+        LOG.exception("启动清理失败（不影响服务启动）")
     yield
+    manager.shutdown()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -127,7 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         force: bool = Query(default=False),
     ) -> dict:
         s: Settings = app.state.settings
-        if not _ANALYZE_LOCK.acquire(blocking=False):
+        if not ANALYZE_LOCK.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="已有分析任务在运行，请稍后再试")
         try:
             result = analyze_batch(s, limit=limit, force=force)
@@ -136,7 +152,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             LOG.exception("分析失败")
             raise HTTPException(status_code=502, detail=f"分析失败，内部错误: {type(exc).__name__}") from exc
         finally:
-            _ANALYZE_LOCK.release()
+            ANALYZE_LOCK.release()
+        # 清理是维护动作：失败只记日志，不能把已成功的分析结果改写成 502。
+        try:
+            prune(s)
+        except Exception:
+            LOG.exception("清理过期数据失败（不影响本次分析结果）")
         return {"data": result}
 
     @app.get("/v1/articles")
@@ -247,6 +268,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"data": db.list_runs(conn, limit)}
         finally:
             conn.close()
+
+    @app.post("/v1/jobs")
+    def create_job(body: AnalyzeJobRequest):
+        """Submit an async analysis batch. Same payload while queued/running reuses the job."""
+        s: Settings = app.state.settings
+        jobs: JobManager = app.state.jobs
+        try:
+            job = jobs.submit(limit=body.limit, force=body.force, concurrency=body.concurrency)
+        except JobQueueFull as exc:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "code": "too_many_jobs",
+                        "status": 429,
+                        "message": str(exc),
+                    }
+                },
+            )
+        return JSONResponse(status_code=202, content={"data": job})
+
+    @app.get("/v1/jobs")
+    def list_jobs(limit: int = Query(default=20, ge=1, le=100)) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            return {"data": db.list_analysis_jobs(conn, limit)}
+        finally:
+            conn.close()
+
+    @app.get("/v1/jobs/{job_id}")
+    def get_job(job_id: str) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            job = db.get_analysis_job(conn, job_id)
+        finally:
+            conn.close()
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"未找到分析任务: {job_id}")
+        return {"data": job}
 
     @app.exception_handler(RequestValidationError)
     async def validation_handler(request: Request, exc: RequestValidationError):

@@ -16,11 +16,23 @@ services:
       NEWS_SOURCE_MODE: ${NEWS_SOURCE_MODE:-auto}
       NEWS_PAGE_SIZE: ${NEWS_PAGE_SIZE:-20}
       NEWS_TIMEOUT: ${NEWS_TIMEOUT:-15}
+      # 详情补正文的并发（每篇一次 GET /v1/articles/{id}）
+      NEWS_DETAIL_CONCURRENCY: ${NEWS_DETAIL_CONCURRENCY:-16}
+      # 分析并发：每篇 3 次串行 LLM 调用，线程数按 10000 篇/2 小时设计
+      ANALYZE_CONCURRENCY: ${ANALYZE_CONCURRENCY:-100}
+      # 主线程每 N 篇提交一次 SQLite，避免每篇一次 fsync
+      ANALYZE_WRITE_BATCH: ${ANALYZE_WRITE_BATCH:-50}
+      # 异步作业排队上限（queued + running），超过返回 429
+      ANALYZE_MAX_PENDING_JOBS: ${ANALYZE_MAX_PENDING_JOBS:-50}
+      # 超过该天数的分析结果自动删除；0 = 永久保留
+      RETENTION_DAYS: ${RETENTION_DAYS:-90}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      # 供应商侧同时请求上限；超过时本地排队（默认与 ANALYZE_CONCURRENCY 对齐）
+      LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-100}
       # 入站鉴权：设置 INSIGHT_API_KEY 后除 /health 与文档外都需 X-API-Key / Bearer
       INSIGHT_API_KEY: ${INSIGHT_API_KEY:-}
       INSIGHT_REQUIRE_AUTH: ${INSIGHT_REQUIRE_AUTH:-0}

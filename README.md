@@ -42,6 +42,8 @@ curl http://localhost:8020/health
 # 配了 INSIGHT_API_KEY 后，除 /health 与 /docs 外都要带 key
 KEY=your-insight-key
 curl -X POST "http://localhost:8020/v1/analyze?limit=10" -H "X-API-Key: $KEY"
+# 长批次用异步作业：202 立即返回 job_id，轮询 /v1/jobs/{id}
+curl -X POST "http://localhost:8020/v1/jobs" -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{"limit":1000}'
 curl "http://localhost:8020/v1/extractions?schema=project_application&due_before=2026-06-30" -H "X-API-Key: $KEY"
 ```
 
@@ -111,12 +113,32 @@ LLM_API_KEY=ollama
 
 **没有 LLM_API_KEY 时**：打标降级为关键词规则（`engine=rules`），申报抽取降级为正则 + 日期归一（`engine=rules`，置信度 0.4~0.5）。这不是替代方案，只是让流水线在没凭证时也能端到端跑通、便于验证部署；生产请配置模型。
 
+### 吞吐与保留
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ANALYZE_CONCURRENCY` | 100 | 同时在途的文章数（1–200）；每篇仍串行 3 次 LLM 调用 |
+| `ANALYZE_WRITE_BATCH` | 50 | 主线程每 N 篇提交一次 SQLite 事务 |
+| `ANALYZE_MAX_PENDING_JOBS` | 50 | 异步作业排队上限（queued + running），超过 `POST /v1/jobs` 返回 429 |
+| `NEWS_DETAIL_CONCURRENCY` | 16 | 从上游补正文的并发请求数（1–64） |
+| `LLM_MAX_CONCURRENCY` | 100 | 供应商侧同时请求上限（1–200）；超过时本地排队，用于避免瞬时打爆网关 |
+| `RETENTION_DAYS` | 90 | 分析结果保留天数（0–3650，0 = 不自动清理）；启动时和每次成功分析后执行硬删除 |
+
+清理也可手动触发：
+
+```bash
+docker compose run --rm insight python -m app prune --dry-run   # 先看会删多少
+docker compose run --rm insight python -m app prune --vacuum    # 删除并回收磁盘
+```
+
 ## HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
-| POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步返回统计，`limit` 上限 50） |
+| POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
+| POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
+| GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
 | GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
@@ -126,13 +148,13 @@ LLM_API_KEY=ollama
 | GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询，`due_before` 按截止日期过滤，可与 `field` 同时使用（按文章过滤，不是按字段） |
 | GET | `/v1/runs` | 运行记录（模式、扫描/分析/跳过/错误数） |
 
-CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10`。
+CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 --concurrency 100`；清理历史数据：`python -m app prune --dry-run`、`python -m app prune --vacuum`。
 
 ### 鉴权
 
 设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/openapi.json` 外都要求 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。注意 `NEWS_API_KEY` 是**出站**凭证（访问爬虫），与本服务入站鉴权无关。
 
-`/v1/analyze` 是同步执行且**全局串行**：已有批次在跑时第二个请求立刻返回 409，而不是排几十分钟队。长批次仍建议外部调度 + `limit` 分批。
+`/v1/analyze` 是同步兼容接口，`limit` 上限 50；分析作业**全局串行**，同步接口遇到已有批次会立刻返回 409，异步作业遇到分析锁被占用会直接标 `failed`（不会并行烧 token），排队作业总数超过 `ANALYZE_MAX_PENDING_JOBS` 时 `POST /v1/jobs` 返回 429。长批次请用 `POST /v1/jobs` + 轮询；单篇内部仍是「打标 → 抽取 → 清单」三次串行 LLM 调用，整体吞吐由 `ANALYZE_CONCURRENCY`（默认 100）决定。
 
 ## 扩展
 
@@ -181,6 +203,7 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10`�
 | `extractions` | `(article_id, schema_id, field)` 主键，含值、原文片段、置信度、是否定位成功 |
 | `article_checklists` | `article_id` 主键，清单项 JSON（`text`/`basis`/`source_text`）、生成引擎与时间 |
 | `runs` | 每次批处理的统计 |
+| `analysis_jobs` | 异步分析作业状态与结果（`queued`/`running`/`succeeded`/`failed`） |
 
 ## 测试
 
@@ -188,8 +211,8 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10`�
 # 宿主机（需要 pip install -e ".[dev]"）
 pytest -q
 
-# 或在镜像里跑，不用本地装依赖
-docker compose run --rm --entrypoint sh insight -c "pip install --user -q pytest && python -m pytest tests -q"
+# 或在镜像里跑（tests/ 不进镜像，必须挂载；镜像也不带 pytest）
+docker compose run --rm -v "$(pwd)/tests:/app/tests" --entrypoint sh insight -c "pip install --user -q pytest && python -m pytest tests -q"
 ```
 
 覆盖：日期归一（绝对/相对/跨年/月底/无基准）、闭集守卫（词表外丢弃、去重、max_tags）、demo 模式端到端（打标 + 申报抽取 + `due_before` 查询）、申报准备清单（规则顺序、`excerpt` 原文定位校验、「LLM 不可用 → 规则」降级、清单端点 404/200）、重跑幂等。
@@ -198,9 +221,9 @@ docker compose run --rm --entrypoint sh insight -c "pip install --user -q pytest
 
 - 抽取质量取决于模型与 prompt，本项目只保证「不越界」（不造标签、不造字段、值可定位），不保证召回；
 - 相对截止时间只覆盖常见表述（`N日内`/`N个工作日`/`本月底`），「公示结束后5个工作日」这类链式表述仍会漏；
-- `/v1/analyze` 同步执行（进程内已有互斥锁，并发第二个请求 409），长批次需要外部调度，或改成任务队列；
-- 清单生成按篇多一次 LLM 调用（正文按 `EXTRACT_BODY_CHARS` 截断），10 篇批次实测约 10 分钟，吞吐敏感时可改为规则清单或异步补齐；
-- 单进程单 SQLite，不适合多副本水平扩展；
+- 分析作业在进程内全局串行（同步接口与异步 job 共用一把锁），长批次请用 `POST /v1/jobs`；单进程单 SQLite，不适合多副本水平扩展；
+- 清单生成按篇多一次 LLM 调用（正文按 `EXTRACT_BODY_CHARS` 截断），每篇固定 3 次 LLM 请求；实际吞吐取决于供应商并发与限流，`ANALYZE_CONCURRENCY` 只是本地上限，`LLM_MAX_CONCURRENCY` 另外限制真正同时在途的供应商请求；遇到 429/5xx 会优先按 `Retry-After`、否则指数退避并加抖动重试；
+- `RETENTION_DAYS` 默认 90：启动时和每次成功分析后自动硬删除更早的 `analyzed_articles`/`article_tags`/`extractions`/`article_checklists`、`runs` 以及已完成的 `analysis_jobs`，不保留归档；
 - 演示数据与规则引擎只用于跑通链路，不作为效果基线。
 
 ## 致谢

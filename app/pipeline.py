@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Any
 
 from app import db
 from app.checklist import build_checklist, to_dicts
@@ -24,48 +27,153 @@ def _field_payload(fields) -> tuple[dict, dict, dict]:
     return values, raw_texts, verified
 
 
-def _maybe_regenerate_checklist(settings: Settings, llm: LLMClient, conn, art) -> None:
-    """Regenerate a missing checklist for an already-analyzed article.
+@dataclass
+class _ChecklistRegen:
+    """A skipped article whose derived checklist is missing and can be rebuilt."""
 
-    Idempotent skip would otherwise make a transient checklist failure permanent:
-    the article is marked analyzed, so later runs never touch it again. Only the
-    derived checklist is rebuilt -- tags and extractions stay untouched.
-    """
+    article: Any
+    fields: dict
+    raw_texts: dict
+    verified: dict
+
+
+def _checklist_regen_source(conn, art) -> _ChecklistRegen | None:
+    """Read what a missing checklist needs, on the main thread (SQLite owner)."""
     detail = db.get_article(conn, art.id)
     if not detail:
-        return
+        return None
     if "project_application" not in {t["tag"] for t in detail.get("tags", [])}:
-        return
+        return None
     if db.get_checklist(conn, art.id) is not None:
-        return
+        return None
     block = detail.get("extractions", {}).get("project_application") or {}
     if not block or not art.body.strip():
-        return
-    fields = {name: info["value"] for name, info in block.items()}
-    raw_texts = {name: info["raw_text"] for name, info in block.items() if info.get("raw_text")}
-    verified = {name: info["verified"] for name, info in block.items()}
+        return None
+    return _ChecklistRegen(
+        article=art,
+        fields={name: info["value"] for name, info in block.items()},
+        raw_texts={name: info["raw_text"] for name, info in block.items() if info.get("raw_text")},
+        verified={name: info["verified"] for name, info in block.items()},
+    )
+
+
+def _build_missing_checklist(settings: Settings, llm: LLMClient, regen: _ChecklistRegen):
+    """LLM-only worker body; persistence stays on the main thread."""
+    checklist = build_checklist(
+        llm,
+        regen.article.title,
+        regen.article.body,
+        regen.fields,
+        raw_texts=regen.raw_texts,
+        verified=regen.verified,
+        body_chars=settings.extract_body_chars,
+    )
+    return regen.article.id, checklist
+
+
+@dataclass
+class _AnalysisResult:
+    """Everything one worker produced for one article; persistence happens on the main thread."""
+
+    article: Any
+    tag_engine: str | None = None
+    hits: list = field(default_factory=list)
+    results: list = field(default_factory=list)
+    checklist: tuple[str, list] | None = None
+    error: str | None = None
+
+
+def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art) -> _AnalysisResult:
+    """Run all LLM calls for one article. Must not touch SQLite: workers are stateless."""
+    result = _AnalysisResult(article=art)
     try:
-        checklist = build_checklist(
+        hits, tag_engine = tag_article(settings, llm, tags, art.title, art.body)
+        result.hits = hits
+        result.tag_engine = tag_engine
+        results = extract_article(
+            settings,
             llm,
+            schemas,
+            hits,
             art.title,
             art.body,
-            fields,
-            raw_texts=raw_texts,
-            verified=verified,
-            body_chars=settings.extract_body_chars,
+            published_at_utc=art.published_at_utc,
+            published_at=art.published_at,
         )
-        db.save_checklist(
-            conn,
-            article_id=art.id,
-            engine=checklist.engine,
-            items=to_dicts(checklist.items),
+        result.results = results
+        app_result = next(
+            (r for r in results if r.schema_id == "project_application" and r.fields),
+            None,
         )
-        LOG.info("补生成缺失清单 %s", art.id)
-    except Exception:  # 补生成失败不影响本次 skip 语义
-        LOG.exception("补生成清单失败 %s", art.id)
+        if app_result is not None:
+            try:
+                fields, raw_texts, verified = _field_payload(app_result.fields)
+                checklist = build_checklist(
+                    llm,
+                    art.title,
+                    art.body,
+                    fields,
+                    raw_texts=raw_texts,
+                    verified=verified,
+                    body_chars=settings.extract_body_chars,
+                )
+                result.checklist = (checklist.engine, to_dicts(checklist.items))
+            except Exception:  # 清单失败不能把整篇标记为错误
+                LOG.exception("生成申报清单失败 %s", art.id)
+    except Exception as exc:  # one bad article must not sink the batch
+        result.error = str(exc) or exc.__class__.__name__
+    return result
 
 
-def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dict:
+def _persist_result(conn, result: _AnalysisResult) -> None:
+    """Write one result using savepoints only; caller batches the real commits."""
+    art = result.article
+    extract_engine = result.results[0].engine if result.results else "none"
+    flat = [
+        (r.schema_id, f.name, f.value, f.raw_text, f.confidence, f.verified)
+        for r in result.results
+        for f in r.fields
+    ]
+    db.save_analysis(
+        conn,
+        article_id=art.id,
+        source=art.source,
+        url=art.url,
+        title=art.title,
+        published_at=art.published_at,
+        published_at_utc=art.published_at_utc,
+        content_length=art.content_length,
+        tag_engine=result.tag_engine or "",
+        extract_engine=extract_engine,
+        tags=[(h.tag_id, h.confidence, h.evidence, h.engine) for h in result.hits],
+        extractions=flat,
+        commit=False,
+    )
+    if result.checklist is not None:
+        engine, items = result.checklist
+        try:
+            db.save_checklist(conn, article_id=art.id, engine=engine, items=items, commit=False)
+        except Exception:  # 清单是派生视图，失败不影响已抽取事实
+            LOG.exception("保存申报清单失败 %s", art.id)
+    elif not any(h.tag_id == "project_application" for h in result.hits):
+        # 只有本次打标也确认不再命中时才作废旧清单，避免抽取抖动误删
+        try:
+            if db.get_checklist(conn, art.id) is not None:
+                db.delete_checklist(conn, art.id, commit=False)
+        except Exception:
+            LOG.exception("删除旧清单失败 %s", art.id)
+
+
+def analyze_batch(
+    settings: Settings,
+    *,
+    limit: int,
+    force: bool = False,
+    concurrency: int | None = None,
+) -> dict:
+    workers = concurrency if concurrency is not None else settings.analyze_concurrency
+    workers = max(1, min(int(workers), 200))
+
     _, tags = load_vocab(settings.vocab_dir)
     schemas = load_schemas(settings.vocab_dir / "schemas")
     llm = LLMClient(settings)
@@ -74,6 +182,11 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
     # 幂等建表：API 走 lifespan 已建过，但 CLI/库调用不应依赖调用方先初始化
     db.init_db(settings.db_path)
     conn = db.connect(settings.db_path)
+    run_id: int | None = None
+    run_finished = False
+    scanned = analyzed = skipped = errors = 0
+    # 已真正 COMMIT 的篇数：异常路径用它写 runs，避免把回滚掉的篇数算进 analyzed。
+    analyzed_committed = 0
     try:
         mode_guess = settings.news_source_mode
         run_id = db.record_run_start(conn, mode_guess)
@@ -82,6 +195,7 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
             articles, mode = client.list_articles(limit=limit)
         except UpstreamError as exc:
             db.record_run_finish(conn, run_id, scanned=0, analyzed=0, skipped=0, errors=1, detail=str(exc))
+            run_finished = True
             raise
 
         conn.execute("UPDATE runs SET mode = ? WHERE id = ?", (mode, run_id))
@@ -89,7 +203,7 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
 
         articles = client.hydrate_bodies(articles, mode)
 
-        scanned = analyzed = skipped = errors = 0
+        scanned = len(articles)
         engine_counts = {"llm": 0, "rules": 0}
         error_notes: list[str] = []
         if mode == "demo" and settings.news_source_mode == "auto" and client.fallback_reason:
@@ -97,94 +211,113 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
             error_notes.append(note)
             LOG.warning(note)
 
+        analyzed_set = set() if force else db.analyzed_ids(conn)
+        pending: list[Any] = []
+        regen_pending: list[_ChecklistRegen] = []
         for art in articles:
-            scanned += 1
             if not art.id or not art.title:
                 skipped += 1
                 continue
-            if not force and db.is_analyzed(conn, art.id):
+            if art.id in analyzed_set:
                 # 已分析但缺清单（上次生成失败）时补生成，否则清单会永久缺失
-                _maybe_regenerate_checklist(settings, llm, conn, art)
+                regen = _checklist_regen_source(conn, art)
+                if regen is not None:
+                    regen_pending.append(regen)
                 skipped += 1
                 continue
-            if not art.body.strip():
+            if not art.body_ok or not art.body.strip():
                 # 只拿标题打标会把「确无截止日」永久定档：宁可这次不入库，让下次自然重试
                 errors += 1
                 error_notes.append(f"{art.id}: 正文缺失，待重试")
                 LOG.warning("正文缺失，跳过分析（不入库，下次重试） %s", art.id)
                 continue
-            try:
-                hits, tag_engine = tag_article(settings, llm, tags, art.title, art.body)
-                engine_counts[tag_engine] = engine_counts.get(tag_engine, 0) + 1
-                results = extract_article(
-                    settings,
-                    llm,
-                    schemas,
-                    hits,
-                    art.title,
-                    art.body,
-                    published_at_utc=art.published_at_utc,
-                    published_at=art.published_at,
-                )
-                extract_engine = results[0].engine if results else "none"
-                flat = [
-                    (r.schema_id, f.name, f.value, f.raw_text, f.confidence, f.verified)
-                    for r in results
-                    for f in r.fields
-                ]
-                db.save_analysis(
-                    conn,
-                    article_id=art.id,
-                    source=art.source,
-                    url=art.url,
-                    title=art.title,
-                    published_at=art.published_at,
-                    published_at_utc=art.published_at_utc,
-                    content_length=art.content_length,
-                    tag_engine=tag_engine,
-                    extract_engine=extract_engine,
-                    tags=[(h.tag_id, h.confidence, h.evidence, h.engine) for h in hits],
-                    extractions=flat,
-                )
-                # 清单是派生视图：生成失败只记日志，不影响已入库的事实
-                app_result = next(
-                    (r for r in results if r.schema_id == "project_application" and r.fields),
-                    None,
-                )
-                if app_result is not None:
+            pending.append(art)
+
+        if regen_pending:
+            # 历史文章缺清单不应串行阻塞整批：与正常分析共用同一并发池的容量。
+            regen_workers = max(1, min(workers, len(regen_pending)))
+            LOG.info("补生成缺失清单 %d 篇，并发=%d", len(regen_pending), regen_workers)
+            built = []
+            if regen_workers == 1 or len(regen_pending) == 1:
+                for item in regen_pending:
                     try:
-                        fields, raw_texts, verified = _field_payload(app_result.fields)
-                        checklist = build_checklist(
-                            llm,
-                            art.title,
-                            art.body,
-                            fields,
-                            raw_texts=raw_texts,
-                            verified=verified,
-                            body_chars=settings.extract_body_chars,
-                        )
-                        db.save_checklist(
-                            conn,
-                            article_id=art.id,
-                            engine=checklist.engine,
-                            items=to_dicts(checklist.items),
-                        )
-                    except Exception:  # 清单失败不能把整篇标记为错误
-                        LOG.exception("生成申报清单失败 %s", art.id)
-                elif not any(h.tag_id == "project_application" for h in hits):
-                    # 只有本次打标也确认不再命中时才作废旧清单，避免抽取抖动误删
-                    if db.get_checklist(conn, art.id) is not None:
-                        db.delete_checklist(conn, art.id)
-                analyzed += 1
-            except Exception as exc:  # one bad article must not sink the batch
-                errors += 1
-                error_notes.append(f"{art.id}: {exc}")
-                LOG.exception("分析文章失败 %s", art.id)
+                        built.append(_build_missing_checklist(settings, llm, item))
+                    except Exception:
+                        LOG.exception("补生成清单失败 %s", item.article.id)
+            else:
+                with ThreadPoolExecutor(max_workers=regen_workers) as executor:
+                    futures = {
+                        executor.submit(_build_missing_checklist, settings, llm, item): item
+                        for item in regen_pending
+                    }
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
+                            built.append(future.result())
+                        except Exception:
+                            LOG.exception("补生成清单失败 %s", item.article.id)
+            for article_id, checklist in built:
+                try:
+                    db.save_checklist(
+                        conn,
+                        article_id=article_id,
+                        engine=checklist.engine,
+                        items=to_dicts(checklist.items),
+                        commit=False,
+                    )
+                    LOG.info("补生成缺失清单 %s", article_id)
+                except Exception:  # 补生成失败不影响本次 skip 语义
+                    LOG.exception("保存补生成清单失败 %s", article_id)
+            conn.commit()
+
+        LOG.info("开始分析 %d 篇，并发=%d", len(pending), workers)
+        if workers == 1 or len(pending) <= 1:
+            results_iter = (_analyze_one(settings, llm, tags, schemas, art) for art in pending)
+            executor = None
+        else:
+            executor = ThreadPoolExecutor(max_workers=min(workers, len(pending)))
+            futures = [
+                executor.submit(_analyze_one, settings, llm, tags, schemas, art) for art in pending
+            ]
+            results_iter = (f.result() for f in as_completed(futures))
+
+        uncommitted = 0
+        done = 0
+        try:
+            for result in results_iter:
+                done += 1
+                if result.tag_engine:
+                    engine_counts[result.tag_engine] = engine_counts.get(result.tag_engine, 0) + 1
+                if result.error is not None:
+                    errors += 1
+                    error_notes.append(f"{result.article.id}: {result.error}")
+                    LOG.error("分析文章失败 %s: %s", result.article.id, result.error)
+                else:
+                    try:
+                        _persist_result(conn, result)
+                        analyzed += 1
+                        uncommitted += 1
+                    except Exception as exc:  # savepoint rolls back this article only
+                        errors += 1
+                        error_notes.append(f"{result.article.id}: 落库失败: {exc}")
+                        LOG.exception("落库失败 %s", result.article.id)
+                if uncommitted >= settings.analyze_write_batch:
+                    conn.commit()
+                    analyzed_committed = analyzed
+                    uncommitted = 0
+                if done % 100 == 0:
+                    LOG.info("分析进度 %d/%d（成功 %d，失败 %d）", done, len(pending), analyzed, errors)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+        conn.commit()
+        analyzed_committed = analyzed
 
         detail = "; ".join(error_notes[:10])
         db.record_run_finish(
             conn, run_id, scanned=scanned, analyzed=analyzed, skipped=skipped, errors=errors, detail=detail
         )
+        run_finished = True
         return {
             "run_id": run_id,
             "mode": mode,
@@ -195,7 +328,29 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
             "tag_engines": engine_counts,
             "llm_enabled": llm.available,
         }
+    except Exception as exc:
+        # 任何中途异常（详情补全、落库、提交）都要收尾 runs，避免永久“运行中”孤儿行。
+        try:
+            conn.rollback()
+        except Exception:
+            LOG.exception("回滚未提交事务失败")
+        if run_id is not None and not run_finished:
+            try:
+                db.record_run_finish(
+                    conn,
+                    run_id,
+                    scanned=scanned,
+                    analyzed=analyzed_committed,
+                    skipped=skipped,
+                    errors=max(errors, 1),
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                LOG.exception("记录失败运行状态失败 run_id=%s", run_id)
+        raise
     finally:
+        client.close()
+        llm.close()
         conn.close()
 
 

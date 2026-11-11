@@ -91,12 +91,23 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
+def _digit_signature(text: str) -> str:
+    """Canonical numeric-run sequence, ignoring separators and leading zeros.
+
+    A plain substring test is wrong in both directions: "2026-04-20" must not
+    match "2026-04-02", but "2025-12-01" should match "2025年12月1日".
+    Pipe-wrapping each run keeps segment boundaries, so "4|2" cannot match "4|20".
+    """
+    return "|".join(str(int(d)) for d in re.findall(r"\d+", text))
+
+
 def _token_supported(token: str, evidence: str) -> bool:
     if token in evidence:
         return True
-    # Compare numeric parts without leading zeros (2025-12-01 vs 2025年12月1日).
-    digits = re.findall(r"\d+", token)
-    return bool(digits) and all(str(int(d)) in evidence for d in digits)
+    sig = _digit_signature(token)
+    if not sig:
+        return False
+    return f"|{sig}|" in f"|{_digit_signature(evidence)}|"
 
 
 def _has_unsupported_fact(text: str, evidence: str) -> bool:
