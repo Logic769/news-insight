@@ -13,6 +13,9 @@ CI 的 yaml lint job 直接调用本文件，因此本地与 CI 的行为完全�
 （后者覆盖前者），`on` 与 `true` 都是布尔 True，`null` 与 `~` 都是 None；
 `1` 与 `'1'` 类型不同，不算重复。
 
+SKIP 只匹配仓库顶层的目录名：`data/` 跳过，`app/data/` 照常校验。
+代价是子目录里的 `.git`/`.venv`（例如将来引入 submodule）不会被豁免。
+
 扫描范围是仓库根（脚本所在目录的上一级），与运行时的 CWD 无关。
 """
 from __future__ import annotations
