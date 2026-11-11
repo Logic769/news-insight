@@ -6,6 +6,7 @@ Secrets never live in the image: every LLM/news credential is injected at
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,11 +54,14 @@ class Settings:
     llm_timeout: float = field(default_factory=lambda: _env_float("LLM_TIMEOUT", 60.0))
     llm_temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.0))
 
+    # --- inbound API auth ------------------------------------------------
+    api_key: str = field(default_factory=lambda: _env("INSIGHT_API_KEY"))
+    require_auth: bool = field(default_factory=lambda: _env("INSIGHT_REQUIRE_AUTH", "0") == "1")
+
     # --- analysis behaviour ---------------------------------------------
     max_tags_per_article: int = field(default_factory=lambda: _env_int("MAX_TAGS_PER_ARTICLE", 5))
     tag_body_chars: int = field(default_factory=lambda: _env_int("TAG_BODY_CHARS", 1200))
     extract_body_chars: int = field(default_factory=lambda: _env_int("EXTRACT_BODY_CHARS", 6000))
-    analyze_batch_size: int = field(default_factory=lambda: _env_int("ANALYZE_BATCH_SIZE", 10))
 
     # --- storage --------------------------------------------------------
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "/app/data")))
@@ -74,4 +78,9 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    if not (settings.api_key or settings.require_auth):
+        logging.getLogger("news_insight.settings").warning(
+            "未配置 INSIGHT_API_KEY：/v1 端点对所有能访问本端口的人开放（POST /v1/analyze 会消耗 LLM 额度）"
+        )
+    return settings

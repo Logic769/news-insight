@@ -23,12 +23,25 @@ def test_out_of_vocab_tags_are_dropped():
     assert [h.tag_id for h in hits] == ["finance"]
 
 
-def test_duplicate_tags_collapse_and_max_tags_respected():
+def test_duplicate_tags_collapse():
     llm = FakeLLM(
         {"tags": [{"id": "finance", "confidence": 0.9}, {"id": "finance", "confidence": 0.7}]}
     )
     hits = tag_with_llm(llm, TAGS, "标题", "银行", max_tags=5, body_chars=500)
-    assert len(hits) == 1
+    assert [h.tag_id for h in hits] == ["finance"]
+
+
+def test_max_tags_truncates_and_keeps_highest_confidence():
+    llm = FakeLLM(
+        {
+            "tags": [
+                {"id": "project_application", "confidence": 0.4},
+                {"id": "finance", "confidence": 0.9},
+            ]
+        }
+    )
+    hits = tag_with_llm(llm, TAGS, "标题", "银行与项目申报", max_tags=1, body_chars=500)
+    assert [h.tag_id for h in hits] == ["finance"]
 
 
 def test_rules_engine_hits_multiple_tags():

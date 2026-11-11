@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -66,6 +67,14 @@ CREATE INDEX IF NOT EXISTS idx_extractions_schema ON extractions(schema_id, fiel
 """
 
 
+def _load_json(raw: Any) -> Any:
+    """库被手工改坏时不要让整个端点 500。"""
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -80,7 +89,8 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def init_db(db_path: Path) -> None:
-    with connect(db_path) as conn:
+    # sqlite3 的上下文管理器只 commit/rollback、不 close，必须用 closing 兜住句柄
+    with closing(connect(db_path)) as conn:
         conn.executescript(SCHEMA_SQL)
         conn.commit()
 
@@ -100,8 +110,50 @@ def save_analysis(
     tags: Iterable[tuple[str, float, str, str]],
     extractions: Iterable[tuple[str, str, Any, str, float, bool]],
 ) -> None:
-    """Replace any previous analysis for this article (idempotent re-runs)."""
+    """Replace any previous analysis for this article (idempotent re-runs).
+
+    整体在一个事务里完成；中途失败立刻回滚，避免调用方吞掉异常后，
+    下一篇的 commit 把这里已执行的 DELETE 一起提交，留下「有主行、无标签」的脏状态。
+    """
     now = _now()
+    try:
+        _replace_analysis(
+            conn,
+            article_id=article_id,
+            source=source,
+            url=url,
+            title=title,
+            published_at=published_at,
+            published_at_utc=published_at_utc,
+            content_length=content_length,
+            tag_engine=tag_engine,
+            extract_engine=extract_engine,
+            tags=tags,
+            extractions=extractions,
+            now=now,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _replace_analysis(
+    conn: sqlite3.Connection,
+    *,
+    article_id: str,
+    source: str,
+    url: str,
+    title: str,
+    published_at: str | None,
+    published_at_utc: str | None,
+    content_length: int,
+    tag_engine: str,
+    extract_engine: str,
+    tags: Iterable[tuple[str, float, str, str]],
+    extractions: Iterable[tuple[str, str, Any, str, float, bool]],
+    now: str,
+) -> None:
     conn.execute(
         """
         INSERT INTO analyzed_articles
@@ -132,7 +184,6 @@ def save_analysis(
             for schema_id, fname, value, raw, conf, verified in extractions
         ],
     )
-    conn.commit()
 
 
 def is_analyzed(conn: sqlite3.Connection, article_id: str) -> bool:
@@ -213,7 +264,7 @@ def get_article(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | N
         (article_id,),
     ):
         ext.setdefault(r["schema_id"], {})[r["field"]] = {
-            "value": json.loads(r["value_json"]),
+            "value": _load_json(r["value_json"]),
             "raw_text": r["raw_text"],
             "confidence": r["confidence"],
             "verified": bool(r["verified"]),
@@ -250,14 +301,23 @@ def list_extractions(
         sql += " AND e.field = ?"
         args.append(field)
     if due_before:
-        sql += " AND e.field = 'deadline' AND json_extract(e.value_json, '$') <= ?"
-        args.append(due_before)
+        # 用子查询而不是再加一个 e.field='deadline'：否则 field 与 due_before
+        # 同时传入时条件互斥（e.field='materials' AND e.field='deadline'）恒空集。
+        # 未指定 field 时默认只看截止日期这一行，避免同一篇文章的多个字段行重复返回。
+        if not field:
+            sql += " AND e.field = 'deadline'"
+        sql += (
+            " AND e.article_id IN (SELECT d.article_id FROM extractions d"
+            " WHERE d.schema_id = ? AND d.field = 'deadline'"
+            " AND json_extract(d.value_json, '$') <= ?)"
+        )
+        args.extend([schema_id, due_before])
     sql += " ORDER BY COALESCE(a.published_at, a.analyzed_at) DESC LIMIT ?"
     args.append(limit)
     out = []
     for r in conn.execute(sql, args):
         item = dict(r)
-        item["value"] = json.loads(item.pop("value_json"))
+        item["value"] = _load_json(item.pop("value_json"))
         item["verified"] = bool(item["verified"])
         out.append(item)
     return out

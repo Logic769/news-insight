@@ -7,9 +7,11 @@ query extracted facts (the "project application deadline" example).
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import __version__, db
@@ -20,6 +22,12 @@ from app.tagging import load_vocab
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 LOG = logging.getLogger("news_insight.main")
+
+# 同步分析是重资源操作（每篇最多两次 LLM 调用）。并发触发只会重复烧 token，
+# 这里串行化：第二个请求立刻 409，而不是排队几十分钟。
+_ANALYZE_LOCK = threading.Lock()
+
+_OPEN_PATHS = ("/health", "/docs", "/redoc", "/openapi.json")
 
 
 @asynccontextmanager
@@ -40,21 +48,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings or load_settings()
 
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        """入站鉴权。NEWS_API_KEY 只管出站，与本服务的入站认证无关。"""
+        s: Settings = app.state.settings
+        path = request.url.path
+        if path in _OPEN_PATHS or path.startswith("/docs") or path.startswith("/redoc"):
+            return await call_next(request)
+        if not (s.api_key or s.require_auth):
+            return await call_next(request)  # 未配置 key 且未强制：保持开放（有 warning）
+        if not s.api_key:
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"code": 401, "message": "服务要求鉴权但未配置 INSIGHT_API_KEY"}},
+            )
+        provided = request.headers.get("x-api-key") or ""
+        auth = request.headers.get("authorization") or ""
+        if not provided and auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+        if provided != s.api_key:
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"code": 401, "message": "API key 无效"}},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
+
     @app.get("/health")
     def health() -> dict:
         s: Settings = app.state.settings
         conn = connect(s)
         try:
-            n = conn.execute("SELECT COUNT(*) FROM analyzed_articles").fetchone()[0]
+            conn.execute("SELECT 1 FROM analyzed_articles LIMIT 1").fetchone()
         finally:
             conn.close()
+        # 不回显 news_base_url：健康检查无需鉴权，内网地址不该从这里漏出去
         return {
             "status": "ok",
             "version": __version__,
-            "analyzed_articles": n,
             "llm_enabled": s.llm_enabled,
             "news_source_mode": s.news_source_mode,
-            "news_base_url": s.news_base_url,
+            "auth_enabled": bool(s.api_key or s.require_auth),
         }
 
     @app.get("/v1/tags")
@@ -89,14 +123,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/v1/analyze")
     def analyze(
-        limit: int = Query(default=10, ge=1, le=200),
+        limit: int = Query(default=10, ge=1, le=50),
         force: bool = Query(default=False),
     ) -> dict:
         s: Settings = app.state.settings
+        if not _ANALYZE_LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="已有分析任务在运行，请稍后再试")
         try:
             result = analyze_batch(s, limit=limit, force=force)
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"分析失败: {exc}") from exc
+            # 不要把上游/LLM 响应体回传给调用方（可能含内部地址与提示词）
+            LOG.exception("分析失败")
+            raise HTTPException(status_code=502, detail=f"分析失败，内部错误: {type(exc).__name__}") from exc
+        finally:
+            _ANALYZE_LOCK.release()
         return {"data": result}
 
     @app.get("/v1/articles")
@@ -143,7 +183,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def extractions(
         schema: str = Query(default="project_application"),
         field: str | None = Query(default=None),
-        due_before: str | None = Query(default=None, description="仅返回截止日期早于该值的记录 (YYYY-MM-DD)"),
+        due_before: str | None = Query(
+            default=None, description="仅返回截止日期不晚于该值的记录 (YYYY-MM-DD)"
+        ),
         limit: int = Query(default=50, ge=1, le=200),
     ) -> dict:
         s: Settings = app.state.settings
@@ -152,7 +194,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rows = db.list_extractions(conn, schema_id=schema, field=field, due_before=due_before, limit=limit)
         finally:
             conn.close()
-        return {"data": rows, "meta": {"total": len(rows), "schema": schema}}
+        return {"data": rows, "meta": {"returned": len(rows), "limit": limit, "schema": schema}}
 
     @app.get("/v1/runs")
     def runs(limit: int = Query(default=20, ge=1, le=100)) -> dict:
@@ -162,6 +204,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"data": db.list_runs(conn, limit)}
         finally:
             conn.close()
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {"code": 422, "status": 422, "message": "参数校验失败", "details": exc.errors()},
+            },
+        )
 
     @app.exception_handler(HTTPException)
     async def http_exc_handler(request, exc: HTTPException):

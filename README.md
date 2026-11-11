@@ -37,9 +37,17 @@ news-crawler (GPL-3.0)                    news-insight (MIT)
 cp .env.example .env        # 填 LLM_API_KEY；不填也能跑（降级为规则引擎）
 docker compose up -d --build
 curl http://localhost:8020/health
-curl -X POST "http://localhost:8020/v1/analyze?limit=10"
-curl "http://localhost:8020/v1/extractions?schema=project_application&due_before=2026-06-30"
+
+# 配了 INSIGHT_API_KEY 后，除 /health 与 /docs 外都要带 key
+KEY=your-insight-key
+curl -X POST "http://localhost:8020/v1/analyze?limit=10" -H "X-API-Key: $KEY"
+curl "http://localhost:8020/v1/extractions?schema=project_application&due_before=2026-06-30" -H "X-API-Key: $KEY"
 ```
+
+两个默认值值得先知道：
+
+- **端口只绑 `127.0.0.1`**。`POST /v1/analyze` 会花 LLM 额度，不该默认暴露给局域网。要让别的机器访问，设 `INSIGHT_BIND=0.0.0.0`，**并先配好 `INSIGHT_API_KEY`**。
+- **数据落在命名卷 `insight_data`**。bind mount 的 `./data` 由 docker daemon 以 `root:root` 创建，而容器以 uid 10001 运行，Linux 上首次启动会因 SQLite 无法读写而崩溃循环。想直接看 `insight.db`：`mkdir -p data && sudo chown 10001 data`，再设 `INSIGHT_DATA_DIR=./data`。
 
 不启动爬虫也能验证：`NEWS_SOURCE_MODE=demo` 时使用 `fixtures/articles.json` 的内置新闻（含两篇申报公告、一篇降准、一篇融资）。
 
@@ -72,17 +80,23 @@ LLM_API_KEY=ollama
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/health` | 健康检查、已分析条数、LLM 是否启用 |
-| POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步返回统计） |
+| GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
+| POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步返回统计，`limit` 上限 50） |
 | GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/tags` | 标签词表 + 每个标签的命中数 |
 | GET | `/v1/tags/stats` | 标签分布与平均置信度 |
 | GET | `/v1/schemas` | 已注册的抽取 schema |
-| GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询，`due_before` 按截止日期过滤 |
+| GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询，`due_before` 按截止日期过滤，可与 `field` 同时使用（按文章过滤，不是按字段） |
 | GET | `/v1/runs` | 运行记录（模式、扫描/分析/跳过/错误数） |
 
 CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10`。
+
+### 鉴权
+
+设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/openapi.json` 外都要求 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。注意 `NEWS_API_KEY` 是**出站**凭证（访问爬虫），与本服务入站鉴权无关。
+
+`/v1/analyze` 是同步执行且**全局串行**：已有批次在跑时第二个请求立刻返回 409，而不是排几十分钟队。长批次仍建议外部调度 + `limit` 分批。
 
 ## 扩展
 
@@ -117,9 +131,9 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10`�
 1. **闭集打标，标签外一律丢弃。** 放任模型自造标签，会把 `Artificial Intelligence` 和 `AI` 变成两个标签——这是 [karakeep](https://github.com/karakeep-app/karakeep) issue #111 记录的原始问题，#529 的解法就是「只允许使用用户已建的标签」，并已合入。本项目在 `tagging.py` 里做了同样的守卫（词表外丢弃 + 告警）。标签集合与「标签→schema 路由」借鉴 [autolabel](https://github.com/refuel-ai/autolabel) 的闭集思路。
 2. **打标与抽取分离。** 打标的输出空间是闭合的（必须是词表内 id），抽取的输出空间是固定的（必须是 schema 内字段）；打标漏标只是少一条线索，抽取编造会污染下游。因此两者用的是不同 prompt、不同校验：标签必须 `in` 词表，抽取值必须能在原文定位。
 3. **相对时间以发布时间为基准。** 「自发布之日起30日内」「本月底」如果用抓取时间换算，会随重跑静默漂移。抽取提示词里显式传入 `published_at_utc`（缺失时回退 `published_at`），`normalize_deadline()` 按下这个基准推算。
-4. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关的子串校验，定位不到的值保留但标 `verified=false`，供人工复核，而不是静默采信。
+4. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关的子串校验，定位不到的值保留但标 `verified=false`，供人工复核，而不是静默采信。模型给出的日期还会用原文重算一遍，与原文对不上就降级可信度；规则引擎（无 LLM 降级）产出的一切恒为 `verified=false`——正则只证明文本出现过，不证明语义正确（「3月1日至4月20日」取左端就是活生生的反例）。
 5. **结果独立成库。** 见上文对照表。
-6. **单篇失败不拖垮批次。** 单篇异常计入 `errors` 并继续，运行统计落到 `runs` 表。
+6. **单篇失败不拖垮批次，但「没拿到正文」不算成功。** 单篇异常计入 `errors` 并继续，运行统计落到 `runs` 表。详情接口没取到正文的文章只拿标题打标会把「确无截止日」永久定档，所以这类文章**不入库**、计入 `errors`，下次运行自然重试；`save_analysis` 整体在一个事务里，中途失败立即回滚，不会留下「有主行、无标签」的脏状态。
 
 ## 数据表
 
@@ -146,7 +160,7 @@ docker compose run --rm --entrypoint sh insight -c "pip install --user -q pytest
 
 - 抽取质量取决于模型与 prompt，本项目只保证「不越界」（不造标签、不造字段、值可定位），不保证召回；
 - 相对截止时间只覆盖常见表述（`N日内`/`N个工作日`/`本月底`），「公示结束后5个工作日」这类链式表述仍会漏；
-- `/v1/analyze` 同步执行，长批次需要外部调度；生产建议加锁或改成任务队列；
+- `/v1/analyze` 同步执行（进程内已有互斥锁，并发第二个请求 409），长批次需要外部调度，或改成任务队列；
 - 单进程单 SQLite，不适合多副本水平扩展；
 - 演示数据与规则引擎只用于跑通链路，不作为效果基线。
 

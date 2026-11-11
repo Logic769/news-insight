@@ -44,6 +44,8 @@ class NewsArticle:
     raw_content: str | None
     content_length: int
     updated_at: str | None
+    # False = 详情接口没拿到（正文为空不代表文章没正文），调用方不应据此定档
+    body_ok: bool = True
 
     @property
     def body(self) -> str:
@@ -143,7 +145,8 @@ class NewsClient:
                 try:
                     detail = self._live_detail(art.id)
                 except UpstreamError as exc:
-                    LOG.warning("跳过详情获取失败的文章 %s: %s", art.id, exc)
+                    LOG.warning("详情获取失败，标记待重试 %s: %s", art.id, exc)
+                    art.body_ok = False
                     out.append(art)
                     continue
                 if isinstance(detail, dict) and isinstance(detail.get("data"), dict):

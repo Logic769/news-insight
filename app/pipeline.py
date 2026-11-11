@@ -51,6 +51,12 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
             if not force and db.is_analyzed(conn, art.id):
                 skipped += 1
                 continue
+            if not art.body.strip():
+                # 只拿标题打标会把「确无截止日」永久定档：宁可这次不入库，让下次自然重试
+                errors += 1
+                error_notes.append(f"{art.id}: 正文缺失，待重试")
+                LOG.warning("正文缺失，跳过分析（不入库，下次重试） %s", art.id)
+                continue
             try:
                 hits, tag_engine = tag_article(settings, llm, tags, art.title, art.body)
                 engine_counts[tag_engine] = engine_counts.get(tag_engine, 0) + 1
@@ -64,7 +70,7 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
                     published_at_utc=art.published_at_utc,
                     published_at=art.published_at,
                 )
-                extract_engine = results[0].engine if results else ""
+                extract_engine = results[0].engine if results else "none"
                 flat = [
                     (r.schema_id, f.name, f.value, f.raw_text, f.confidence, f.verified)
                     for r in results
