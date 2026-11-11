@@ -42,6 +42,10 @@ def analyze_batch(settings: Settings, *, limit: int, force: bool = False) -> dic
         scanned = analyzed = skipped = errors = 0
         engine_counts = {"llm": 0, "rules": 0}
         error_notes: list[str] = []
+        if mode == "demo" and settings.news_source_mode == "auto" and client.fallback_reason:
+            note = f"上游不可用，已回退演示数据: {client.fallback_reason}"
+            error_notes.append(note)
+            LOG.warning(note)
 
         for art in articles:
             scanned += 1

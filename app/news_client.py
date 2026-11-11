@@ -72,6 +72,8 @@ class NewsArticle:
 class NewsClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # auto 模式回退到演示数据时记录原因，供 pipeline 写进 runs.detail
+        self.fallback_reason = ""
 
     # ------------------------------------------------------------------ live
     def _headers(self) -> dict[str, str]:
@@ -134,6 +136,7 @@ class NewsClient:
             if self.settings.news_source_mode == "live":
                 raise
             LOG.warning("上游不可用，回退到内置演示数据: %s", exc)
+            self.fallback_reason = str(exc)
             rows = self._demo_rows()
             return [NewsArticle.from_payload(r) for r in rows][offset : offset + limit], "demo"
 

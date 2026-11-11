@@ -135,3 +135,33 @@ def test_one_bad_article_does_not_sink_batch(settings, monkeypatch):
     result = pipeline.analyze_batch(settings, limit=4)
     assert result["errors"] == 1
     assert result["analyzed"] == 3
+
+
+def test_auto_fallback_reason_lands_in_run_detail(settings, monkeypatch):
+    """auto 模式回退演示数据时，runs.detail 要能看出回退原因。"""
+    from dataclasses import replace
+
+    import app.pipeline as pipeline
+
+    class FakeClient:
+        fallback_reason = "连接超时"
+
+        def __init__(self, _settings):
+            pass
+
+        def list_articles(self, limit, offset=0):
+            return [], "demo"
+
+        def hydrate_bodies(self, articles, mode):
+            return articles
+
+    monkeypatch.setattr(pipeline, "NewsClient", FakeClient)
+    auto = replace(settings, news_source_mode="auto")
+    pipeline.analyze_batch(auto, limit=1)
+
+    conn = db.connect(auto.db_path)
+    try:
+        row = conn.execute("select detail from runs order by id desc limit 1").fetchone()
+        assert row is not None and "连接超时" in (row["detail"] or "")
+    finally:
+        conn.close()
