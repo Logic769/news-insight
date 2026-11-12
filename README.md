@@ -2,19 +2,21 @@
 
 把 [news-crawler](../news) 抓到的新闻，变成**结构化、可查询的情报**：
 
-1. **打标签** —— 只能从你自己写好的标签词表里选（闭集多标签），模型不许自己造标签；
-2. **抽关键线索** —— 命中 `project_application` 这类标签后，进入 schema 驱动的事实抽取，例如项目申报的申报主体、材料清单、**截止时间**、资助额度、申报渠道；
-3. **出准备清单** —— 把抽到的事实按申报执行顺序排成可直接照做的清单（确认项目 → 核对资格 → 备材料 → 系统填报 → 截止提交），每条标注原文依据或「流程建议」；
-4. **落库 + 出接口** —— 结果存独立 SQLite，通过 HTTP API 查询，供后续业务系统消费。
+1. **分大类** —— 每篇新闻先归入唯一的一个一级大类（项目申报 / 行业政策 / 人才申报 / 企业资质申报 / 资金补贴 / 其他）；
+2. **打标签** —— 再**只在该大类允许的标签**里做闭集多标签打标，模型不许自己造标签；
+3. **抽关键线索** —— 命中 `project_application` 这类标签后，进入 schema 驱动的事实抽取，例如项目申报的申报主体、材料清单、**截止时间**、资助额度、申报渠道；
+4. **出准备清单** —— 把抽到的事实按申报执行顺序排成可直接照做的清单（确认项目 → 核对资格 → 备材料 → 系统填报 → 截止提交），每条标注原文依据或「流程建议」；
+5. **落库 + 出接口** —— 结果存独立 SQLite，通过 HTTP API 查询，供后续业务系统消费。
 
 它不抓网页、不解析正文、不碰爬虫的数据库。与 news-crawler 之间只有一条 HTTP 契约。
 
 ```
 news-crawler (GPL-3.0)                    news-insight (MIT)
 ┌──────────────────────┐   GET /v1/articles   ┌────────────────────────────┐
-│ GNE 抽取 + SQLite     │ ───────────────────► │ tag（闭集多标签）            │
-│ FastAPI /v1          │   GET /v1/articles/{id}│   └─► 标签命中 schema？     │
-│ /app/data/news.db    │                      │        └─► extract（schema） │
+│ GNE 抽取 + SQLite     │ ───────────────────► │ 一级分类（单选 6 类）        │
+│ FastAPI /v1          │   GET /v1/articles/{id}│   └─► tag（类内闭集多标签） │
+│ /app/data/news.db    │                      │        └─► 标签命中 schema？ │
+│                      │                      │             └─► extract     │
 └──────────────────────┘                      │ → insight.db（独立文件）     │
                                               │ → HTTP API :8020            │
                                               └────────────────────────────┘
@@ -139,10 +141,12 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
-| GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤 |
+| GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤；也可用 `category=funding_subsidy` 按大类过滤（可与 `tag` 同用，AND） |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
-| GET | `/v1/tags` | 标签词表 + 每个标签的命中数 |
+| GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
+| GET | `/v1/categories/stats` | 分类分布与平均置信度（不含分类功能上线前的历史行） |
+| GET | `/v1/tags` | 标签词表 + 每个标签的命中数；带 `category=` 时只统计该大类下的命中 |
 | GET | `/v1/tags/stats` | 标签分布与平均置信度 |
 | GET | `/v1/schemas` | 已注册的抽取 schema |
 | GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询，`due_before` 按截止日期过滤，可与 `field` 同时使用（按文章过滤，不是按字段） |
@@ -158,13 +162,37 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 -
 
 ## 扩展
 
+### 加一级分类
+
+编辑 `app/vocab/categories.json`，往 `categories` 里加一条：
+
+```json
+{
+  "id": "funding_subsidy",
+  "name": "资金补贴",
+  "description": "财政资金、补贴、奖补、贴息、资助等资金支持政策与兑现通知。",
+  "keywords": ["补贴", "补助", "奖补", "专项资金", "贴息"],
+  "tags": ["subsidy", "funding", "policy_release"]
+}
+```
+
+- 一级分类是**单选**：每篇只落一个 `category`，跨类内容取最贴近的一类；
+- `tags` 是该类允许的二级标签白名单，**二级打标只能在这个集合里选**，这是防跨类污染的护栏（一篇人才通知不会被挂上资金补贴标签）；
+- `other` 是兜底类：`keywords` 与 `tags` 留空。归到 `other` 的文章**不做语义打标**（省一次模型调用），只用规则引擎按 `group=domain` 保住行业标签（金融/科技/农业等），所以「央行降准」这类非 5 大类新闻仍能按 `finance` 查到；
+- 并列时的归属由 `categories.json` 的**声明顺序**决定（先声明者胜），调整顺序等于调整并列归属，属于行为变更；比较用的是原始关键词分，不是封顶到 0.95 的 `confidence`，所以高分先命中的类不会被后面的低分翻盘；
+- 大类与标签是**两级**关系：`/v1/articles?category=` 查大类，`?tag=` 查二级标签，两者可组合；
+- `category` 参数不做闭集校验：传一个不存在的类名、或传空串，都返回 200 空集（而不是 422），沿用标签参数的一贯行为；`/v1/tags?category=` 行为一致（词表照旧返回，计数按该类统计，空串下计数全 0）；
+- `categories.json` 里少了兜底类 `other` 时不会启动失败，但会记一条 WARNING：模型答出表外大类就没有去处，那篇文章的二级打标与抽取都会被跳过。
+
 ### 加标签
 
 编辑 `app/vocab/tags.json`，往 `tags` 里加一条：`{ "id": "tender", "name": "招标采购", "group": "event", "keywords": ["招标","中标"] }`。
 
 - `id` 是唯一契约，落库与查询都用它，**改名不要改 id**；
 - `keywords` 只在无 LLM 的规则降级时使用，模型看的是 `id + name + group + keywords` 的完整描述；
-- 几十个标签全部塞进单次 prompt 完全放得下，不需要两阶段召回。词表涨到几百条再考虑先粗筛候选。
+- 几十个标签全部塞进单次 prompt 完全放得下，不需要两阶段召回。词表涨到几百条再考虑先粗筛候选；
+- 新加的标签要在 `categories.json` 里被至少一个类引用，否则任何文章都打不到它（只有 `group=domain` 且文章落到 `other` 时才可能命中）；
+- `group` 决定二级范围：`domain` 是行业维度，`event`/`policy` 是业务维度。归到 `other` 的文章只保留 `domain` 组，业务标签必须由大类白名单授权。
 
 ### 加抽取 schema
 
@@ -186,19 +214,20 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 -
 
 ## 设计决策
 
-1. **闭集打标，标签外一律丢弃。** 放任模型自造标签，会把 `Artificial Intelligence` 和 `AI` 变成两个标签——这是 [karakeep](https://github.com/karakeep-app/karakeep) issue #111 记录的原始问题，#529 的解法就是「只允许使用用户已建的标签」，并已合入。本项目在 `tagging.py` 里做了同样的守卫（词表外丢弃 + 告警）。标签集合与「标签→schema 路由」借鉴 [autolabel](https://github.com/refuel-ai/autolabel) 的闭集思路。
-2. **打标与抽取分离。** 打标的输出空间是闭合的（必须是词表内 id），抽取的输出空间是固定的（必须是 schema 内字段）；打标漏标只是少一条线索，抽取编造会污染下游。因此两者用的是不同 prompt、不同校验：标签必须 `in` 词表，抽取值必须能在原文定位。
-3. **相对时间以发布时间为基准。** 「自发布之日起30日内」「本月底」如果用抓取时间换算，会随重跑静默漂移。抽取提示词里显式传入 `published_at_utc`（缺失时回退 `published_at`），`normalize_deadline()` 按下这个基准推算。
-4. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关的子串校验，定位不到的值保留但标 `verified=false`，供人工复核，而不是静默采信。模型给出的日期还会用原文重算一遍，与原文对不上就降级可信度；规则引擎（无 LLM 降级）产出的一切恒为 `verified=false`——正则只证明文本出现过，不证明语义正确（「3月1日至4月20日」取左端就是活生生的反例）。
-5. **结果独立成库。** 见上文对照表。
-6. **清单是派生视图，不是新事实。** 清单项要么引用已抽取的事实（`basis="excerpt"`：原文片段必须能在正文定位，且 `text` 里的日期/金额/电话等事实 token 必须被该片段支持，否则丢弃），要么显式标成 `suggested`（盖章、留存回执这类流程建议，禁止出现任何数字）。规则引擎生成的项沿用抽取行的 `verified` 标记（通常为 `false`），不会冒充已核验事实。它单独存在 `article_checklists`，重新生成不重写标签/抽取表；已分析但缺清单的文章会在下次运行自动补生成。
-7. **单篇失败不拖垮批次，但「没拿到正文」不算成功。** 单篇异常计入 `errors` 并继续，运行统计落到 `runs` 表。详情接口没取到正文的文章只拿标题打标会把「确无截止日」永久定档，所以这类文章**不入库**、计入 `errors`，下次运行自然重试；`save_analysis` 整体在一个事务里，中途失败立即回滚，不会留下「有主行、无标签」的脏状态。
+1. **先分大类，再在类内闭集打标。** 一级分类把标签空间切成互不重叠的几块：模型先选唯一一类，第二级只能看到该类允许的标签。好处是跨类污染从提示词层面就消失了（人才通知看不到资金补贴标签），代价是类别边界要人工维护；归到兜底类 `other` 的文章跳过第二次模型调用，只用规则引擎保住 `group=domain` 的行业标签，避免「不属于 5 大类」等于「一无所知」。
+2. **闭集打标，标签外一律丢弃。** 放任模型自造标签，会把 `Artificial Intelligence` 和 `AI` 变成两个标签——这是 [karakeep](https://github.com/karakeep-app/karakeep) issue #111 记录的原始问题，#529 的解法就是「只允许使用用户已建的标签」，并已合入。本项目在 `tagging.py` 里做了同样的守卫（词表外丢弃 + 告警）。标签集合与「标签→schema 路由」借鉴 [autolabel](https://github.com/refuel-ai/autolabel) 的闭集思路。
+3. **打标与抽取分离。** 打标的输出空间是闭合的（必须是词表内 id），抽取的输出空间是固定的（必须是 schema 内字段）；打标漏标只是少一条线索，抽取编造会污染下游。因此两者用的是不同 prompt、不同校验：标签必须 `in` 词表，抽取值必须能在原文定位。
+4. **相对时间以发布时间为基准。** 「自发布之日起30日内」「本月底」如果用抓取时间换算，会随重跑静默漂移。抽取提示词里显式传入 `published_at_utc`（缺失时回退 `published_at`），`normalize_deadline()` 按下这个基准推算。
+5. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关的子串校验，定位不到的值保留但标 `verified=false`，供人工复核，而不是静默采信。模型给出的日期还会用原文重算一遍，与原文对不上就降级可信度；规则引擎（无 LLM 降级）产出的一切恒为 `verified=false`——正则只证明文本出现过，不证明语义正确（「3月1日至4月20日」取左端就是活生生的反例）。
+6. **结果独立成库。** 见上文对照表。
+7. **清单是派生视图，不是新事实。** 清单项要么引用已抽取的事实（`basis="excerpt"`：原文片段必须能在正文定位，且 `text` 里的日期/金额/电话等事实 token 必须被该片段支持，否则丢弃），要么显式标成 `suggested`（盖章、留存回执这类流程建议，禁止出现任何数字）。规则引擎生成的项沿用抽取行的 `verified` 标记（通常为 `false`），不会冒充已核验事实。它单独存在 `article_checklists`，重新生成不重写标签/抽取表；已分析但缺清单的文章会在下次运行自动补生成。
+8. **单篇失败不拖垮批次，但「没拿到正文」不算成功。** 单篇异常计入 `errors` 并继续，运行统计落到 `runs` 表。详情接口没取到正文的文章只拿标题打标会把「确无截止日」永久定档，所以这类文章**不入库**、计入 `errors`，下次运行自然重试；`save_analysis` 整体在一个事务里，中途失败立即回滚，不会留下「有主行、无标签」的脏状态。
 
 ## 数据表
 
 | 表 | 内容 |
 | --- | --- |
-| `analyzed_articles` | 已分析文章元数据（`article_id` 主键，与上游对齐） |
+| `analyzed_articles` | 已分析文章元数据（`article_id` 主键，与上游对齐），含一级分类 `category` 与 `category_confidence`/`category_engine`（`NULL` = 分类功能上线前分析的历史行，与 `other` 不是一回事） |
 | `article_tags` | `(article_id, tag)` 主键，含置信度、原文依据、引擎 |
 | `extractions` | `(article_id, schema_id, field)` 主键，含值、原文片段、置信度、是否定位成功 |
 | `article_checklists` | `article_id` 主键，清单项 JSON（`text`/`basis`/`source_text`）、生成引擎与时间 |
@@ -232,15 +261,18 @@ docker compose run --rm -v "$(pwd)/tests:/app/tests" -v "$(pwd)/tools:/app/tools
 
 规则集保留了 `bypass_actors`（RepositoryRole / always），单人维护时只有这一条路可走。允许 bypass 的情形仅限：**CodeRabbit 侧故障或配额耗尽导致 required check 永久 pending**，且此时必须人工确认本地 `ruff check .`、`mypy`、`pytest -q` 与 `docker build` 全部通过后再合入。GitHub Actions 的 7 个检查不允许 bypass——它们是本地可复现的。
 
-覆盖：日期归一（绝对/相对/跨年/月底/无基准）、闭集守卫（词表外丢弃、去重、max_tags）、demo 模式端到端（打标 + 申报抽取 + `due_before` 查询）、申报准备清单（规则顺序、`excerpt` 原文定位校验、「LLM 不可用 → 规则」降级、清单端点 404/200）、重跑幂等。
+覆盖：日期归一（绝对/相对/跨年/月底/无基准）、闭集守卫（词表外丢弃、去重、max_tags）、一级分类（词表外大类回落兜底、置信度夹取、并列按声明顺序、未带 `categories.json` 的旧部署退回单级打标、类别引用标签必须存在）、类内打标范围（跨类标签打不进、兜底类只保留 `domain` 组）、demo 模式端到端（分类 + 打标 + 申报抽取 + `due_before` 查询）、申报准备清单（规则顺序、`excerpt` 原文定位校验、「LLM 不可用 → 规则」降级、清单端点 404/200）、分类与标签端点、重跑幂等。
 
 ## 已知限制
 
 - 抽取质量取决于模型与 prompt，本项目只保证「不越界」（不造标签、不造字段、值可定位），不保证召回；
 - 相对截止时间只覆盖常见表述（`N日内`/`N个工作日`/`本月底`），「公示结束后5个工作日」这类链式表述仍会漏；
 - 分析作业在进程内全局串行（同步接口与异步 job 共用一把锁），长批次请用 `POST /v1/jobs`；单进程单 SQLite，不适合多副本水平扩展；
-- 清单生成按篇多一次 LLM 调用（正文按 `EXTRACT_BODY_CHARS` 截断），每篇固定 3 次 LLM 请求；实际吞吐取决于供应商并发与限流，`ANALYZE_CONCURRENCY` 只是本地上限，`LLM_MAX_CONCURRENCY` 另外限制真正同时在途的供应商请求；遇到 429/5xx 会优先按 `Retry-After`、否则指数退避并加抖动重试；
+- 清单生成按篇多一次 LLM 调用（正文按 `EXTRACT_BODY_CHARS` 截断），每篇最多 4 次 LLM 请求（分大类 1 + 类内打标 1 + 抽取 1 + 清单 1；归到 other 时只有 1 次）；实际吞吐取决于供应商并发与限流，`ANALYZE_CONCURRENCY` 只是本地上限，`LLM_MAX_CONCURRENCY` 另外限制真正同时在途的供应商请求；遇到 429/5xx 会优先按 `Retry-After`、否则指数退避并加抖动重试；
 - `RETENTION_DAYS` 默认 90：启动时和每次成功分析后自动硬删除更早的 `analyzed_articles`/`article_tags`/`extractions`/`article_checklists`、`runs` 以及已完成的 `analysis_jobs`，不保留归档；
+- 一级分类的边界靠 `categories.json` 的 `description` 与 `keywords` 人工维护：规则引擎按关键词计分，遇到「专项资金申报通知」这种同时命中资金补贴与项目申报的文章，会归到分数更高的那一类，另一类的二级标签随之拿不到（目前 `funding_subsidy` 的白名单不含 `project_application`，这类文章不会触发申报抽取）；需要时给该类补 `project_application` 标签即可；
+- 分类按「保留式」写入：重跑时没做分类（例如临时移走 `categories.json`、回退到旧版本）只会更新标签，不会清空已有分类；但此时标签是按全词表打的，可能出现分类与标签不同源的行（`category=project_application` 却带 `ipo` 标签）。恢复词表后再跑一次即回到类内一致；
+- 分类功能上线前已分析的历史行 `category` 为 `NULL`：`/v1/categories` 里统计不到、`?category=` 也筛不出来，需要 `analyze --force` 重跑才会补上分类；这与归到 `other` 是不同的状态；
 - 演示数据与规则引擎只用于跑通链路，不作为效果基线。
 
 ## 致谢

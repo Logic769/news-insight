@@ -37,7 +37,11 @@ def test_demo_batch_tags_and_extracts(settings):
         # 非申报文章不触发抽取
         row3 = db.get_article(conn, "c3a2e5f4d9b06c73")
         assert "project_application" not in row3["extractions"]
+        # 央行降准不属于 5 大类 → other；兜底类不做语义打标，但规则引擎仍保住行业标签
+        assert row3["category"] == "other"
+        assert row3["category_engine"] == "rules"
         assert {t["tag"] for t in row3["tags"]} & {"finance", "policy_release"}
+        assert all(t["engine"] == "rules" for t in row3["tags"]), "兜底类不应产生 LLM 标签"
 
         # 截止时间查询
         rows = db.list_extractions(conn, schema_id="project_application", field=None,

@@ -21,7 +21,7 @@ from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull
 from app.pipeline import analyze_batch, connect
 from app.prune import prune
 from app.settings import Settings, load_settings
-from app.tagging import load_vocab
+from app.tagging import load_categories, load_vocab
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 LOG = logging.getLogger("news_insight.main")
@@ -107,13 +107,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "auth_enabled": bool(s.api_key or s.require_auth),
         }
 
+    @app.get("/v1/categories")
+    def categories() -> dict:
+        s: Settings = app.state.settings
+        payload, cats = load_categories(s.vocab_dir)
+        conn = connect(s)
+        try:
+            stats = {r["category"]: r for r in db.category_stats(conn)}
+        finally:
+            conn.close()
+        data = [
+            {
+                "id": c.id,
+                "name": c.name,
+                "description": c.description,
+                "keywords": list(c.keywords),
+                "tags": list(c.tags),
+                "article_count": stats.get(c.id, {}).get("count", 0),
+            }
+            for c in cats
+        ]
+        return {"data": data, "meta": {"total": len(data), "vocab_version": payload.get("version")}}
+
+    @app.get("/v1/categories/stats")
+    def categories_stats() -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            return {"data": db.category_stats(conn)}
+        finally:
+            conn.close()
+
     @app.get("/v1/tags")
-    def tags() -> dict:
+    def tags(category: str | None = Query(default=None)) -> dict:
         s: Settings = app.state.settings
         payload, defs = load_vocab(s.vocab_dir)
         conn = connect(s)
         try:
-            stats = {r["tag"]: r for r in db.tag_stats(conn)}
+            stats = {r["tag"]: r for r in db.tag_stats(conn, category=category)}
         finally:
             conn.close()
         data = [
@@ -163,13 +194,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/articles")
     def articles(
         tag: str | None = Query(default=None),
+        category: str | None = Query(default=None),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
         s: Settings = app.state.settings
         conn = connect(s)
         try:
-            rows, total = db.list_analyzed(conn, tag=tag, limit=limit, offset=offset)
+            rows, total = db.list_analyzed(conn, tag=tag, category=category, limit=limit, offset=offset)
         finally:
             conn.close()
         return {"data": rows, "meta": {"total": total, "limit": limit, "offset": offset}}

@@ -60,6 +60,63 @@ def test_checklist_endpoint(client):
     assert missing.json()["error"]["code"] == "article_not_found"
 
 
+def test_categories_listing_and_filter(client):
+    """/v1/categories 要把 6 个大类连同一句中文名一起返回，且统计要能对上过滤结果。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    resp = client.get("/v1/categories", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    cats = {c["id"]: c for c in body["data"]}
+    assert list(cats) == [
+        "project_application",
+        "industry_policy",
+        "talent_application",
+        "enterprise_certification",
+        "funding_subsidy",
+        "other",
+    ]
+    assert cats["project_application"]["name"] == "项目申报"
+    assert cats["other"]["tags"] == [], "兜底类不打二级标签"
+    assert body["meta"]["vocab_version"] >= 1
+
+    counts = {c["category"]: c["count"] for c in client.get("/v1/categories/stats", headers=headers).json()["data"]}
+    assert counts["project_application"] == 2, "示例数据里有两篇申报通知"
+    assert cats["project_application"]["article_count"] == 2
+
+    filtered = client.get("/v1/articles", params={"category": "project_application"}, headers=headers).json()
+    assert filtered["meta"]["total"] == 2
+    assert {a["category"] for a in filtered["data"]} == {"project_application"}
+
+
+def test_category_filter_on_tags_endpoint(client):
+    """tag_stats 带 category 时只统计该类下的标签，否则跨类标签会虚高。"""
+    headers = {"X-API-Key": "secret"}
+    client.post("/v1/analyze", params={"limit": 4}, headers=headers)
+
+    scoped = client.get("/v1/tags", params={"category": "other"}, headers=headers).json()["data"]
+    finance = next(t for t in scoped if t["id"] == "finance")
+    assert finance["article_count"] == 1, "央行降准那篇被归到 other，规则引擎仍打了 finance"
+
+    unscoped = client.get("/v1/tags", headers=headers).json()["data"]
+    assert next(t for t in unscoped if t["id"] == "finance")["article_count"] == 1
+
+
+def test_empty_category_filter_returns_empty_not_everything(client):
+    """category= 空串是「筛一个不存在的类」，不能静默退化成不过滤。"""
+    headers = {"X-API-Key": "secret"}
+    client.post("/v1/analyze", params={"limit": 4}, headers=headers)
+
+    resp = client.get("/v1/articles", params={"category": ""}, headers=headers).json()
+    assert resp["data"] == []
+    assert resp["meta"]["total"] == 0
+
+    # /v1/tags 返回词表本身，空串下应当是「词表照旧、计数全 0」
+    tags = client.get("/v1/tags", params={"category": ""}, headers=headers).json()["data"]
+    assert tags and {t["article_count"] for t in tags} == {0}
+
+
 def test_analyze_limit_capped(client):
     resp = client.post(
         "/v1/analyze", params={"limit": 500}, headers={"X-API-Key": "secret"}

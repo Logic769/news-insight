@@ -14,7 +14,16 @@ from app.extraction import extract_article, load_schemas
 from app.llm import LLMClient
 from app.news_client import NewsClient, UpstreamError
 from app.settings import Settings
-from app.tagging import load_vocab, tag_article
+from app.tagging import (
+    FALLBACK_CATEGORY,
+    classify_article,
+    load_categories,
+    load_vocab,
+    tag_article,
+    tag_with_rules,
+    tags_for_category,
+    tags_for_unclassified,
+)
 
 LOG = logging.getLogger("news_insight.pipeline")
 
@@ -77,17 +86,47 @@ class _AnalysisResult:
 
     article: Any
     tag_engine: str | None = None
+    category: str = ""
+    category_confidence: float | None = None
+    category_engine: str = ""
     hits: list = field(default_factory=list)
     results: list = field(default_factory=list)
     checklist: tuple[str, list] | None = None
     error: str | None = None
 
 
-def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art) -> _AnalysisResult:
-    """Run all LLM calls for one article. Must not touch SQLite: workers are stateless."""
+def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art, categories=()) -> _AnalysisResult:
+    """Run all LLM calls for one article. Must not touch SQLite: workers are stateless.
+
+    两级：先给文章定唯一大类，再（且只在该类允许的标签里）打关键词标签。
+    'other' 这类没有下游标签的大类直接跳过第二级，省一次模型调用。
+    """
     result = _AnalysisResult(article=art)
     try:
-        hits, tag_engine = tag_article(settings, llm, tags, art.title, art.body)
+        scope = list(tags)
+        if categories:
+            hit = classify_article(settings, llm, categories, art.title, art.body)
+            result.category = hit.category_id
+            result.category_confidence = hit.confidence if hit.category_id else None
+            result.category_engine = hit.engine
+            scope = tags_for_category(categories, tags, hit.category_id)
+            if hit.category_id == FALLBACK_CATEGORY:
+                # 兜底类不做语义打标（省一次模型调用），只用规则引擎保住行业维度标签
+                result.hits = tag_with_rules(
+                    tags_for_unclassified(tags),
+                    art.title,
+                    art.body,
+                    max_tags=settings.max_tags_per_article,
+                    body_chars=settings.tag_body_chars,
+                )
+                result.tag_engine = "rules" if result.hits else ""
+                return result
+            if not scope:
+                # 类内白名单为空：明确记为未打标，而不是遗留上一次的引擎值
+                LOG.warning("大类 %r 的标签白名单为空，跳过二级打标", hit.category_id)
+                result.tag_engine = ""
+                return result
+        hits, tag_engine = tag_article(settings, llm, scope, art.title, art.body)
         result.hits = hits
         result.tag_engine = tag_engine
         results = extract_article(
@@ -147,6 +186,9 @@ def _persist_result(conn, result: _AnalysisResult) -> None:
         extract_engine=extract_engine,
         tags=[(h.tag_id, h.confidence, h.evidence, h.engine) for h in result.hits],
         extractions=flat,
+        category=result.category,
+        category_confidence=result.category_confidence,
+        category_engine=result.category_engine,
         commit=False,
     )
     if result.checklist is not None:
@@ -175,6 +217,7 @@ def analyze_batch(
     workers = max(1, min(int(workers), 200))
 
     _, tags = load_vocab(settings.vocab_dir)
+    _, categories = load_categories(settings.vocab_dir)
     schemas = load_schemas(settings.vocab_dir / "schemas")
     llm = LLMClient(settings)
     client = NewsClient(settings)
@@ -273,11 +316,11 @@ def analyze_batch(
         LOG.info("开始分析 %d 篇，并发=%d", len(pending), workers)
         executor: ThreadPoolExecutor | None = None
         if workers == 1 or len(pending) <= 1:
-            results_iter = (_analyze_one(settings, llm, tags, schemas, art) for art in pending)
+            results_iter = (_analyze_one(settings, llm, tags, schemas, art, categories) for art in pending)
         else:
             executor = ThreadPoolExecutor(max_workers=min(workers, len(pending)))
             analyze_futures = [
-                executor.submit(_analyze_one, settings, llm, tags, schemas, art) for art in pending
+                executor.submit(_analyze_one, settings, llm, tags, schemas, art, categories) for art in pending
             ]
             results_iter = (f.result() for f in as_completed(analyze_futures))
 
