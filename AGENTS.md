@@ -425,7 +425,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=` |
-| `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等 |
+| `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
 | `test_tagging.py` | 词表外标签丢弃、去重、max_tags 截断、规则引擎多标签 |
 | `test_extraction_rules.py` | 日期区间取右端、裸开始日期不当截止、中文两位数、闰日、规则引擎不标 verified |
 | `test_extraction_llm_range.py` | 13 个区间用例：右端仅「日」、跨年、多区间取最后、截止前缀优先、电话/时钟不误判、跨逗号不误取评审区间 |
@@ -438,7 +438,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_news_client.py` | `published_desc`、page_size 不超过上游 100、live 报错、auto 回退记录原因、分页、坏 `total_pages`、坏 `content_length`、详情异常不崩、4xx 不回退、去重、详情覆盖顺序 |
 | `test_yaml_lint.py` | 合法/重复键/非法 YAML、SKIP 集合与顶层目录语义、工作目录无关、非 UTF-8、仓库全部 YAML 通过 |
 
-基线：宿主机全量 `pytest` **140 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **143 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 

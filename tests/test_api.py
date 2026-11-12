@@ -103,6 +103,20 @@ def test_category_filter_on_tags_endpoint(client):
     assert next(t for t in unscoped if t["id"] == "finance")["article_count"] == 1
 
 
+def test_empty_category_filter_returns_empty_not_everything(client):
+    """category= 空串是「筛一个不存在的类」，不能静默退化成不过滤。"""
+    headers = {"X-API-Key": "secret"}
+    client.post("/v1/analyze", params={"limit": 4}, headers=headers)
+
+    resp = client.get("/v1/articles", params={"category": ""}, headers=headers).json()
+    assert resp["data"] == []
+    assert resp["meta"]["total"] == 0
+
+    # /v1/tags 返回词表本身，空串下应当是「词表照旧、计数全 0」
+    tags = client.get("/v1/tags", params={"category": ""}, headers=headers).json()["data"]
+    assert tags and {t["article_count"] for t in tags} == {0}
+
+
 def test_analyze_limit_capped(client):
     resp = client.post(
         "/v1/analyze", params={"limit": 500}, headers={"X-API-Key": "secret"}

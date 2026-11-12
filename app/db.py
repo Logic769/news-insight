@@ -422,7 +422,9 @@ def list_analyzed(
     if tag:
         clauses.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag = ?)")
         args.append(tag)
-    if category:
+    # 用 is not None 而不是真值判断：category= 空串是「筛一个不存在的类」，
+    # 应该和未知类名一样返回空集，而不是静默退化成「不过滤」
+    if category is not None:
         clauses.append("a.category = ?")
         args.append(category)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -553,14 +555,15 @@ def category_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """
     rows = conn.execute(
         "SELECT category, COUNT(*) AS count, ROUND(AVG(category_confidence), 3) AS avg_confidence "
-        "FROM analyzed_articles WHERE category IS NOT NULL "
+        "FROM analyzed_articles WHERE category IS NOT NULL AND category <> '' "
         "GROUP BY category ORDER BY count DESC"
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def tag_stats(conn: sqlite3.Connection, *, category: str | None = None) -> list[dict[str, Any]]:
-    if category:
+    # 与 list_analyzed 一致：空串是「筛一个不存在的类」，返回空集而不是全量
+    if category is not None:
         rows = conn.execute(
             "SELECT t.tag, COUNT(*) AS count, ROUND(AVG(t.confidence), 3) AS avg_confidence "
             "FROM article_tags t JOIN analyzed_articles a ON a.article_id = t.article_id "

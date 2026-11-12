@@ -99,6 +99,21 @@ def test_shipped_categories_are_closed_and_consistent():
     )
 
 
+def test_missing_fallback_category_warns(tmp_path, caplog):
+    """词表缺兜底类时，表外结果无处可落，至少要能在日志里看出来。"""
+    (tmp_path / "categories.json").write_text(
+        '{"version": 1, "categories": [{"id": "a", "name": "甲", "keywords": [], "tags": []}]}',
+        encoding="utf-8",
+    )
+    load_categories.cache_clear()
+    try:
+        payload, cats = load_categories(tmp_path)
+        assert [c.id for c in cats] == ["a"], "缺兜底类不阻止加载，只是记一条告警"
+        assert any("other" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    finally:
+        load_categories.cache_clear()
+
+
 def test_missing_categories_file_means_single_stage_tagging(tmp_path):
     """没带 categories.json 的旧部署要原样退回单级打标，而不是启动失败。"""
     (tmp_path / "tags.json").write_text('{"version": 1, "tags": []}', encoding="utf-8")
@@ -149,6 +164,22 @@ def test_rules_category_ties_keep_declaration_order():
     # 「申报」(project_application) 与「人才计划」(talent_application) 各 0.6，先声明者胜
     assert hit.category_id == "project_application"
     assert hit.confidence == 0.6
+
+
+def test_rules_category_high_score_is_not_overridden_by_clamped_rival():
+    """高分先命中不能被后来的低分翻盘。
+
+    confidence 有 0.95 封顶，若拿封顶值当比较阈值，后面任何一个原始分过 0.95
+    的类都能覆盖前面的更高分，结果就取决于声明顺序了。
+    """
+    cats = [
+        CategoryDef("a", "甲", "", ("甲一", "甲二"), ()),
+        CategoryDef("b", "乙", "", ("乙一", "乙二", "乙三"), ()),
+    ]
+    # 甲在标题命中两词 = 1.2（封顶 0.95）；乙标题命中一词 + 正文命中两词 = 1.1
+    hit = category_with_rules(cats, "甲一甲二 乙一", "乙二 乙三", body_chars=200)
+    assert hit.category_id == "a"
+    assert hit.confidence == 0.95, "封顶只作用于对外置信度，不影响类别选择"
 
 
 def test_rules_category_never_returns_other_by_keyword():

@@ -128,6 +128,10 @@ def load_categories(vocab_dir: Path) -> tuple[dict[str, Any], list[CategoryDef]]
         )
         for c in payload.get("categories", [])
     ]
+    if cats and FALLBACK_CATEGORY not in {c.id for c in cats}:
+        # 词表里没有兜底类时，模型答出表外 id 就无处可落，二级打标与抽取都会被跳过。
+        # 这里只告警不抛错：启动失败比降级更难排查，而告警足以暴露配置错误。
+        LOG.warning("categories.json 缺少兜底大类 %r，表外结果将无法归类", FALLBACK_CATEGORY)
     return payload, cats
 
 
@@ -188,6 +192,7 @@ def category_with_rules(
     """
     haystack = f"{title}\n{body[:body_chars]}"
     best: CategoryHit | None = None
+    best_score = 0.0
     for c in categories:
         if c.id == FALLBACK_CATEGORY:
             continue
@@ -202,7 +207,10 @@ def category_with_rules(
             elif kw in haystack:
                 score += 0.25
                 hit_word = hit_word or kw
-        if score > 0 and (best is None or score > best.confidence):
+        # 用原始分比较，不用 clamp 后的 confidence：0.95 是封顶值，
+        # 拿它当阈值会让后面任何一个过 0.95 的类翻盘，结果取决于声明顺序
+        if score > 0 and (best is None or score > best_score):
+            best_score = score
             best = CategoryHit(c.id, min(0.95, score), hit_word, "rules")
     if best is not None:
         return best
