@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "description": "一级分类：每篇新闻单选一类。打标分两级——先定类，再只在该类允许的标签（tags.json 的 id）里做闭集多标签打标。other 是兜底类，不打二级关键词。",
+  "categories": [
+    {
+      "id": "project_application",
+      "name": "项目申报",
+      "description": "政府部门发布的项目/课题/计划申报通知、征集公告、立项与验收安排。",
+      "keywords": [
+        "申报",
+        "征集",
+        "立项",
+        "申报指南",
+        "推荐申报",
+        "项目库",
+        "课题",
+        "验收",
+        "中期检查",
+        "申报通知",
+        "申报条件",
+        "申报材料",
+        "申报截止"
+      ],
+      "tags": [
+        "project_application",
+        "planning",
+        "policy_release"
+      ]
+    },
+    {
+      "id": "industry_policy",
+      "name": "行业政策",
+      "description": "产业规划、实施意见、管理办法、标准规范等政策文件与政策解读。",
+      "keywords": [
+        "实施意见",
+        "若干措施",
+        "管理办法",
+        "指导意见",
+        "行动计划",
+        "规划",
+        "实施细则",
+        "试点",
+        "标准规范",
+        "政策解读",
+        "暂行办法",
+        "工作方案"
+      ],
+      "tags": [
+        "policy_release",
+        "planning",
+        "standard",
+        "public_service"
+      ]
+    },
+    {
+      "id": "talent_application",
+      "name": "人才申报",
+      "description": "人才计划、人才项目、职称与团队评选等面向个人的申报与认定。",
+      "keywords": [
+        "人才计划",
+        "人才项目",
+        "高层次人才",
+        "领军人才",
+        "创新团队",
+        "人才引进",
+        "引才",
+        "职称评审",
+        "博士后",
+        "人才认定",
+        "人才补贴",
+        "人才公寓"
+      ],
+      "tags": [
+        "talent_application",
+        "hr_talent",
+        "project_application",
+        "subsidy"
+      ]
+    },
+    {
+      "id": "enterprise_certification",
+      "name": "企业资质申报",
+      "description": "高新技术企业、专精特新、科技型中小企业等企业资质认定与入库培育。",
+      "keywords": [
+        "高新技术企业",
+        "专精特新",
+        "创新型中小企业",
+        "科技型中小企业",
+        "资质认定",
+        "认定名单",
+        "入库培育",
+        "备案",
+        "复审",
+        "企业技术中心",
+        "认定管理",
+        "评价认定"
+      ],
+      "tags": [
+        "certification",
+        "project_application",
+        "policy_release"
+      ]
+    },
+    {
+      "id": "funding_subsidy",
+      "name": "资金补贴",
+      "description": "财政资金、补贴、奖补、贴息、资助等资金支持政策与兑现通知。",
+      "keywords": [
+        "补贴",
+        "补助",
+        "奖补",
+        "奖励",
+        "专项资金",
+        "扶持资金",
+        "贴息",
+        "资助",
+        "兑现",
+        "拨付",
+        "资金支持",
+        "扶持计划"
+      ],
+      "tags": [
+        "subsidy",
+        "funding",
+        "policy_release"
+      ]
+    },
+    {
+      "id": "other",
+      "name": "其他",
+      "description": "不属于上述 5 类的新闻；只做一级兜底分类，不进入二级关键词打标。",
+      "keywords": [],
+      "tags": []
+    }
+  ]
+}

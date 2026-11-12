@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS analyzed_articles (
     published_at    TEXT,
     published_at_utc TEXT,
     content_length  INTEGER NOT NULL DEFAULT 0,
+    category        TEXT,               -- 一级分类（单选），categories.json 的 id；NULL = 分类功能上线前分析的历史行
+    category_confidence REAL,
+    category_engine TEXT,               -- llm / rules / none
     tag_engine      TEXT,
     extract_engine  TEXT,
     analyzed_at     TEXT NOT NULL
@@ -91,6 +94,21 @@ CREATE INDEX IF NOT EXISTS idx_analyzed_published ON analyzed_articles(published
 CREATE INDEX IF NOT EXISTS idx_extractions_schema ON extractions(schema_id, field);
 """
 
+# 依赖新增列的索引不能写在 SCHEMA_SQL 里：executescript 先于补列执行，旧库会因为
+# category 列还不存在而直接报错。放在 _migrate_columns 之后建。
+_POST_MIGRATION_SQL = """
+CREATE INDEX IF NOT EXISTS idx_analyzed_category ON analyzed_articles(category, published_at DESC);
+"""
+
+# init_db 只有 CREATE TABLE IF NOT EXISTS，升级前建好的库不会自动长出新列。
+# 新增列必须在这里补一次 ADD COLUMN，否则老库上的 INSERT 会因列不存在直接失败。
+_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    # (列, 列定义) —— 都落在 analyzed_articles 上
+    ("category", "TEXT"),
+    ("category_confidence", "REAL"),
+    ("category_engine", "TEXT"),
+)
+
 
 def _load_json(raw: Any) -> Any:
     """库被手工改坏时不要让整个端点 500。"""
@@ -121,7 +139,24 @@ def init_db(db_path: Path) -> None:
     # sqlite3 的上下文管理器只 commit/rollback、不 close，必须用 closing 兜住句柄
     with closing(connect(db_path)) as conn:
         conn.executescript(SCHEMA_SQL)
+        _migrate_columns(conn)
+        conn.executescript(_POST_MIGRATION_SQL)
         conn.commit()
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent ADD COLUMN for databases created before a column existed.
+
+    SQLite has no ALTER TABLE ... IF NOT EXISTS, so the existing column set is
+    read first; adding a column that already exists is the only failure mode
+    worth avoiding and it is cheapest to avoid by inspection.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(analyzed_articles)")}
+    for column, decl in _ADDED_COLUMNS:
+        if column in existing:
+            continue
+        conn.execute(f"ALTER TABLE analyzed_articles ADD COLUMN {column} {decl}")
+        LOG.info("已为 analyzed_articles 补列: %s", column)
 
 
 def save_analysis(
@@ -138,6 +173,9 @@ def save_analysis(
     extract_engine: str,
     tags: Iterable[tuple[str, float, str, str]],
     extractions: Iterable[tuple[str, str, Any, str, float, bool]],
+    category: str = "",
+    category_confidence: float | None = None,
+    category_engine: str = "",
     commit: bool = True,
 ) -> None:
     """Replace any previous analysis for this article (idempotent re-runs).
@@ -166,6 +204,9 @@ def save_analysis(
             extract_engine=extract_engine,
             tags=tags,
             extractions=extractions,
+            category=category,
+            category_confidence=category_confidence,
+            category_engine=category_engine,
             now=now,
         )
     except Exception:
@@ -192,22 +233,33 @@ def _replace_analysis(
     extract_engine: str,
     tags: Iterable[tuple[str, float, str, str]],
     extractions: Iterable[tuple[str, str, Any, str, float, bool]],
+    category: str,
+    category_confidence: float | None,
+    category_engine: str,
     now: str,
 ) -> None:
     conn.execute(
         """
         INSERT INTO analyzed_articles
             (article_id, source, url, title, published_at, published_at_utc,
-             content_length, tag_engine, extract_engine, analyzed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+             content_length, category, category_confidence, category_engine,
+             tag_engine, extract_engine, analyzed_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(article_id) DO UPDATE SET
             source=excluded.source, url=excluded.url, title=excluded.title,
             published_at=excluded.published_at, published_at_utc=excluded.published_at_utc,
-            content_length=excluded.content_length, tag_engine=excluded.tag_engine,
+            content_length=excluded.content_length,
+            -- 空值表示「这次没做分类」（旧版本重跑、categories.json 被移走后退回单级打标），
+            -- 不能拿它覆盖库里已有的分类；明确判成 other 时 category='other'，不是空值，会正常写入。
+            category            = COALESCE(excluded.category, analyzed_articles.category),
+            category_confidence = COALESCE(excluded.category_confidence, analyzed_articles.category_confidence),
+            category_engine     = COALESCE(NULLIF(excluded.category_engine, ''), analyzed_articles.category_engine),
+            tag_engine=excluded.tag_engine,
             extract_engine=excluded.extract_engine, analyzed_at=excluded.analyzed_at
         """,
         (article_id, source, url, title, published_at, published_at_utc,
-         content_length, tag_engine, extract_engine, now),
+         content_length, category or None, category_confidence, category_engine,
+         tag_engine, extract_engine, now),
     )
     conn.execute("DELETE FROM article_tags WHERE article_id = ?", (article_id,))
     conn.executemany(
@@ -363,11 +415,17 @@ def list_analyzed(
     tag: str | None,
     limit: int,
     offset: int,
+    category: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    where, args = "", []
+    clauses: list[str] = []
+    args: list[Any] = []
     if tag:
-        where = "WHERE a.article_id IN (SELECT article_id FROM article_tags WHERE tag = ?)"
+        clauses.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag = ?)")
         args.append(tag)
+    if category:
+        clauses.append("a.category = ?")
+        args.append(category)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     total = conn.execute(f"SELECT COUNT(*) FROM analyzed_articles a {where}", args).fetchone()[0]
     rows = conn.execute(
         f"""SELECT a.* FROM analyzed_articles a {where}
@@ -486,7 +544,30 @@ def get_checklist(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] |
     }
 
 
-def tag_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def category_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """One row per first-level category; unclassified (pre-upgrade) rows are excluded.
+
+    NULL category means "analyzed before categorization existed", which is not
+    the same as the 'other' bucket -- folding them together would make the
+    'other' count jump on every deployment that predates this feature.
+    """
+    rows = conn.execute(
+        "SELECT category, COUNT(*) AS count, ROUND(AVG(category_confidence), 3) AS avg_confidence "
+        "FROM analyzed_articles WHERE category IS NOT NULL "
+        "GROUP BY category ORDER BY count DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def tag_stats(conn: sqlite3.Connection, *, category: str | None = None) -> list[dict[str, Any]]:
+    if category:
+        rows = conn.execute(
+            "SELECT t.tag, COUNT(*) AS count, ROUND(AVG(t.confidence), 3) AS avg_confidence "
+            "FROM article_tags t JOIN analyzed_articles a ON a.article_id = t.article_id "
+            "WHERE a.category = ? GROUP BY t.tag ORDER BY count DESC",
+            (category,),
+        ).fetchall()
+        return [dict(r) for r in rows]
     rows = conn.execute(
         "SELECT tag, COUNT(*) AS count, ROUND(AVG(confidence), 3) AS avg_confidence "
         "FROM article_tags GROUP BY tag ORDER BY count DESC"
