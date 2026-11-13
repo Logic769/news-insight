@@ -80,7 +80,7 @@ class _FakeClient:
     def __init__(
         self,
         bodies: dict[str, str],
-        errors: dict[str, str] | None = None,
+        errors: dict[str, str | tuple[str, int]] | None = None,
         tracker: _ConnTracker | None = None,
     ):
         self.bodies = bodies
@@ -94,7 +94,11 @@ class _FakeClient:
         if self.tracker is not None and self.tracker.conn is not None:
             self.tx_during_calls.append(self.tracker.conn.in_transaction)
         if article_id in self.errors:
-            raise UpstreamError(self.errors[article_id])
+            spec = self.errors[article_id]
+            if isinstance(spec, tuple):
+                message, status_code = spec
+                raise UpstreamError(message, status_code=status_code)
+            raise UpstreamError(spec)
         return {"content": self.bodies.get(article_id, "")}
 
     def close(self) -> None:
@@ -181,7 +185,10 @@ class TestBackfill:
         ])
         client = _FakeClient(
             {"empty": "   ", "older": "旧正文"},
-            errors={"dead": "404", "dead2": "410"},
+            errors={
+                "dead": ("文章详情 dead 返回 404", 404),
+                "dead2": ("文章详情 dead2 返回 410", 410),
+            },
         )
         _patch_client(monkeypatch, client)
         result = backfill_mod.backfill_bodies(settings, limit=1, batch=10)
@@ -189,8 +196,10 @@ class TestBackfill:
             "死链占满了窗口，更早的可回填文章没被访问到：" + repr(client.calls)
         )
         assert result["filled"] == 1
-        assert result["failed"] == 2
-        assert result["skipped"] == 1
+        # 死链（404/410）算 skipped：上游明确说没有，重跑也不会有，
+        # 计入 failed 会让「failed > 0 就重跑」永远成立。
+        assert result["failed"] == 0
+        assert result["skipped"] == 3
         assert result["remaining"] == 3
 
         conn = db.connect(settings.db_path)
@@ -201,6 +210,37 @@ class TestBackfill:
         assert got["older"] == "旧正文"
         assert got["dead"] is None
         assert got["empty"] is None
+
+    def test_gone_links_are_skipped_but_transient_errors_stay_failed(
+        self, tmp_path, monkeypatch
+    ):
+        """404/410 是死链，算 skipped；5xx 是临时故障，算 failed。
+
+        两者的运维含义相反：failed > 0 意味着「稍后重跑可能补上」，
+        skipped 意味着「这篇上游确实没有正文」。死链若计入 failed，
+        持续 404 的行会让 failed 永远 > 0，运维永远等不到停止信号。
+        """
+        settings = _settings(tmp_path)
+        _seed(settings.db_path, [
+            ("gone404", None, "2026-11-05 00:00:00"),
+            ("gone410", None, "2026-11-04 00:00:00"),
+            ("boom", None, "2026-11-03 00:00:00"),
+            ("ok", None, "2026-11-02 00:00:00"),
+        ])
+        client = _FakeClient(
+            {"ok": "正文"},
+            errors={
+                "gone404": ("文章详情 gone404 返回 404", 404),
+                "gone410": ("文章详情 gone410 返回 410", 410),
+                "boom": ("文章详情 boom 返回 503", 503),
+            },
+        )
+        _patch_client(monkeypatch, client)
+        result = backfill_mod.backfill_bodies(settings, limit=10, batch=10)
+        assert result["filled"] == 1
+        assert result["skipped"] == 2, "404/410 应计入 skipped"
+        assert result["failed"] == 1, "503 是临时故障，仍应计入 failed"
+        assert result["remaining"] == 3
 
     def test_candidate_selection_is_deterministic(self, tmp_path, monkeypatch):
         """同名次行在 LIMIT 边界上必须稳定：否则两次运行回填的是不同集合。"""

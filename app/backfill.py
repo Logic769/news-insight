@@ -32,6 +32,11 @@ LOG = logging.getLogger("news_insight.backfill")
 # "how much we write".
 _SCAN_FACTOR = 5
 
+# Upstream says the article is gone. These are permanent, not transient: counting
+# them as `failed` would keep `failed > 0` forever and the run would never look
+# finished, so operators would retry a dead link indefinitely.
+_GONE_STATUS_CODES = frozenset({404, 410})
+
 
 def _articles_missing_body(conn: Any, scan_budget: int) -> list[dict[str, Any]]:
     """Rows analyzed but without a body, newest first.
@@ -148,6 +153,12 @@ def backfill_bodies(settings: Settings, *, limit: int = 500, batch: int = 50) ->
                 try:
                     payload = client.get_article(article_id)
                 except UpstreamError as exc:
+                    if exc.status_code in _GONE_STATUS_CODES:
+                        # 上游明确说这篇不存在（死链），不是临时故障。计成 failed 会让
+                        # 「failed > 0 就该重跑」永远成立，运维永远等不到停止信号。
+                        LOG.warning("文章已不存在 %s（HTTP %s）", article_id, exc.status_code)
+                        skipped += 1
+                        continue
                     LOG.warning("取正文失败 %s: %s", article_id, exc)
                     failed += 1
                     continue
