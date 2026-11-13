@@ -1150,17 +1150,22 @@ def test_search_undated_excluded_only_counts_rows_matching_the_keyword() -> None
     assert out["undated_excluded"] == 1, "无关的无日期行不能算进来"
 
 
-def test_search_time_filter_excludes_rows_with_tab_whitespace_date() -> None:
-    """日期是制表符的历史行既不能出现在结果里，也不能悄悄消失。
+def test_search_time_filter_excludes_rows_with_whitespace_only_date() -> None:
+    """日期只由空白组成的历史行既不能出现在结果里，也不能悄悄消失。
 
     内置 trim(x) 只去半角空格，'\t' 原样留下：它既会被上界命中（'\t' < '2026-11-06'），
     又算不出 undated（trim 后仍是 '\t' 非空），于是这行既不在结果里也不在统计里，
     用户看到的总数会比实际少且没有任何解释。
+
+    覆盖的码位必须与 search.WS_CHARS 同源：早先手写表只到制表符/全角空格，
+    U+2003（从 Word 复制的日期里最常见）与 U+0085 仍是静默丢行。
     """
     conn = _conn()
     _add_dt(conn, "dated", published_at="2026-11-05 12:00:00")
     _add_dt(conn, "tab", published_at="\t", published_at_utc=None)
     _add_dt(conn, "ideographic", published_at="\u3000", published_at_utc=None)
+    _add_dt(conn, "em-space", published_at="\u2003", published_at_utc=None)
+    _add_dt(conn, "nel", published_at="\x85", published_at_utc=None)
 
     out = db.search_grouped(
         conn,
@@ -1171,7 +1176,7 @@ def test_search_time_filter_excludes_rows_with_tab_whitespace_date() -> None:
     )
     ids = [i["article_id"] for g in out["groups"] for i in g["items"]]
     assert ids == ["dated"]
-    assert out["undated_excluded"] == 2, "制表符与全角空格都要计入未计入统计"
+    assert out["undated_excluded"] == 4, "制表符/全角空格/U+2003/U+0085 都要计入未计入统计"
 
 
 def test_search_time_sort_breaks_ties_by_relevance() -> None:

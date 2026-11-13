@@ -137,11 +137,10 @@ _DAY_EXPR = "substr(COALESCE(NULLIF(published_at, ''), NULLIF(published_at_utc, 
 
 # SQLite 内置的 trim(x) 只去掉 U+0020，'\t' / NBSP / 全角空格会原样留下，于是这类
 # 「看起来是空的」日期既命中上界（'\t' < '2026-11-06'）又算不出 undated，行会被静默丢掉。
-# 用第二参数显式给一张表：与 app/search.py 的 WS_CHARS 保持同一批字符，两处不能各写一半。
-_SQL_BLANK_CHARS = (
-    "' ' || char(9) || char(10) || char(11) || char(12) || char(13)"
-    " || char(160) || char(12288)"
-)
+# 用第二参数显式给一张表，且直接由 search.WS_CHARS 生成：两处共用同一份码位表，
+# 不会再出现「SQL 侧手写 8 个、Python 侧 22 个」这种静默丢行的缺口（U+2003、
+# U+0085 等复制的日期此前会被既不算结果也不算 undated）。
+_SQL_BLANK_CHARS = " || ".join(f"char({ord(ch)})" for ch in search_mod.WS_CHARS)
 # 「日期不可判定」的统一判定：NULL，或只由空白组成（含制表符/全角空格）。
 _DAY_MISSING_SQL = f"({_DAY_EXPR} IS NULL OR trim({_DAY_EXPR}, {_SQL_BLANK_CHARS}) = '')"
 
