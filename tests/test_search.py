@@ -1048,3 +1048,131 @@ def test_search_candidates_rejects_unknown_sort() -> None:
     _add_dt(conn, "a1")
     with pytest.raises(ValueError, match="未知排序"):
         db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="nope")
+
+def test_search_time_filter_never_returns_blank_date_rows() -> None:
+    """日期是纯空白的历史行不能既出现在结果里、又被算成「已排除」。
+
+    SQLite 的 NULLIF(x, '') 只认空串，'   ' 原样返回，于是 _DAY_EXPR 得到 '   '，
+    '   ' < '2026-11-06' 为真 —— 只靠上下界的话这类行会被上界命中。而
+    list_analyzed 的 undated 统计用的是 trim(...) = ''，同一行会既出现又被报成
+    「未计入日期筛选」，用户看到「共 1 条，其中 1 条无日期未计入」这种自相矛盾的话。
+    """
+    conn = _conn()
+    _add_dt(conn, "dated", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "blank", published_at="   ", published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_to="2026-11-06",
+    )
+    ids = [i["article_id"] for g in out["groups"] for i in g["items"]]
+    assert ids == ["dated"], "空白日期行不能被上界命中"
+    assert out["total"] == 1
+    assert out["undated_excluded"] == 1, "它必须只出现在 excluded 计数里"
+
+
+def test_search_grouped_reports_undated_excluded_only_when_filtering() -> None:
+    """不筛日期时没有东西被排除，计数必须是 0 而不是全表无日期行数。"""
+    conn = _conn()
+    _add_dt(conn, "dated", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "undated", published_at=None, published_at_utc=None)
+
+    plain = db.search_grouped(conn, raw_query="光伏", tags=TAGS, category_order=CATEGORY_ORDER)
+    assert plain["total"] == 2, "不筛日期时无日期行照常返回"
+    assert plain["undated_excluded"] == 0
+
+    filtered = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_from="2026-11-01",
+    )
+    assert filtered["total"] == 1
+    assert filtered["undated_excluded"] == 1
+
+
+def test_search_undated_excluded_respects_category_and_source_filters() -> None:
+    """统计口径必须与筛选用的是同一批条件，否则两个数各说各话。
+
+    只按「全库无日期行」数一遍的话，用户筛了项目申报、看来源 A，却被告知
+    「另有 2 篇无日期被排除」——那 2 篇可能既不属于该类也不属于该来源，
+    用户去核对时根本找不到对应文章。
+    """
+    conn = _conn()
+    _add_dt(conn, "hit", category="project_application", source="site-a",
+            published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "same-cat", category="project_application", source="site-a",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "other-cat", category="industry_policy", source="site-a",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "other-src", category="project_application", source="site-b",
+            published_at=None, published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        categories=["project_application"],
+        sources=["site-a"],
+        published_from="2026-11-01",
+    )
+    assert out["undated_excluded"] == 1, "只数同类同源的那篇"
+
+
+def test_search_time_sort_breaks_ties_by_relevance() -> None:
+    """同一时刻的多篇仍按相关度次序：时间相同不等于顺序可以随便。
+
+    发布时间精度到秒，同一天发的几十篇里大多数这一列完全相同，只剩相关度能
+    区分。这里刻意让「高分那篇的 article_id」在两种排序下都与期望顺序相反：
+    如果删掉相关度这一级键、直接落到 article_id 兜底，结果必然反序——只写
+    同向数据的话，删键也照样绿，守卫等于没有。
+    """
+    for sort, high in (("published_desc", "aaa-high"), ("published_asc", "zzz-high")):
+        conn = _conn()
+        low = "zzz-low" if high == "aaa-high" else "aaa-low"
+        for aid in (high, low):
+            _add_dt(
+                conn,
+                aid,
+                category="project_application",
+                published_at="2026-11-01 00:00:00",
+                published_at_utc="2026-11-01 00:00:00",
+            )
+        for aid, conf in ((high, 0.95), (low, 0.3)):
+            conn.execute(
+                "INSERT INTO article_tags (article_id, tag, confidence, evidence, engine)"
+                " VALUES (?,?,?,?,?)",
+                (aid, "new_energy", conf, "", "rules"),
+            )
+        conn.commit()
+
+        out = db.search_grouped(
+            conn, raw_query="光伏", tags=TAGS, category_order=CATEGORY_ORDER, sort=sort
+        )
+        ids = [i["article_id"] for g in out["groups"] for i in g["items"]]
+        assert ids == [high, low], (sort, ids)
+
+
+def test_search_grouped_empty_query_keeps_response_shape() -> None:
+    """空查询的返回不能缺键：前端为缺键兜默认值，那套默认值迟早跟真实返回漂移。"""
+    conn = _conn()
+    _add_dt(conn, "a1")
+
+    out = db.search_grouped(
+        conn,
+        raw_query="zzz不存在",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        sort="published_asc",
+    )
+    assert out["groups"] == [] and out["total"] == 0
+    assert out["sort"] == "published_asc"
+    assert out["returned"] == 0
+    assert out["truncated"] is False
+    assert out["undated_excluded"] == 0
+

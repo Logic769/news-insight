@@ -500,6 +500,13 @@ def _time_clauses(
     """
     clauses: list[str] = []
     args: list[Any] = []
+    # 只要带了任一端，就必须把「日期不可判定」的行排除掉，而不是只靠上下界。
+    # 原因在 SQLite 的比较语义：published_at 是纯空白（'   '）时
+    # NULLIF(published_at,'') 不会把它变成 NULL（它只认空串），于是
+    # _DAY_EXPR 得到 '   ' 而不是 NULL，'   ' < '2026-11-07' 为真——这类行会被
+    # 上界命中、同时又被 undated_excluded 统计为「未计入」，同一行既出现又
+    # 被说成排除掉了。list_analyzed 的 undated 统计用的正是
+    # (IS NULL OR trim(...) = '')，这里必须同源才能互不重不漏。
     if published_from:
         clauses.append(f"{_DAY_EXPR} >= ?")
         args.append(published_from[:10])
@@ -508,6 +515,8 @@ def _time_clauses(
         # 与带毫秒的时间戳都不会被漏掉。
         clauses.append(f"{_DAY_EXPR} < ?")
         args.append(published_to[:10])
+    if clauses:
+        clauses.append(f"trim({_DAY_EXPR}) <> ''")
     return clauses, args
 
 
@@ -948,6 +957,74 @@ def vacuum(conn: sqlite3.Connection) -> None:
 
 
 # ------------------------------------------------------------------ search
+def _undated_excluded(
+    conn: sqlite3.Connection,
+    *,
+    terms: Sequence[str],
+    tag_ids: Sequence[str],
+    categories: Sequence[str] | None,
+    sources: Sequence[str] | None,
+    published_from: str | None,
+    published_to: str | None,
+) -> int:
+    """带日期过滤时被排除的「无日期」命中数；不筛日期时返回 0。
+
+    条件与 search_candidates 逐项同源（signal / category / source），只有日期那一段
+    换成「判不出日期」——这就是「本来命中、只因日期不可判定而被筛掉」的那批。
+    """
+    if not (published_from or published_to):
+        return 0
+    clauses, args = _signal_clauses(conn, terms, tag_ids)
+    if categories is not None:
+        if not categories:
+            return 0
+        placeholders = ",".join("?" for _ in categories)
+        clauses.append("COALESCE(a.category, '') IN (" + placeholders + ")")
+        args.extend(categories)
+    src_clauses, src_args = _source_clause(sources)
+    clauses.extend(src_clauses)
+    args.extend(src_args)
+    clauses.append(f"({_DAY_EXPR} IS NULL OR trim({_DAY_EXPR}) = '')")
+    row = conn.execute(
+        "SELECT COUNT(*) FROM analyzed_articles a WHERE " + " AND ".join(clauses),
+        args,
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _signal_clauses(
+    conn: sqlite3.Connection,
+    terms: Sequence[str],
+    tag_ids: Sequence[str],
+) -> tuple[list[str], list[Any]]:
+    """检索命中的信号条件：命中任一标签，或标题/正文包含任一词。
+
+    抽出来是为了让 search_candidates（取候选）与 search_grouped 的
+    undated_excluded 统计用同一份条件——两处各写一遍，将来改了一处就会出现
+    「统计说排除了 N 篇，实际筛掉的却是另一批」。
+    """
+    clauses: list[str] = []
+    args: list[Any] = []
+    signal: list[str] = []
+    if tag_ids:
+        placeholders = ",".join("?" for _ in tag_ids)
+        signal.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag IN (" + placeholders + "))")
+        args.extend(tag_ids)
+    # term 与 title/body 都过同一个 _norm：空白（含 \u2003 这类从网页复制的窄空格）
+    # 与非 ASCII 大小写（ÖBB / müller）都必须在预筛阶段就被折掉，否则 SQL 阶段丢行，
+    # 打分阶段再准也没用。
+    _ensure_norm_func(conn)
+    for term in terms:
+        needle = search_mod._norm(term)
+        if not needle:
+            continue
+        signal.append("(instr(py_norm(a.title), ?) > 0 OR instr(py_norm(a.body), ?) > 0)")
+        args.extend([needle, needle])
+    if signal:
+        clauses.append("(" + " OR ".join(signal) + ")")
+    return clauses, args
+
+
 def search_candidates(
     conn: sqlite3.Connection,
     *,
@@ -999,24 +1076,9 @@ def search_candidates(
     clauses: list[str] = []
     args: list[Any] = []
 
-    signal: list[str] = []
-    if tag_ids:
-        placeholders = ",".join("?" for _ in tag_ids)
-        signal.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag IN (" + placeholders + "))")
-        args.extend(tag_ids)
-    # term 与 title/body 都过同一个 _norm：空白（含 \u2003 这类从网页复制的窄空格）
-    # 与非 ASCII 大小写（ÖBB / müller）都必须在预筛阶段就被折掉，否则 SQL 阶段丢行，
-    # 打分阶段再准也没用。
-    _ensure_norm_func(conn)
-    for term in terms:
-        needle = search_mod._norm(term)
-        if not needle:
-            continue
-        signal.append("(instr(py_norm(a.title), ?) > 0 OR instr(py_norm(a.body), ?) > 0)")
-        args.extend([needle, needle])
-
-    if signal:
-        clauses.append("(" + " OR ".join(signal) + ")")
+    signal, signal_args = _signal_clauses(conn, terms, tag_ids)
+    clauses.extend(signal)
+    args.extend(signal_args)
 
     if categories is not None:
         if not categories:
@@ -1157,7 +1219,20 @@ def search_grouped(
     """
     query = search_mod.resolve_query(raw_query, tags)
     if query.is_empty:
-        return {"query": raw_query, "matched_tags": [], "terms": [], "groups": [], "total": 0}
+        # 形状与正常返回一致（缺键会让前端 branch 出 undefined）：空查询同样要带
+        # sort/returned/truncated/undated_excluded，否则前端得为「空结果」单独
+        # 兜一套字段默认值，而这套默认值迟早会跟真实返回漂移。
+        return {
+            "query": raw_query,
+            "matched_tags": [],
+            "terms": [],
+            "groups": [],
+            "total": 0,
+            "sort": sort,
+            "returned": 0,
+            "truncated": False,
+            "undated_excluded": 0,
+        }
 
     # 多取一行用来判断「是否还有更多」：只比对 len(rows) == limit 的话，库里恰好
     # 2000 行时会误报截断（其实全取完了），而把 limit 传死又不随将来改动走。
@@ -1173,6 +1248,15 @@ def search_grouped(
         # 否则最老的那批恰好是被截掉的那批。
         sort=sort,
         limit=_CANDIDATE_LIMIT + 1,
+    )
+    undated_excluded = _undated_excluded(
+        conn,
+        terms=query.term_texts,
+        tag_ids=query.tag_ids,
+        categories=categories,
+        sources=sources,
+        published_from=published_from,
+        published_to=published_to,
     )
     truncated = len(rows) > _CANDIDATE_LIMIT
     if truncated:
@@ -1272,4 +1356,11 @@ def search_grouped(
         # 候选集是否被 _CANDIDATE_LIMIT 截断。为 true 时 total 只是下界，
         # 前端必须提示「结果可能不完整」，不能把 total 当成全库命中数展示。
         "truncated": truncated,
+        # 带日期过滤时，有多少篇「本来命中关键词与分类/来源条件，但两个时间列都
+        # 判不出日期」的文章被排除在外。不带日期过滤时恒为 0（此时没有东西被排除）。
+        #
+        # 必须单独数：total 只数筛完剩下的，用户看到「共 20 条」而实际库里有 23 篇
+        # 命中，会以为丢了数据。统计口径与 list_analyzed 的 undated_excluded 一致，
+        # 且同样不受 _CANDIDATE_LIMIT 截断影响——它是 COUNT(*)，不是对 rows 数一遍。
+        "undated_excluded": undated_excluded,
     }

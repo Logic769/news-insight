@@ -192,19 +192,9 @@ def test_search_sorts_by_published_time(client, sort, expected):
         assert stamps == sorted(stamps, reverse=expected), (group["category"], stamps)
 
 
-def test_search_time_sort_keeps_high_relevance_first_on_ties(client):
-    """同一时刻的多篇仍按相关度降序：时间相同不等于顺序可以随便。"""
-    resp = client.get(
-        "/v1/search", params={"q": "申报", "sort": "published_asc"}, headers=HEADERS
-    )
-    for group in resp.json()["data"]["groups"]:
-        items = group["items"]
-        for prev, cur in zip(items, items[1:], strict=False):
-            prev_time = prev.get("published_at_utc") or prev.get("published_at") or ""
-            cur_time = cur.get("published_at_utc") or cur.get("published_at") or ""
-            if prev_time != cur_time:
-                continue
-            assert prev["relevance"]["score"] >= cur["relevance"]["score"]
+# 「同一时刻按相关度次序」在 HTTP 层测不了：夹具五篇发布时间互不相同，循环里的
+# 同刻分支一次也不会进，断言形同虚设（删掉次级排序键也照样绿）。改为在
+# tests/test_search.py 里用显式同刻行覆盖：test_search_time_sort_breaks_ties_by_relevance。
 
 
 def _display_day(item):
