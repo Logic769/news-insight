@@ -265,7 +265,9 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 - `Z < remaining`：**这一轮根本没扫完**，`filled=0` 什么都证明不了，必须调大 `--limit`（`Z` 随之放大）
   直到 `Z ≥ remaining` 再判断；
-- `Z ≥ remaining` 且 `filled=0`：才说明这一轮确实扫过了全部缺正文的行、且都没能取到正文，可以停。
+- `Z ≥ remaining` 且 `filled=0`：只说明**扫描覆盖完成**、这一轮扫过的行都没写进正文，**不等于回填完成**。
+  还要看 `failed`：`failed > 0`（上游错误/超时）说明是临时故障，稍后重跑即可，不能当完成；
+  `failed == 0` 且 `filled == 0` 才是「这些行上游确实没有正文」（`skipped`），此时可以停。
 
 只看「调大 `--limit` 后 `filled` 是否为 0」会误判。实测（死链在前、唯一可回填的行在最旧处）：
 
@@ -278,6 +280,10 @@ python -m app backfill-bodies --limit 500 --batch 50
 第二行就是反例：把 `--limit` 从 1 调到 50 后 `filled` 依然为 0，但回填并没有完成——预算 250 恰好被
 250 篇死链吃满，最旧那篇可回填的行仍没进入候选集。所以 `filled=0` 只有在 `Z ≥ remaining` 时才可信。
 这个上限是结构性的（预算有限），不想被卡住就继续调大 `--limit`，或先手工清掉这批死链。
+
+注意 `skipped` 与 `failed` 的区别很重要：`skipped` 是上游明确没有正文（本轮请求成功、返回空），`failed`
+是请求本身出错（超时、5xx、连接失败）。上游临时不可用会让整批都进 `failed`，这时 `remaining` 一篇没少
+也不奇怪——重跑而不是把它当成「这些文章永远没有正文」。
 
 **已知取舍**：
 
