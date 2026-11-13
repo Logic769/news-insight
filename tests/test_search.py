@@ -1124,6 +1124,56 @@ def test_search_undated_excluded_respects_category_and_source_filters() -> None:
     assert out["undated_excluded"] == 1, "只数同类同源的那篇"
 
 
+def test_search_undated_excluded_only_counts_rows_matching_the_keyword() -> None:
+    """无日期统计必须只数「本来会被这次检索命中」的行。
+
+    只按「全库无日期的行」数一遍的话，用户搜「光伏」却被告知「另有 3 篇无日期
+    被排除」，而那 3 篇讲的是别的事 —— 用户按提示去核对时一篇都对不上。
+    """
+    conn = _conn()
+    _add_dt(conn, "hit", title="光伏补贴申报通知", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "hit-undated", title="光伏补贴申报补充通知",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "noise-undated", title="关于人才落户的通知",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "noise-undated-2", title="关于开展安全检查的通知",
+            published_at=None, published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_from="2026-11-01",
+    )
+    assert out["total"] == 1
+    assert out["undated_excluded"] == 1, "无关的无日期行不能算进来"
+
+
+def test_search_time_filter_excludes_rows_with_tab_whitespace_date() -> None:
+    """日期是制表符的历史行既不能出现在结果里，也不能悄悄消失。
+
+    内置 trim(x) 只去半角空格，'\t' 原样留下：它既会被上界命中（'\t' < '2026-11-06'），
+    又算不出 undated（trim 后仍是 '\t' 非空），于是这行既不在结果里也不在统计里，
+    用户看到的总数会比实际少且没有任何解释。
+    """
+    conn = _conn()
+    _add_dt(conn, "dated", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "tab", published_at="\t", published_at_utc=None)
+    _add_dt(conn, "ideographic", published_at="\u3000", published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_to="2026-11-06",
+    )
+    ids = [i["article_id"] for g in out["groups"] for i in g["items"]]
+    assert ids == ["dated"]
+    assert out["undated_excluded"] == 2, "制表符与全角空格都要计入未计入统计"
+
+
 def test_search_time_sort_breaks_ties_by_relevance() -> None:
     """同一时刻的多篇仍按相关度次序：时间相同不等于顺序可以随便。
 
@@ -1159,13 +1209,18 @@ def test_search_time_sort_breaks_ties_by_relevance() -> None:
 
 
 def test_search_grouped_empty_query_keeps_response_shape() -> None:
-    """空查询的返回不能缺键：前端为缺键兜默认值，那套默认值迟早跟真实返回漂移。"""
+    """空查询的返回不能缺键：前端为缺键兜默认值，那套默认值迟早跟真实返回漂移。
+
+    必须传真正的空串走 search_grouped 的早退分支。传"库里没有的词"是**测不到**的：
+    resolve_query 对任何非空文本都会塞一个 terms 条目，is_empty 为 False，代码走的是
+    正常路径，四键断言天然成立（这个用例曾经就是这么写的，删掉早退分支仍然全绿）。
+    """
     conn = _conn()
     _add_dt(conn, "a1")
 
     out = db.search_grouped(
         conn,
-        raw_query="zzz不存在",
+        raw_query="",
         tags=TAGS,
         category_order=CATEGORY_ORDER,
         sort="published_asc",

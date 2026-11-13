@@ -135,6 +135,16 @@ _TIME_EXPR = "COALESCE(NULLIF(published_at_utc, ''), published_at)"
 # 两列都空的行无法判定，会被排除并计入 undated_excluded。
 _DAY_EXPR = "substr(COALESCE(NULLIF(published_at, ''), NULLIF(published_at_utc, '')), 1, 10)"
 
+# SQLite 内置的 trim(x) 只去掉 U+0020，'\t' / NBSP / 全角空格会原样留下，于是这类
+# 「看起来是空的」日期既命中上界（'\t' < '2026-11-06'）又算不出 undated，行会被静默丢掉。
+# 用第二参数显式给一张表：与 app/search.py 的 WS_CHARS 保持同一批字符，两处不能各写一半。
+_SQL_BLANK_CHARS = (
+    "' ' || char(9) || char(10) || char(11) || char(12) || char(13)"
+    " || char(160) || char(12288)"
+)
+# 「日期不可判定」的统一判定：NULL，或只由空白组成（含制表符/全角空格）。
+_DAY_MISSING_SQL = f"({_DAY_EXPR} IS NULL OR trim({_DAY_EXPR}, {_SQL_BLANK_CHARS}) = '')"
+
 
 # 依赖新增列的索引不能写在 SCHEMA_SQL 里：executescript 先于补列执行，旧库会因为
 # category 列还不存在而直接报错。放在 _migrate_columns 之后建。
@@ -501,12 +511,11 @@ def _time_clauses(
     clauses: list[str] = []
     args: list[Any] = []
     # 只要带了任一端，就必须把「日期不可判定」的行排除掉，而不是只靠上下界。
-    # 原因在 SQLite 的比较语义：published_at 是纯空白（'   '）时
-    # NULLIF(published_at,'') 不会把它变成 NULL（它只认空串），于是
-    # _DAY_EXPR 得到 '   ' 而不是 NULL，'   ' < '2026-11-07' 为真——这类行会被
-    # 上界命中、同时又被 undated_excluded 统计为「未计入」，同一行既出现又
-    # 被说成排除掉了。list_analyzed 的 undated 统计用的正是
-    # (IS NULL OR trim(...) = '')，这里必须同源才能互不重不漏。
+    # 原因在 SQLite 的比较语义：published_at 是纯空白（'   ' / '\t' / 全角空格）时
+    # NULLIF(published_at,'') 不会把它变成 NULL（它只认空串），于是 _DAY_EXPR 得到
+    # '   ' 而不是 NULL，'   ' < '2026-11-07' 为真——这类行会被上界命中、同时又被
+    # undated_excluded 统计为「未计入」，同一行既出现又被说成排除掉了。
+    # 判空必须走 _DAY_MISSING_SQL：内置 trim() 只认半角空格，'\t' 会被漏掉。
     if published_from:
         clauses.append(f"{_DAY_EXPR} >= ?")
         args.append(published_from[:10])
@@ -515,8 +524,9 @@ def _time_clauses(
         # 与带毫秒的时间戳都不会被漏掉。
         clauses.append(f"{_DAY_EXPR} < ?")
         args.append(published_to[:10])
-    if clauses:
-        clauses.append(f"trim({_DAY_EXPR}) <> ''")
+    if published_from or published_to:
+        # 与 _DAY_MISSING_SQL 严格互补：能被这项排除的行，恰好是 undated 统计数到的那批。
+        clauses.append(f"NOT {_DAY_MISSING_SQL}")
     return clauses, args
 
 
@@ -643,10 +653,9 @@ def list_analyzed(
         # 不数出来的话用户看到的 total 会比预期少一截且无解释。
         undated_clauses = [
             *clauses,
-            # 直接用 _DAY_EXPR 判空，与过滤条件同源：两列都空、或只剩纯空白时它给出
-            # NULL，正好是「无法判定日期」的那批行。若另写一套 (IS NULL OR = '')，
+            # 与 _time_clauses 里的排除条件共用 _DAY_MISSING_SQL：两处各写一套的话，
             # 纯空白行会被过滤条件排除却不计入 undated，total 少一截还没解释。
-            f"({_DAY_EXPR} IS NULL OR trim({_DAY_EXPR}) = '')",
+            _DAY_MISSING_SQL,
         ]
         undated = conn.execute(
             "SELECT COUNT(*) FROM analyzed_articles a WHERE " + " AND ".join(undated_clauses),
@@ -984,7 +993,7 @@ def _undated_excluded(
     src_clauses, src_args = _source_clause(sources)
     clauses.extend(src_clauses)
     args.extend(src_args)
-    clauses.append(f"({_DAY_EXPR} IS NULL OR trim({_DAY_EXPR}) = '')")
+    clauses.append(_DAY_MISSING_SQL)
     row = conn.execute(
         "SELECT COUNT(*) FROM analyzed_articles a WHERE " + " AND ".join(clauses),
         args,

@@ -142,7 +142,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
 | GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤；也可用 `category=funding_subsidy` 按大类过滤（可与 `tag` 同用，AND） |
-| GET | `/v1/search?q=申报&category=project_application&per_category=20&include_body=false` | **关键词检索**：结果按 5 大类分组、类内按相关度降序（排序全部在后端算完，前端直接渲染；详见下节） |
+| GET | `/v1/search?q=申报&category=project_application&per_category=20&include_body=false&source=&published_from=&published_to=&sort=` | **关键词检索**：结果按 6 大类分组、类内按相关度降序（排序全部在后端算完，前端直接渲染；详见下节） |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
@@ -173,6 +173,10 @@ curl -H "X-API-Key: $KEY" "http://localhost:8020/v1/search?q=%E4%BA%BA%E6%89%8D%
     "matched_tags": ["talent_application", "project_application"],
     "terms": ["人才", "申报"],
     "total": 276,
+    "returned": 120,
+    "truncated": false,
+    "undated_excluded": 0,
+    "sort": "relevance",
     "groups": [
       {"category": "talent_application", "count": 20, "items": [
         {"article_id": "...", "title": "...", "published_at": "...", "tags": [...],
