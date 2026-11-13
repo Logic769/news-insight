@@ -198,7 +198,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
 | GET | `/v1/articles?tag=&category=&limit=&offset=` | 已分析文章列表，可按标签和/或大类过滤（AND 组合，`limit` ≤ 200） |
-| GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按相关度降序（排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance|published_desc|published_asc|confidence_desc|confidence_asc`（未知值 422 而非静默降序），`per_category` 1–100 |
+| GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按相关度降序（排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance|published_desc|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
 | GET | `/v1/schemas` | 已注册的抽取 schema 列表 |
