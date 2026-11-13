@@ -208,6 +208,19 @@ class NewsClient:
             rows = self._demo_rows()
             return [NewsArticle.from_payload(r) for r in rows][offset : offset + limit], "demo"
 
+    def get_article(self, article_id: str) -> dict[str, Any]:
+        """Fetch one article's detail payload, normalized to the inner `data` object.
+
+        Public single-article access exists for the body backfill: walking the
+        paginated list to find one id would re-download the whole catalogue.
+        """
+        detail = self._live_detail(article_id)
+        if isinstance(detail, dict) and isinstance(detail.get("data"), dict):
+            detail = detail["data"]
+        if not isinstance(detail, dict):
+            raise UpstreamError(f"文章详情 {article_id} 返回格式不正确")
+        return detail
+
     def hydrate_bodies(self, articles: Iterable[NewsArticle], mode: str) -> list[NewsArticle]:
         """Fill in body text. Demo rows already carry it; live rows need the detail call."""
         items = list(articles)
@@ -228,13 +241,11 @@ class NewsClient:
 
         def fill(art: NewsArticle) -> None:
             try:
-                detail = self._live_detail(art.id)
+                detail = self.get_article(art.id)
             except (UpstreamError, ValueError, KeyError, TypeError) as exc:
                 LOG.warning("详情获取失败，标记待重试 %s: %s", art.id, exc)
                 art.body_ok = False
                 return
-            if isinstance(detail, dict) and isinstance(detail.get("data"), dict):
-                detail = detail["data"]
             merged = NewsArticle.from_payload({**detail, "id": art.id})
             # keep list-level fields if the detail payload omits them
             art.title = merged.title or art.title

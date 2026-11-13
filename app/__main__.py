@@ -7,6 +7,7 @@ import json
 import logging
 
 from app import db
+from app.backfill import backfill_bodies
 from app.pipeline import analyze_batch
 from app.prune import prune
 from app.settings import load_settings
@@ -25,6 +26,11 @@ def main() -> int:
     p_pr.add_argument("--days", type=int, default=None, help="保留天数，默认取 RETENTION_DAYS")
     p_pr.add_argument("--dry-run", action="store_true", help="只统计不删除")
     p_pr.add_argument("--vacuum", action="store_true", help="清理后执行 VACUUM 回收磁盘")
+
+
+    p_bf = sub.add_parser("backfill-bodies", help="从新闻 API 补正文（不调用 LLM，可重复运行）")
+    p_bf.add_argument("--limit", type=int, default=500)
+    p_bf.add_argument("--batch", type=int, default=50)
 
     sub.add_parser("init", help="初始化数据库")
     sub.add_parser("health", help="打印当前配置")
@@ -46,6 +52,10 @@ def main() -> int:
             "db": str(settings.db_path),
             "retention_days": settings.retention_days,
         }, ensure_ascii=False))
+        return 0
+    if args.cmd == "backfill-bodies":
+        result = backfill_bodies(settings, limit=args.limit, batch=args.batch)
+        print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.cmd == "prune":
         result = prune(
