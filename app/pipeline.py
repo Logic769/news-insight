@@ -189,6 +189,7 @@ def _persist_result(conn, result: _AnalysisResult) -> None:
         category=result.category,
         category_confidence=result.category_confidence,
         category_engine=result.category_engine,
+        body=art.body or None,
         commit=False,
     )
     if result.checklist is not None:

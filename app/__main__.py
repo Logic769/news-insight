@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 
 from app import db
+from app.backfill import BackfillUsageError, backfill_bodies
 from app.pipeline import analyze_batch
 from app.prune import prune
 from app.settings import load_settings
@@ -25,6 +27,11 @@ def main() -> int:
     p_pr.add_argument("--days", type=int, default=None, help="保留天数，默认取 RETENTION_DAYS")
     p_pr.add_argument("--dry-run", action="store_true", help="只统计不删除")
     p_pr.add_argument("--vacuum", action="store_true", help="清理后执行 VACUUM 回收磁盘")
+
+
+    p_bf = sub.add_parser("backfill-bodies", help="从新闻 API 补正文（不调用 LLM，可重复运行）")
+    p_bf.add_argument("--limit", type=int, default=500)
+    p_bf.add_argument("--batch", type=int, default=50)
 
     sub.add_parser("init", help="初始化数据库")
     sub.add_parser("health", help="打印当前配置")
@@ -46,6 +53,16 @@ def main() -> int:
             "db": str(settings.db_path),
             "retention_days": settings.retention_days,
         }, ensure_ascii=False))
+        return 0
+    if args.cmd == "backfill-bodies":
+        try:
+            result = backfill_bodies(settings, limit=args.limit, batch=args.batch)
+        except (RuntimeError, BackfillUsageError) as exc:
+            # demo 模式拒绝回填 / 参数不合法：都是使用问题，不是崩溃，别让用户看 traceback。
+            # 只捕 BackfillUsageError：裸 ValueError 会把内部意外 bug 也静默成退出码 2。
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.cmd == "prune":
         result = prune(

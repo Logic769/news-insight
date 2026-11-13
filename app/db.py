@@ -12,12 +12,27 @@ import datetime as dt
 import json
 import logging
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from app import search as search_mod
+from app.tagging import TagDef
+
 LOG = logging.getLogger("news_insight.db")
+
+# SQL 侧的归一不能靠 SQL 自己拼：SQLite 的 lower() 只折 ASCII，把 "Ärger" 折完还是
+# "Ärger"，而 Python 的 casefold() 会折成 "ärger" —— 两层判断一旦用不同实现，
+# 预筛就会把打分阶段本可命中的行丢掉（用户看到 200 + 空结果，不报错）。
+# 所以直接把 search._norm 注册成 SQL 函数，两边跑同一份代码，物理上不可能分叉。
+# 代价是每行每列一次 Python 回调：1000 行 × 6000 字正文全表扫描实测 0.34s vs
+# 纯 SQL 0.25s，而候选集上限只有 2000 行，这个量级可以接受。
+_NORM_FUNC = "py_norm"
+
+# 检索候选集上限：泛词会把整库都捞进来，用它兜住最坏情况下 Python 侧的内存占用。
+_CANDIDATE_LIMIT = 2000
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS analyzed_articles (
@@ -28,6 +43,7 @@ CREATE TABLE IF NOT EXISTS analyzed_articles (
     published_at    TEXT,
     published_at_utc TEXT,
     content_length  INTEGER NOT NULL DEFAULT 0,
+    body            TEXT,               -- 正文纯文本；关键词检索用。NULL = 落库时上游未提供（历史行），不改写为空串
     category        TEXT,               -- 一级分类（单选），categories.json 的 id；NULL = 分类功能上线前分析的历史行
     category_confidence REAL,
     category_engine TEXT,               -- llm / rules / none
@@ -98,12 +114,14 @@ CREATE INDEX IF NOT EXISTS idx_extractions_schema ON extractions(schema_id, fiel
 # category 列还不存在而直接报错。放在 _migrate_columns 之后建。
 _POST_MIGRATION_SQL = """
 CREATE INDEX IF NOT EXISTS idx_analyzed_category ON analyzed_articles(category, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analyzed_recency ON analyzed_articles(COALESCE(published_at, analyzed_at) DESC, article_id DESC);
 """
 
 # init_db 只有 CREATE TABLE IF NOT EXISTS，升级前建好的库不会自动长出新列。
 # 新增列必须在这里补一次 ADD COLUMN，否则老库上的 INSERT 会因列不存在直接失败。
 _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     # (列, 列定义) —— 都落在 analyzed_articles 上
+    ("body", "TEXT"),
     ("category", "TEXT"),
     ("category_confidence", "REAL"),
     ("category_engine", "TEXT"),
@@ -120,6 +138,17 @@ def _load_json(raw: Any) -> Any:
 
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ensure_norm_func(conn: sqlite3.Connection) -> None:
+    """Register `search._norm` as the SQL function `py_norm`.
+
+    Idempotent and cheap: `create_function` overwrites, so calling it per query is
+    harmless. Registering here (not in connect()) keeps the dependency one-way -- a
+    connection used only for reads never pays for it, and the function always matches
+    whatever `search._norm` currently does, including future changes to WS_CHARS.
+    """
+    conn.create_function(_NORM_FUNC, 1, lambda value: search_mod._norm(value or ""), deterministic=True)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -176,6 +205,7 @@ def save_analysis(
     category: str = "",
     category_confidence: float | None = None,
     category_engine: str = "",
+    body: str | None = None,
     commit: bool = True,
 ) -> None:
     """Replace any previous analysis for this article (idempotent re-runs).
@@ -207,6 +237,7 @@ def save_analysis(
             category=category,
             category_confidence=category_confidence,
             category_engine=category_engine,
+            body=body,
             now=now,
         )
     except Exception:
@@ -236,19 +267,23 @@ def _replace_analysis(
     category: str,
     category_confidence: float | None,
     category_engine: str,
+    body: str | None,
     now: str,
 ) -> None:
     conn.execute(
         """
         INSERT INTO analyzed_articles
             (article_id, source, url, title, published_at, published_at_utc,
-             content_length, category, category_confidence, category_engine,
+             content_length, body, category, category_confidence, category_engine,
              tag_engine, extract_engine, analyzed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(article_id) DO UPDATE SET
             source=excluded.source, url=excluded.url, title=excluded.title,
             published_at=excluded.published_at, published_at_utc=excluded.published_at_utc,
             content_length=excluded.content_length,
+            -- 正文只在本次真的拿到时覆盖：早期行 body 为 NULL，重新分析若上游没返回正文
+            -- （详情接口抖动、正文为空），不能被写成 NULL/空串，否则检索会静默丢文章。
+            body         = COALESCE(NULLIF(excluded.body, ''), analyzed_articles.body),
             -- 空值表示「这次没做分类」（旧版本重跑、categories.json 被移走后退回单级打标），
             -- 不能拿它覆盖库里已有的分类；明确判成 other 时 category='other'，不是空值，会正常写入。
             category            = COALESCE(excluded.category, analyzed_articles.category),
@@ -258,7 +293,7 @@ def _replace_analysis(
             extract_engine=excluded.extract_engine, analyzed_at=excluded.analyzed_at
         """,
         (article_id, source, url, title, published_at, published_at_utc,
-         content_length, category or None, category_confidence, category_engine,
+         content_length, body, category or None, category_confidence, category_engine,
          tag_engine, extract_engine, now),
     )
     conn.execute("DELETE FROM article_tags WHERE article_id = ?", (article_id,))
@@ -708,3 +743,259 @@ def vacuum(conn: sqlite3.Connection) -> None:
     conn.commit()
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.execute("VACUUM")
+
+
+# ------------------------------------------------------------------ search
+def search_candidates(
+    conn: sqlite3.Connection,
+    *,
+    terms: Sequence[str],
+    tag_ids: Sequence[str],
+    categories: Sequence[str] | None = None,
+    limit: int = _CANDIDATE_LIMIT,
+) -> list[dict[str, Any]]:
+    """Rows that might match, prefiltered in SQL before scoring.
+
+    Scoring needs the title, the body and the tag confidences, so it cannot be
+    done in SQL. This function's only job is to keep the Python side from
+    loading the whole table: a candidate must either carry one of the queried
+    tags or contain one of the terms literally.
+
+    Literal matching uses instr() rather than LIKE on purpose: a keyword is user
+    input, and LIKE would let "%" and "_" act as wildcards, so searching for
+    "50%" would quietly match every row.
+
+    `limit` is a safety valve, not pagination -- it bounds worst-case memory when
+    a one-character keyword matches everything. The caller re-ranks by relevance
+    (see search_grouped), so this order is not the display order; it only decides
+    *which* rows survive the cut.
+
+    That choice has to be deterministic and meaningful. Without ORDER BY, SQLite
+    returns rows in whatever order the scan happens to produce, so once a query
+    exceeds `limit` two identical runs can truncate to different sets and the user
+    sees results appear and disappear between refreshes. Newest-first is the same
+    bias the product wants (recent news matters more), and `article_id` breaks
+    full ties so the set never depends on scan order.
+
+    `idx_analyzed_recency` exists to make that ordering cheap, and the win is much
+    larger than the sort itself. Without the index SQLite has to evaluate every
+    hit before it can order them, so the per-row `py_norm` scan runs over the whole
+    match set even though only `limit` rows are kept. With the index it walks in
+    index order and stops after `limit` rows. Measured on 20000 matching rows,
+    limit=2000: 3.9s -> 0.07s when the term is in the title, 11.9s -> 0.82s when
+    it is only in the body. The two differ by a factor because the prefilter's OR
+    short-circuits on a title hit and never normalizes the 6000-char body, so do
+    not quote the cheaper number as the normal case -- most specific terms only
+    appear in the body. Benchmarking just the ORDER BY clause (no py_norm) shows
+    0.01s vs 0.002s and badly understates this, because that plan never had to
+    normalize the rows it discards.
+    """
+    clauses: list[str] = []
+    args: list[Any] = []
+
+    signal: list[str] = []
+    if tag_ids:
+        placeholders = ",".join("?" for _ in tag_ids)
+        signal.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag IN (" + placeholders + "))")
+        args.extend(tag_ids)
+    # term 与 title/body 都过同一个 _norm：空白（含 \u2003 这类从网页复制的窄空格）
+    # 与非 ASCII 大小写（ÖBB / müller）都必须在预筛阶段就被折掉，否则 SQL 阶段丢行，
+    # 打分阶段再准也没用。
+    _ensure_norm_func(conn)
+    for term in terms:
+        needle = search_mod._norm(term)
+        if not needle:
+            continue
+        signal.append("(instr(py_norm(a.title), ?) > 0 OR instr(py_norm(a.body), ?) > 0)")
+        args.extend([needle, needle])
+
+    if signal:
+        clauses.append("(" + " OR ".join(signal) + ")")
+
+    if categories is not None:
+        if not categories:
+            return []
+        placeholders = ",".join("?" for _ in categories)
+        clauses.append("COALESCE(a.category, '') IN (" + placeholders + ")")
+        args.extend(categories)
+
+    # ORDER BY 必须在截断前定序，否则同一查询两次可能截到不同集合，用户会看到
+    # 结果忽有忽无。它同时决定「命中超过 limit 时保留哪些」——取最新的，所以
+    # 顺序本身就是产品行为，不只是稳定性。该表达式有 idx_analyzed_recency
+    # 支撑（见 _POST_MIGRATION_SQL）：没有这个索引时先算完全部命中行才能排序，
+    # 于是每行的 py_norm 都要跑一遍，即使最后只留 limit 行。2 万行全命中、
+    # limit=2000 实测（本机 min-of-2）：标题命中 3.9s → 0.07s；仅正文命中
+    # 11.9s → 0.82s（预筛的 OR 在标题命中时短路，不会归一 6000 字正文，所以
+    # 两条路径成本差一个档，别把 0.07s 当成常态——用户查的细分词大多只在正文）。
+    #
+    # 没有任何 signal（terms 与 tag_ids 都空）时 where 为空串，会退化成全表扫描。
+    # 生产路径走不到：search_grouped 在 query.is_empty 处提前返回空结果。这里保留
+    # 该行为而不是返回 []，是因为本函数是公开的候选集查询，"不限条件" 是合理语义，
+    # 由调用方负责判空。
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        "SELECT a.article_id, a.source, a.url, a.title, a.body,"
+        " a.published_at, a.published_at_utc, a.content_length,"
+        " a.category, a.category_confidence, a.category_engine,"
+        " a.tag_engine, a.analyzed_at"
+        " FROM analyzed_articles a " + where
+        + " ORDER BY COALESCE(a.published_at, a.analyzed_at) DESC, a.article_id DESC"
+        + " LIMIT ?",
+        [*args, limit],
+    ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["tag_confidences"] = {}
+        item["tags"] = []
+        out.append(item)
+
+    if not out:
+        return out
+
+    # 每个候选都要自己的标签置信度：这就是「标签置信度」这一项打分的输入。
+    # 分批 IN 查询避免逐行往返，也避开 SQLite 的变量个数上限。
+    ids = [r["article_id"] for r in out]
+    by_id = {r["article_id"]: r for r in out}
+    for chunk_start in range(0, len(ids), 500):
+        chunk = ids[chunk_start : chunk_start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for tr in conn.execute(
+            "SELECT article_id, tag, confidence, evidence, engine FROM article_tags"
+            " WHERE article_id IN (" + placeholders + ")",
+            chunk,
+        ):
+            entry = by_id[tr["article_id"]]
+            entry["tag_confidences"][tr["tag"]] = tr["confidence"]
+            entry["tags"].append(
+                {
+                    "tag": tr["tag"],
+                    "confidence": tr["confidence"],
+                    "evidence": tr["evidence"],
+                    "engine": tr["engine"],
+                }
+            )
+    return out
+
+
+def set_body(conn: sqlite3.Connection, *, article_id: str, body: str, commit: bool = True) -> bool:
+    """Write only the body column, leaving every derived field untouched.
+
+    The guard mirrors the candidate set used by the backfill command: only rows
+    that still have no body are written. Without it, a snapshot taken before a
+    concurrent analyse run could overwrite the body that run just wrote with an
+    older copy.
+
+    Returns whether the row was actually written. The guard can reject the write
+    (another process filled the row first), and the backfill reports a `filled`
+    count to the user -- counting a no-op as filled would make progress look better
+    than it is.
+    """
+    cur = conn.execute(
+        "UPDATE analyzed_articles SET body = ?"
+        " WHERE article_id = ? AND (body IS NULL OR body = '')",
+        (body, article_id),
+    )
+    written = cur.rowcount > 0
+    if commit:
+        conn.commit()
+    return written
+
+
+# --------------------------------------------------------------- search
+
+def search_grouped(
+    conn: sqlite3.Connection,
+    *,
+    raw_query: str,
+    tags: list[TagDef],
+    category_order: Sequence[str] = (),
+    categories: Sequence[str] | None = None,
+    per_category: int = 20,
+    include_body: bool = False,
+) -> dict[str, Any]:
+    """Score every candidate, then group by category and rank inside each group.
+
+    Returning groups rather than one flat ranked list is the whole point: the
+    product asks for five categories as the outer structure, and a flat list
+    would force the frontend to re-sort by a score it never receives.
+    """
+    query = search_mod.resolve_query(raw_query, tags)
+    if query.is_empty:
+        return {"query": raw_query, "matched_tags": [], "terms": [], "groups": [], "total": 0}
+
+    # 多取一行用来判断「是否还有更多」：只比对 len(rows) == limit 的话，库里恰好
+    # 2000 行时会误报截断（其实全取完了），而把 limit 传死又不随将来改动走。
+    rows = search_candidates(
+        conn,
+        terms=query.term_texts,
+        tag_ids=query.tag_ids,
+        categories=categories,
+        limit=_CANDIDATE_LIMIT + 1,
+    )
+    truncated = len(rows) > _CANDIDATE_LIMIT
+    if truncated:
+        rows = rows[:_CANDIDATE_LIMIT]
+        # 打满上限说明预筛基本没起作用（典型的是一两个泛词），返回的 total 会偏小，
+        # 且偏多少无法从响应里看出来。留一条 WARNING 让运维知道该收紧关键词，
+        # 而不是把「排序看起来不对」当成打分逻辑的 bug。
+        LOG.warning(
+            "检索候选集打满上限 %d，结果可能不完整：terms=%d tag_ids=%d",
+            _CANDIDATE_LIMIT,
+            len(query.term_texts),
+            len(query.tag_ids),
+        )
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for row in rows:
+        rel = search_mod.score_article(
+            query,
+            title=row["title"],
+            body=row.get("body"),
+            tag_confidences=row["tag_confidences"],
+        )
+        if not search_mod.has_signal(rel):
+            continue
+        item = dict(row)
+        item.pop("tag_confidences", None)
+        item["relevance"] = rel.as_dict()
+        if not include_body:
+            item.pop("body", None)
+        scored.append((rel.score, item))
+
+    # 同分兜底：先按发布时间倒序，最后用 article_id 打破完全平局。少了最后这一
+    # 层，同分同时间的多篇按 SQLite 返回顺序排，查询计划一变排列就会抖——而前端
+    # 拿到的 items[] 顺序就是最终展示顺序，抖动等于用户看到列表顺序会变。
+    scored.sort(
+        key=lambda pair: (pair[0], pair[1].get("published_at") or "", pair[1]["article_id"]),
+        reverse=True,
+    )
+
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for _, item in scored:
+        buckets.setdefault(item.get("category") or "", []).append(item)
+
+    # 先按调用方给的固定类顺序输出（前端五段布局稳定），再补上不在顺序里
+    # 的类（other、以及分类功能上线前的历史 NULL 行）。
+    ordered = [c for c in category_order if c in buckets]
+    known = set(ordered)
+    ordered.extend(sorted(k for k in buckets if k not in known))
+
+    groups = [
+        {
+            "category": key,
+            "count": len(buckets[key]),
+            "items": buckets[key][:per_category],
+        }
+        for key in ordered
+    ]
+    return {
+        "query": raw_query,
+        "matched_tags": list(query.tag_ids),
+        "terms": list(query.term_texts),
+        "groups": groups,
+        # 候选集（最多 2000 行）内命中的行数，不是全库真实命中数：泛词被截断时
+        # 这个值会偏小。前端展示「共 N 条」时应理解为「本次返回范围内的条数」。
+        "total": len(scored),
+    }

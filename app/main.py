@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -205,6 +205,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             conn.close()
         return {"data": rows, "meta": {"total": total, "limit": limit, "offset": offset}}
+
+    @app.get("/v1/search")
+    def search_articles(
+        # pattern 要求至少一个非空白字符：q="" 会因 min_length 变成 422，但 q=" "
+        # 能绕过它，进 resolve_query 后被 strip 成空、返回 200 空 groups —— 同一件事
+        # 两种响应码，前端得写两条分支。这里让纯空白也在参数校验阶段被拒。
+        q: str = Query(min_length=1, max_length=100, pattern=r"\S", description="用户关键词"),
+        # 这里用 Annotated 而不是 Query(...) 作默认值：注解是可变容器（list），
+        # ruff 的 B008 会判定"默认值里调用函数 + 可变类型"有问题；同文件其余
+        # 参数都是 str/int/bool，不受该规则影响。
+        category: Annotated[
+            list[str] | None, Query(description="只在这些大类里检索")
+        ] = None,
+        per_category: int = Query(default=20, ge=1, le=100, description="每个大类返回多少条"),
+        include_body: bool = Query(default=False, description="是否返回正文（默认不返回，节省带宽）"),
+    ) -> dict:
+        """按关键词检索，结果按 5 大类分组、类内按相关度排序。
+
+        排序相关的计算全在这里完成，前端只负责渲染。前端虽然能从 item 里读到标签
+        置信度，但拿不到查询覆盖度（那要复算词表匹配），默认也拿不到正文，无法复
+        算出同一个分数，所以 `groups[].items[]` 的顺序就是最终顺序。
+        """
+        s: Settings = app.state.settings
+        cleaned = [c.strip() for c in (category or []) if c.strip()]
+        _, tags = load_vocab(s.vocab_dir)
+        _, categories = load_categories(s.vocab_dir)
+        conn = connect(s)
+        try:
+            result = db.search_grouped(
+                conn,
+                raw_query=q,
+                tags=tags,
+                category_order=tuple(c.id for c in categories),
+                # ?category= 传空串时 FastAPI 给出 [""]，直接透传会让 SQL 变成
+                # COALESCE(category,'') IN ('')，只命中「分类上线前的历史 NULL 行」，
+                # 静默返回一堆与用户意图无关的结果。空串一律当「没传」——注意过滤后
+                # 可能变成空列表，而 search_candidates 把空列表当作「筛选后无结果」，
+                # 所以这里要显式转成 None（不传），否则 ?category= 反而返回空集。
+                categories=cleaned or None,
+                per_category=per_category,
+                include_body=include_body,
+            )
+        finally:
+            conn.close()
+        return {"data": result}
 
     @app.get("/v1/articles/{article_id}")
     def article_detail(article_id: str) -> dict:

@@ -142,6 +142,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
 | GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤；也可用 `category=funding_subsidy` 按大类过滤（可与 `tag` 同用，AND） |
+| GET | `/v1/search?q=申报&category=project_application&per_category=20&include_body=false` | **关键词检索**：结果按 5 大类分组、类内按相关度降序（排序全部在后端算完，前端直接渲染；详见下节） |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
@@ -153,6 +154,153 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/runs` | 运行记录（模式、扫描/分析/跳过/错误数） |
 
 CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 --concurrency 100`；清理历史数据：`python -m app prune --dry-run`、`python -m app prune --vacuum`。
+
+
+### 关键词检索（后端算排序，前端只渲染）
+
+搜索界面由前端实现，本服务只提供检索层与 API。**排序必须在后端算完**：前端虽然能从
+`items[]` 里读到标签置信度，但拿不到查询覆盖度（那要复算词表匹配），默认也拿不到正文，
+无法复算出同一个分数，所以 `groups[].items[]` 的顺序就是最终顺序。
+
+```bash
+curl -H "X-API-Key: $KEY" "http://localhost:8020/v1/search?q=%E4%BA%BA%E6%89%8D%E7%94%B3%E6%8A%A5&per_category=10"
+```
+
+```json
+{
+  "data": {
+    "query": "人才申报",
+    "matched_tags": ["talent_application", "project_application"],
+    "terms": ["人才", "申报"],
+    "total": 276,
+    "groups": [
+      {"category": "talent_application", "count": 20, "items": [
+        {"article_id": "...", "title": "...", "published_at": "...", "tags": [...],
+         "relevance": {"score": 0.765, "tag_confidence": 0.9, "title_hits": 1,
+                       "body_hits": 3, "matched_tags": ["talent_application"],
+                       "matched_terms": ["人才", "申报"]}}
+      ]}
+    ]
+  }
+}
+```
+
+**排序口径**：`score = 0.70×标签项 + 0.20×标题命中 + 0.10×正文命中`，三项都在 `[0,1]`，
+所以总分天然落在 `[0,1]`，可直接当作前端的进度条或权重。
+
+- 标签项 = 命中的闭集标签置信度 × 查询覆盖度（取最大值，不累加）。用户输入先映射到标签词表：
+  输入「光伏」命中 `new_energy` 这个闭集标签，比字面匹配更贴近语义；
+- 覆盖度 = 命中片段占用户输入的比例，实行**长度惩罚**：整词命中 1.0，4 字查询里命中 2 字记 0.5。
+  一个标签可能同时命中多个候选形态（词表里大量短词是长词的前缀，如「人才」→「人才计划」），
+  实现会遍历该标签全部候选再取最大值 —— 命中第一个就停会让用户输入完整标签名时只拿到 0.5，
+  而且结果会随 `keywords` 的书写顺序变化。
+  它**不做语义消歧** —— 「人才申报」里「人才」和「申报」各覆盖一半、权重相同，真正把两类文章分开的是标签置信度与标题命中。
+  这一条有真实教训：最初以为覆盖度能区分这两类，实测才发现两类同为 0.5，`project_application` 曾凭置信度以 0.893 压过 `talent_application` 的 0.879。
+- 标题命中按条数计（1 条即饱和），正文命中 10 条饱和 —— 长文堆词不再自动占优；
+  计数按**出现次数**而不是「候选形态命中次数」：词表里短词常是长词前缀（「人才」⊂「人才申报」），
+  若每个形态各自 `count`，标题里一次「人才申报」会被记成 3 次；实现按权重降序（长形态优先）逐个计数，
+  命中过的位置记在一个 `bytearray` 里，后续形态只认同「未被占用的位置」的出现，保证一处文本只计一次，
+  同时短形态仍能命中长形态覆盖不到的文本（不用哨兵字符占位，正文真含 NUL 也不会伪造命中）。
+  同一形态的重叠出现（「aa」在「aaa」里）覆盖的是同一段字符，也只计一次。
+  记账用标记数组而不是区间列表：列表方案每命中一次都要跟全部已记区间比一遍，
+  6000 字正文里单字高频命中（「的」「年」）会退化到 O(n²)，实测 0.87s；标记数组同一场景 0.004s。
+  `matched_terms` 只列实际贡献了命中的形态 —— 被长形态吃掉的短形态不列，否则排障时会误判它是加分来源；
+- 分数相同按发布时间降序、再按 `article_id` 兜底，顺序不依赖 SQLite 的返回顺序（只按时间兜底时，同分同时间的几篇会退回行序，查询计划一变就抖）；
+- 类顺序固定为 `categories.json` 的声明顺序，前端五段布局可以硬编码；
+- 字面匹配用 `instr()` 而不是 `LIKE`：关键词是用户自由输入，`%` 和 `_` 在 `LIKE` 里是通配符，搜「50%」会命中全库。
+  SQL 预筛与内存打分跑**同一份归一代码**：`search._norm` 被注册成 SQL 函数 `py_norm`，
+  `instr(py_norm(title), ?)` 与打分侧的 `_norm()` 是同一个函数，物理上不会分叉。这不是洁癖 ——
+  SQLite 的 `lower()` 只折 ASCII（`Ärger` 折完还是 `Ärger`），而 Python 的 `casefold()` 折成 `ärger`，
+  两层用不同实现时「用户输入与标题字面完全一致」也会返回空结果（真实触发词：ÖBB、Ärzte、Müller、École）。
+  空白同理：只对齐大小写不够，搜「gpt 模型」而标题写「GPT模型」时，SQL 拿带空格的原文去 `instr` 会直接空集。
+  代价是每行每列每个形态一次 Python 回调。实测规模统一为「候选集打满 2000 行、正文 6000 字」
+  （本机 min-of-3，不同机器可能差 2–3×）：
+
+  | 场景（`instr(py_norm(title), ?) OR instr(py_norm(body), ?)`） | 预筛 | 全链路 |
+  | --- | --- | --- |
+  | **标题**命中（第一个条件即为真，短路掉 body） | 约 0.05s | 约 0.5s |
+  | **仅正文**命中（标题不含，必须算完 body 才为真） | 约 0.55s | 约 2.0s |
+  | 全不命中（候选为空、不打分） | 约 0.52s | 约 0.5s |
+  | 全不命中、3 个形态（每行算 3×2 列） | 约 1.5s | 同上 |
+  | 历史行 `body IS NULL`、全不命中 | 约 0.003s | 同上 |
+
+  **只有「标题命中」才便宜**：`OR` 在首个条件为真时短路，省掉 `body` 的 6000 字归一。
+  标题不含查询词时（真实新闻里用户查的行业词、细分词大多只在正文出现），`body` 的
+  `py_norm` 每行都要付，成本与「全不命中」同档——**这是最常见路径，别按 0.05s 估**。
+  纯 SQL `instr` 对照（不命中全扫）约 0.04s，即 `py_norm` 带来一个数量级预筛开销，
+  这是「两侧归一必须同源」的代价。逐行归一 + `score_article` 是另一块大头
+  （仅正文命中且候选打满时约 1.5s）。
+  泛词会打满候选集，**超时请按秒级设**（最坏约 2–3s，建议 10s），不要按「几百毫秒」估。
+
+**为什么正文要落库**：只靠标题和标签，用户搜一个正文里才出现的词（如某个细分行业）会全军覆没。
+正文在 `analyzed_articles.body`，只有上游详情页真取到文本时才覆盖（`COALESCE(NULLIF(excluded.body,''), body)`），
+避免某次详情抖动把历史正文写成 `NULL` 让检索静默丢文章。检索默认不返回正文，`include_body=true` 才带。
+
+历史行（本功能上线前分析的）`body` 为 `NULL`，需要回填一次（只搬文本、不重跑模型、不消耗 token）：
+
+```bash
+python -m app backfill-bodies --limit 500 --batch 50
+```
+
+`NEWS_SOURCE_MODE=demo` 时会直接拒绝（demo 模式不访问网络，而回填必须逐个请求上游详情接口）；候选按「最新优先 + `article_id` 兜底」取；每批先把正文全部取回，再开写事务统一写库，网络请求期间不持有未提交事务。参数约束：`--batch` 必须 ≥ 1，`--limit` 不能为负（SQLite 把 `LIMIT -1` 当不限，不拦会回填整库），`--limit 0` 等于空跑（不发请求、不写库）。
+
+回填只处理 `body IS NULL OR body = ''` 的行，可重复执行；单篇失败不中断整批，返回
+`{"filled", "failed", "skipped", "remaining"}`。`limit` 限制的是**写入篇数**，扫描预算为
+`5×limit`（`_SCAN_FACTOR`），所以少量死链不会钉死小 `--limit` 的窗口。
+
+但它**不是无限**的：连续 `5×limit` 篇都不可回填时会退回「每轮重试同一批」的行为
+（实测 `--limit 1` 时，4 篇连续死链仍能摸到更早的文章，5 篇就摸不到）。遇到这种情况调大
+`--limit`（预算随之放大），或先手工处理掉这批死链。
+
+另注意 `remaining` 不一定能归零：上游确实没有正文的行（`skipped`）不会被写占位符、下一轮还会再试。
+
+**但 `remaining` 稳定不能单独作为停止依据**：它稳定有两种成因，含义完全不同——
+
+- 真的只剩不可回填的行（`skipped`，上游确实没正文）：可以停；
+- 卡在扫描预算上：`--limit 1` 时若前 5 篇都不可回填，每轮都在重试这 5 篇，`remaining`
+  同样稳定，但**后面仍有可回填的文章**，此时停下来等于漏回填。
+
+区分办法要看**是否扫描覆盖了全部剩余候选**，而不是只看 `filled` 有没有变。日志「已回填 X/Y（候选 Z）」
+里的 `Z = 5×limit` 就是本轮实际扫过的候选数。判据：
+
+- `Z < remaining`：**这一轮根本没扫完**，`filled=0` 什么都证明不了，必须调大 `--limit`（`Z` 随之放大）
+  直到 `Z ≥ remaining` 再判断；
+- `Z ≥ remaining` 且 `filled=0`：只说明**扫描覆盖完成**、这一轮扫过的行都没写进正文，**不等于回填完成**。
+  还要看 `failed`：`failed > 0`（上游错误/超时）说明是临时故障，稍后重跑即可，不能当完成；
+  `failed == 0` 且 `filled == 0` 才是「这些行上游确实没有正文」（`skipped`），此时可以停。
+
+只看「调大 `--limit` 后 `filled` 是否为 0」会误判。实测（死链在前、唯一可回填的行在最旧处）：
+
+| 场景 | `--limit 1`（Z=5） | `--limit 50`（Z=250） |
+| --- | --- | --- |
+| 5 篇死链 + 1 篇可回填 | `filled=0` `remaining=6` | `filled=1` `remaining=5` |
+| 250 篇死链 + 1 篇可回填 | `filled=0` `remaining=251` | **`filled=0` `remaining=251`（Z=250 < 251，仍没扫到）** |
+| 3 篇死链、没有别的行 | `filled=1` `remaining=3` | `filled=1` `remaining=3` |
+
+第二行就是反例：把 `--limit` 从 1 调到 50 后 `filled` 依然为 0，但回填并没有完成——预算 250 恰好被
+250 篇死链吃满，最旧那篇可回填的行仍没进入候选集。所以 `filled=0` 只有在 `Z ≥ remaining` 时才可信。
+这个上限是结构性的（预算有限），不想被卡住就继续调大 `--limit`，或先手工清掉这批死链。
+
+注意 `skipped` 与 `failed` 的区别很重要，它决定「要不要重跑」：
+
+- `skipped`：上游明确表示这篇没正文可给——请求成功但正文为空，或返回 404/410（文章已删除/不存在）。
+  重跑也不会有，属于常态；
+- `failed`：请求本身出错（超时、5xx、连接失败、鉴权失败等），是**临时故障**，稍后重跑可能就补上了。
+
+上游临时不可用会让整批都进 `failed`，这时 `remaining` 一篇没少也不奇怪——该重跑，而不是把结果当成
+「这些文章永远没有正文」。反过来，死链持续返回 404 时会计入 `skipped` 而不是 `failed`，所以「`failed == 0`
+就可以停」不会被几个死链永久卡住。
+
+**已知取舍**：
+
+- 检索是字面 + 闭集标签的混合，没有分词也没有同义词扩展，「补贴」与「资助」靠词表里的 `keywords` 打通；
+- 候选集上限 2000 行（`search_candidates(limit=2000)`），命中极多的泛词（如「的」）会被截断，所以 `total` 是**候选集内**命中的行数，不是全库真实命中数；
+  命中超过上限时保留**最新**的 2000 行（按 `COALESCE(published_at, analyzed_at) DESC, article_id DESC`），
+  所以极老的命中可能搜不到；
+  候选集打满上限时服务端会记一条 WARNING（带 terms / tag_ids 数量），便于判断是不是关键词太泛导致结果不完整；
+  判断方式是「多取一行看是否还有更多」，所以库里恰好 2000 行（全取完）不会误报；
+- `category=` 不做闭集校验，未知类返回空结果而不是 422（同 `/v1/articles?category=`）；
+- 分类功能上线前分析的历史行 `category` 为 `NULL`（≠ `other`），它们会单独成组，`category_order` 之外排在最后。
 
 ### 鉴权
 
@@ -181,7 +329,13 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 -
 - `other` 是兜底类：`keywords` 与 `tags` 留空。归到 `other` 的文章**不做语义打标**（省一次模型调用），只用规则引擎按 `group=domain` 保住行业标签（金融/科技/农业等），所以「央行降准」这类非 5 大类新闻仍能按 `finance` 查到；
 - 并列时的归属由 `categories.json` 的**声明顺序**决定（先声明者胜），调整顺序等于调整并列归属，属于行为变更；比较用的是原始关键词分，不是封顶到 0.95 的 `confidence`，所以高分先命中的类不会被后面的低分翻盘；
 - 大类与标签是**两级**关系：`/v1/articles?category=` 查大类，`?tag=` 查二级标签，两者可组合；
-- `category` 参数不做闭集校验：传一个不存在的类名、或传空串，都返回 200 空集（而不是 422），沿用标签参数的一贯行为；`/v1/tags?category=` 行为一致（词表照旧返回，计数按该类统计，空串下计数全 0）；
+- `category` 参数不做闭集校验：传一个不存在的类名返回 200 空集（而不是 422），沿用标签参数的一贯行为；
+  空串的语义在三个接口上**有意不同**，调用方不要混用：
+  - `/v1/articles?category=`：空串按「未知类」处理（`a.category = ''`）→ 200 空集；
+  - `/v1/search?category=`：空串归一为「不传」（`cleaned or None`）。若透传，SQL 会变成
+    `COALESCE(category,'') IN ('')` 只命中「分类功能上线前」的历史行；若只在 Python 侧过滤掉空串，
+    剩下的空列表又会被当成「筛完没结果」直接返回空集。两条路都会让用户只是清空了筛选框却看不到结果；
+  - `/v1/tags?category=`：词表照旧返回，计数按该类统计（空串下计数全 0）；
 - `categories.json` 里少了兜底类 `other` 时不会启动失败，但会记一条 WARNING：模型答出表外大类就没有去处，那篇文章的二级打标与抽取都会被跳过。
 
 ### 加标签
@@ -227,7 +381,7 @@ CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 -
 
 | 表 | 内容 |
 | --- | --- |
-| `analyzed_articles` | 已分析文章元数据（`article_id` 主键，与上游对齐），含一级分类 `category` 与 `category_confidence`/`category_engine`（`NULL` = 分类功能上线前分析的历史行，与 `other` 不是一回事） |
+| `analyzed_articles` | 已分析文章元数据（`article_id` 主键，与上游对齐），含一级分类 `category` 与 `category_confidence`/`category_engine`（`NULL` = 分类功能上线前分析的历史行，与 `other` 不是一回事）；`body` 存正文副本供检索（`NULL` = 落库时上游未提供，需 `backfill-bodies` 回填） |
 | `article_tags` | `(article_id, tag)` 主键，含置信度、原文依据、引擎 |
 | `extractions` | `(article_id, schema_id, field)` 主键，含值、原文片段、置信度、是否定位成功 |
 | `article_checklists` | `article_id` 主键，清单项 JSON（`text`/`basis`/`source_text`）、生成引擎与时间 |
@@ -265,6 +419,8 @@ docker compose run --rm -v "$(pwd)/tests:/app/tests" -v "$(pwd)/tools:/app/tools
 
 ## 已知限制
 
+- `q` 至少要有 1 个非空白字符：空串与纯空白都返回 422，避免同一件事两种响应码；
+
 - 抽取质量取决于模型与 prompt，本项目只保证「不越界」（不造标签、不造字段、值可定位），不保证召回；
 - 相对截止时间只覆盖常见表述（`N日内`/`N个工作日`/`本月底`），「公示结束后5个工作日」这类链式表述仍会漏；
 - 分析作业在进程内全局串行（同步接口与异步 job 共用一把锁），长批次请用 `POST /v1/jobs`；单进程单 SQLite，不适合多副本水平扩展；
@@ -273,6 +429,9 @@ docker compose run --rm -v "$(pwd)/tests:/app/tests" -v "$(pwd)/tools:/app/tools
 - 一级分类的边界靠 `categories.json` 的 `description` 与 `keywords` 人工维护：规则引擎按关键词计分，遇到「专项资金申报通知」这种同时命中资金补贴与项目申报的文章，会归到分数更高的那一类，另一类的二级标签随之拿不到（目前 `funding_subsidy` 的白名单不含 `project_application`，这类文章不会触发申报抽取）；需要时给该类补 `project_application` 标签即可；
 - 分类按「保留式」写入：重跑时没做分类（例如临时移走 `categories.json`、回退到旧版本）只会更新标签，不会清空已有分类；但此时标签是按全词表打的，可能出现分类与标签不同源的行（`category=project_application` 却带 `ipo` 标签）。恢复词表后再跑一次即回到类内一致；
 - 分类功能上线前已分析的历史行 `category` 为 `NULL`：`/v1/categories` 里统计不到、`?category=` 也筛不出来，需要 `analyze --force` 重跑才会补上分类；这与归到 `other` 是不同的状态；
+- 检索是字面匹配 + 闭集标签的混合，不做分词、不做同义词扩展（「补贴/资助」靠词表 `keywords` 打通），也不做拼音或错别字容忍；候选集上限 2000 行，命中面极广的泛词会被截断；
+- 检索排序是**人工设定的权重**（标签 0.70 / 标题 0.20 / 正文 0.10），不是学习出来的排序模型；它保证「标签命中优先、长文不占优、结果稳定可复现」，不保证符合每个人的直觉。要调权重改 `app/search.py` 顶部常量并补用例；
+- 正文副本（`body`）使库体积约增加一倍多，且会随保留期一起被删除；`RETENTION_DAYS` 之后连同正文一起消失，检索结果也随之减少；
 - 演示数据与规则引擎只用于跑通链路，不作为效果基线。
 
 ## 致谢
