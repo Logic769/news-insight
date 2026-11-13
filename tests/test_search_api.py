@@ -142,3 +142,121 @@ def test_search_rejects_whitespace_only_query(client):
     assert client.get("/v1/search", params={"q": "   "}, headers=HEADERS).status_code == 422
     # 带真实内容的查询不受影响
     assert client.get("/v1/search", params={"q": " 申报 "}, headers=HEADERS).status_code == 200
+
+# ------------------------------------------------------- 新增：时间/来源/排序
+
+def _all_items(data):
+    return [i for g in data["groups"] for i in g["items"]]
+
+
+def test_search_rejects_bad_date_format(client):
+    """日期只接受 YYYY-MM-DD：带时分秒的输入语义不明，必须 422 而不是猜。"""
+    for bad in ("2026/03/01", "2026-3-1", "20260301", "昨天"):
+        resp = client.get(
+            "/v1/search",
+            params={"q": "申报", "published_from": bad},
+            headers=HEADERS,
+        )
+        assert resp.status_code == 422, bad
+
+
+def test_search_rejects_unknown_sort(client):
+    resp = client.get(
+        "/v1/search", params={"q": "申报", "sort": "score"}, headers=HEADERS
+    )
+    assert resp.status_code == 422
+
+
+def test_search_echoes_sort(client):
+    resp = client.get("/v1/search", params={"q": "申报", "sort": "published_asc"}, headers=HEADERS)
+    assert resp.json()["data"]["sort"] == "published_asc"
+
+
+@pytest.mark.parametrize(
+    ("sort", "expected"),
+    [
+        ("published_desc", True),
+        ("published_asc", False),
+    ],
+)
+def test_search_sorts_by_published_time(client, sort, expected):
+    """按时间排时，类内顺序必须是真的按时间，而不是碰巧相关度也同向。"""
+    resp = client.get("/v1/search", params={"q": "申报", "sort": sort}, headers=HEADERS)
+    for group in resp.json()["data"]["groups"]:
+        stamps = [
+            i.get("published_at_utc") or i.get("published_at") or ""
+            for i in group["items"]
+        ]
+        assert stamps == sorted(stamps, reverse=expected), (group["category"], stamps)
+
+
+def test_search_time_sort_keeps_high_relevance_first_on_ties(client):
+    """同一时刻的多篇仍按相关度降序：时间相同不等于顺序可以随便。"""
+    resp = client.get(
+        "/v1/search", params={"q": "申报", "sort": "published_asc"}, headers=HEADERS
+    )
+    for group in resp.json()["data"]["groups"]:
+        items = group["items"]
+        for prev, cur in zip(items, items[1:], strict=False):
+            prev_time = prev.get("published_at_utc") or prev.get("published_at") or ""
+            cur_time = cur.get("published_at_utc") or cur.get("published_at") or ""
+            if prev_time != cur_time:
+                continue
+            assert prev["relevance"]["score"] >= cur["relevance"]["score"]
+
+
+def test_search_published_to_includes_whole_day(client):
+    """published_to 是「含当天」：终点被推到次日 00:00:00，当天的行都要在。"""
+    resp = client.get(
+        "/v1/search",
+        params={"q": "申报", "published_to": "2026-03-05"},
+        headers=HEADERS,
+    )
+    data = resp.json()["data"]
+    items = _all_items(data)
+    assert items
+    for item in items:
+        assert (item.get("published_at") or "")[:10] <= "2026-03-05"
+
+
+def test_search_published_from_excludes_earlier_days(client):
+    base = client.get("/v1/search", params={"q": "申报"}, headers=HEADERS).json()["data"]
+    resp = client.get(
+        "/v1/search",
+        params={"q": "申报", "published_from": "2026-03-05"},
+        headers=HEADERS,
+    )
+    data = resp.json()["data"]
+    assert data["total"] <= base["total"]
+    for item in _all_items(data):
+        assert (item.get("published_at") or "")[:10] >= "2026-03-05"
+
+
+def test_search_source_filter_returns_only_that_source(client):
+    resp = client.get(
+        "/v1/search",
+        params={"q": "申报", "source": "prov-sci-tech"},
+        headers=HEADERS,
+    )
+    data = resp.json()["data"]
+    assert data["total"] > 0
+    assert {i["source"] for i in _all_items(data)} == {"prov-sci-tech"}
+
+
+def test_search_empty_source_param_is_treated_as_absent(client):
+    base = client.get("/v1/search", params={"q": "申报"}, headers=HEADERS).json()["data"]
+    blank = client.get("/v1/search", params={"q": "申报", "source": ""}, headers=HEADERS)
+    assert blank.status_code == 200
+    assert blank.json()["data"]["total"] == base["total"]
+
+
+def test_search_unknown_source_returns_empty_not_everything(client):
+    """筛一个不存在的站点必须是空集；静默退化成「不过滤」会让用户以为筛选生效了。"""
+    resp = client.get(
+        "/v1/search",
+        params={"q": "申报", "source": "no-such-source"},
+        headers=HEADERS,
+    )
+    data = resp.json()["data"]
+    assert data["total"] == 0
+    assert data["groups"] == []

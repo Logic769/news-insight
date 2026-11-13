@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Iterable, Sequence
 from contextlib import closing
@@ -115,6 +116,12 @@ CREATE INDEX IF NOT EXISTS idx_extractions_schema ON extractions(schema_id, fiel
 _POST_MIGRATION_SQL = """
 CREATE INDEX IF NOT EXISTS idx_analyzed_category ON analyzed_articles(category, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_analyzed_recency ON analyzed_articles(COALESCE(published_at, analyzed_at) DESC, article_id DESC);
+-- 时间过滤按 _TIME_EXPR 比较，索引表达式必须与查询里一字不差才可能被用上；
+-- 沿用 recency 那个表达式（不含 utc）会让 WHERE 走全表扫描。
+CREATE INDEX IF NOT EXISTS idx_analyzed_recency_utc ON analyzed_articles(COALESCE(NULLIF(published_at_utc, ''), published_at) DESC, article_id DESC);
+-- (source, 时间) 组合索引：来源筛选和「发布单位 + 时间范围」同时出现时，
+-- 单列 source 索引仍要把命中行全取出来再排序。
+CREATE INDEX IF NOT EXISTS idx_analyzed_source_time ON analyzed_articles(source, COALESCE(NULLIF(published_at_utc, ''), published_at) DESC);
 """
 
 # init_db 只有 CREATE TABLE IF NOT EXISTS，升级前建好的库不会自动长出新列。
@@ -444,6 +451,96 @@ def mark_stale_jobs_failed(conn: sqlite3.Connection) -> int:
     return int(cur.rowcount)
 
 
+# 列表与检索共用的时间过滤：按「真实时刻」比较，优先 published_at_utc，
+# 历史行 utc 缺失时回退站点墙钟 published_at。两列都空的行无法判断是否落在区间内，
+# 只能排除——这是静默丢行，所以调用方会把这类行的条数单独报出来（undated_excluded），
+# 而不是让用户以为「这段时间没有数据」。
+# 注意这里刻意不带表别名前缀：SQLite 的表达式索引按语法文本匹配，查询里写
+# a.published_at 就匹配不上建在 published_at 上的索引，会退化成全表扫描。
+# 两处查询的 FROM 都只有 analyzed_articles 一张主表，不加前缀不会有歧义。
+_TIME_EXPR = "COALESCE(NULLIF(published_at_utc, ''), published_at)"
+
+
+def _time_clauses(
+    published_from: str | None,
+    published_to: str | None,
+) -> tuple[list[str], list[Any]]:
+    """[from, to) 半开区间，参数已是 'YYYY-MM-DD HH:MM:SS' 字符串。"""
+    clauses: list[str] = []
+    args: list[Any] = []
+    if published_from:
+        clauses.append(f"{_TIME_EXPR} >= ?")
+        args.append(published_from)
+    if published_to:
+        # 用 < 而不是 <=：区间由调用方把日期转成「次日 00:00:00」，
+        # 这样 23:59:59 与带上毫秒的时间戳都不会被漏掉。
+        clauses.append(f"{_TIME_EXPR} < ?")
+        args.append(published_to)
+    return clauses, args
+
+
+_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def normalize_day(value: str | None) -> str | None:
+    """把 'YYYY-MM-DD' 归一成 'YYYY-MM-DD 00:00:00'；空串/None 视为未传。
+
+    只接受纯日期：检索条件里的日期来自日期选择器，带时分秒的输入没有明确语义
+    （是区间起点还是整点截止？），与其猜不如在参数校验阶段就拒掉。
+    """
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    # 先卡形状再解析：date.fromisoformat 从 3.11 起还接受 "20260301"，
+    # strptime("%Y-%m-%d") 又会接受 "2026-3-1"，两者都是前端不该送来的形式。
+    # 只认 YYYY-MM-DD，别的直接在参数校验阶段拒掉，避免同一天多种写法被当成
+    # 不同的检索条件、或紧凑格式被悄悄解释成另一天。
+    if not _DAY_RE.fullmatch(text):
+        raise ValueError(f"日期格式应为 YYYY-MM-DD: {value}")
+    try:
+        parsed = dt.date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"日期不合法: {value}") from exc
+    return parsed.strftime("%Y-%m-%d 00:00:00")
+
+
+def normalize_day_end(value: str | None) -> str | None:
+    """把日期终点推到「次日 00:00:00」，与 _time_clauses 的 [from, to) 配套。"""
+    start = normalize_day(value)
+    if start is None:
+        return None
+    parsed = dt.date.fromisoformat(start[:10]) + dt.timedelta(days=1)
+    return parsed.strftime("%Y-%m-%d 00:00:00")
+
+
+def _source_clause(sources: Sequence[str] | None) -> tuple[list[str], list[Any]]:
+    if sources is None:
+        return [], []
+    if not sources:
+        # 空列表 = 「筛完什么都不剩」，与不传（None）不是一回事
+        return ["0"], []
+    placeholders = ",".join("?" for _ in sources)
+    return [f"a.source IN ({placeholders})"], list(sources)
+
+
+# 列表排序：默认最新优先。按 category_confidence 排时用 IS NULL 前缀把缺值的行
+# 压到最后，否则 SQLite 把 NULL 当最小值，升序时一堆无评分行会排在最前面。
+_LIST_ORDERS = {
+    "published_desc": "COALESCE(a.published_at, a.analyzed_at) DESC, a.article_id DESC",
+    "published_asc": "COALESCE(a.published_at, a.analyzed_at) ASC, a.article_id ASC",
+    "confidence_desc": "(a.category_confidence IS NULL), a.category_confidence DESC, a.article_id DESC",
+    "confidence_asc": "(a.category_confidence IS NULL), a.category_confidence ASC, a.article_id ASC",
+}
+LIST_SORTS = tuple(_LIST_ORDERS)
+
+# 检索的类内排序：默认按相关度，另外允许按时间翻。"相关度排序" 是产品默认，
+# 按时间排是给「先看最新的」这类浏览型查询用的，两者都得由后端算完，
+# 因为前端拿不到复算分数所需的查询覆盖度。
+SEARCH_SORTS = ("relevance", "published_desc", "published_asc")
+
+
 def list_analyzed(
     conn: sqlite3.Connection,
     *,
@@ -451,7 +548,16 @@ def list_analyzed(
     limit: int,
     offset: int,
     category: str | None = None,
-) -> tuple[list[dict[str, Any]], int]:
+    sources: Sequence[str] | None = None,
+    published_from: str | None = None,
+    published_to: str | None = None,
+    sort: str = "published_desc",
+) -> tuple[list[dict[str, Any]], int, int]:
+    """分页列表；返回 (rows, total, undated_excluded)。
+
+    undated_excluded 只在带了时间过滤时才有意义：它统计「本来能命中其他条件、
+    但因为两个时间列都是 NULL 而无法判断是否在区间内」的行数。
+    """
     clauses: list[str] = []
     args: list[Any] = []
     if tag:
@@ -462,13 +568,36 @@ def list_analyzed(
     if category is not None:
         clauses.append("a.category = ?")
         args.append(category)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    total = conn.execute(f"SELECT COUNT(*) FROM analyzed_articles a {where}", args).fetchone()[0]
+    src_clauses, src_args = _source_clause(sources)
+    clauses.extend(src_clauses)
+    args.extend(src_args)
+
+    time_clauses, time_args = _time_clauses(published_from, published_to)
+    all_clauses = [*clauses, *time_clauses]
+    where = f"WHERE {' AND '.join(all_clauses)}" if all_clauses else ""
+
+    total = conn.execute(f"SELECT COUNT(*) FROM analyzed_articles a {where}", [*args, *time_args]).fetchone()[0]
+    undated = 0
+    if time_clauses:
+        # 单独数一遍「两个时间列都空」的行：它们本来就命不中时间条件，
+        # 不数出来的话用户看到的 total 会比预期少一截且无解释。
+        undated_clauses = [
+            *clauses,
+            "(a.published_at_utc IS NULL OR a.published_at_utc = '')",
+            "(a.published_at IS NULL OR a.published_at = '')",
+        ]
+        undated = conn.execute(
+            "SELECT COUNT(*) FROM analyzed_articles a WHERE " + " AND ".join(undated_clauses),
+            args,
+        ).fetchone()[0]
+    order = _LIST_ORDERS.get(sort)
+    if order is None:
+        raise ValueError(f"未知排序: {sort}")
     rows = conn.execute(
         f"""SELECT a.* FROM analyzed_articles a {where}
-            ORDER BY COALESCE(a.published_at, a.analyzed_at) DESC
+            ORDER BY {order}
             LIMIT ? OFFSET ?""",
-        [*args, limit, offset],
+        [*args, *time_args, limit, offset],
     ).fetchall()
     out = []
     for row in rows:
@@ -481,7 +610,7 @@ def list_analyzed(
             )
         ]
         out.append(item)
-    return out, int(total)
+    return out, int(total), int(undated)
 
 
 def get_article(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | None:
@@ -609,6 +738,23 @@ def tag_stats(conn: sqlite3.Connection, *, category: str | None = None) -> list[
     rows = conn.execute(
         "SELECT tag, COUNT(*) AS count, ROUND(AVG(confidence), 3) AS avg_confidence "
         "FROM article_tags GROUP BY tag ORDER BY count DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def source_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """One row per crawler source, for the source filter and the admin board.
+
+    latest_published_at uses _TIME_EXPR rather than published_at on purpose: with
+    mixed-timezone sources the row with the largest wall clock is not necessarily
+    the newest one, and a board showing "last updated" must use real instants.
+    """
+    rows = conn.execute(
+        "SELECT source, COUNT(*) AS count,"
+        " ROUND(AVG(category_confidence), 3) AS avg_confidence,"
+        f" MAX({_TIME_EXPR}) AS latest_published_at "
+        "FROM analyzed_articles a WHERE a.source IS NOT NULL AND a.source <> ''"
+        " GROUP BY a.source ORDER BY count DESC, a.source ASC"
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -752,6 +898,10 @@ def search_candidates(
     terms: Sequence[str],
     tag_ids: Sequence[str],
     categories: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
+    published_from: str | None = None,
+    published_to: str | None = None,
+    sort: str = "relevance",
     limit: int = _CANDIDATE_LIMIT,
 ) -> list[dict[str, Any]]:
     """Rows that might match, prefiltered in SQL before scoring.
@@ -819,6 +969,15 @@ def search_candidates(
         clauses.append("COALESCE(a.category, '') IN (" + placeholders + ")")
         args.extend(categories)
 
+    # 时间与来源筛选和 list_analyzed 共用同一套子句，两处口径必须一致：
+    # 否则同一批数据在「浏览」和「检索」里被筛出不同的集合，用户会以为丢数据。
+    src_clauses, src_args = _source_clause(sources)
+    clauses.extend(src_clauses)
+    args.extend(src_args)
+    time_clauses, time_args = _time_clauses(published_from, published_to)
+    clauses.extend(time_clauses)
+    args.extend(time_args)
+
     # ORDER BY 必须在截断前定序，否则同一查询两次可能截到不同集合，用户会看到
     # 结果忽有忽无。它同时决定「命中超过 limit 时保留哪些」——取最新的，所以
     # 顺序本身就是产品行为，不只是稳定性。该表达式有 idx_analyzed_recency
@@ -832,6 +991,16 @@ def search_candidates(
     # 生产路径走不到：search_grouped 在 query.is_empty 处提前返回空结果。这里保留
     # 该行为而不是返回 []，是因为本函数是公开的候选集查询，"不限条件" 是合理语义，
     # 由调用方负责判空。
+    # 排序必须和调用方的意图一致，因为它决定「超过 limit 时留哪一批」。
+    # 按时间升序查却仍用「最新优先」截断，会把用户想看的最老的几条直接截掉，
+    # 结果集里只剩最新的 2000 行——不报错，但答案是错的。
+    # relevance 模式仍按最新优先截断：相关度要在 Python 侧算完才知道，SQL 阶段
+    # 拿不到，只能先按一个与产品偏好一致（新的更重要）的次序取候选。
+    cutoff_order = (
+        "COALESCE(a.published_at, a.analyzed_at) ASC, a.article_id ASC"
+        if sort == "published_asc"
+        else "COALESCE(a.published_at, a.analyzed_at) DESC, a.article_id DESC"
+    )
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         "SELECT a.article_id, a.source, a.url, a.title, a.body,"
@@ -839,7 +1008,7 @@ def search_candidates(
         " a.category, a.category_confidence, a.category_engine,"
         " a.tag_engine, a.analyzed_at"
         " FROM analyzed_articles a " + where
-        + " ORDER BY COALESCE(a.published_at, a.analyzed_at) DESC, a.article_id DESC"
+        + " ORDER BY " + cutoff_order
         + " LIMIT ?",
         [*args, limit],
     ).fetchall()
@@ -912,8 +1081,12 @@ def search_grouped(
     tags: list[TagDef],
     category_order: Sequence[str] = (),
     categories: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
+    published_from: str | None = None,
+    published_to: str | None = None,
     per_category: int = 20,
     include_body: bool = False,
+    sort: str = "relevance",
 ) -> dict[str, Any]:
     """Score every candidate, then group by category and rank inside each group.
 
@@ -932,6 +1105,12 @@ def search_grouped(
         terms=query.term_texts,
         tag_ids=query.tag_ids,
         categories=categories,
+        sources=sources,
+        published_from=published_from,
+        published_to=published_to,
+        # 排序影响截断方向：按时间升序查时不能还按「最新优先」取候选，
+        # 否则最老的那批恰好是被截掉的那批。
+        sort=sort,
         limit=_CANDIDATE_LIMIT + 1,
     )
     truncated = len(rows) > _CANDIDATE_LIMIT
@@ -967,10 +1146,37 @@ def search_grouped(
     # 同分兜底：先按发布时间倒序，最后用 article_id 打破完全平局。少了最后这一
     # 层，同分同时间的多篇按 SQLite 返回顺序排，查询计划一变排列就会抖——而前端
     # 拿到的 items[] 顺序就是最终展示顺序，抖动等于用户看到列表顺序会变。
-    scored.sort(
-        key=lambda pair: (pair[0], pair[1].get("published_at") or "", pair[1]["article_id"]),
-        reverse=True,
-    )
+    if sort == "relevance":
+        scored.sort(
+            key=lambda pair: (pair[0], pair[1].get("published_at") or "", pair[1]["article_id"]),
+            reverse=True,
+        )
+    elif sort in ("published_desc", "published_asc"):
+        # 按时间排时相关度仍要能决定同秒内的顺序：同一批站点的发布时间常见
+        # 精确到分钟甚至全是 00:00:00，只按时间排会让同一天的几十篇恒为某一种
+        # 任意顺序。两级键都带上，时间主序、相关度次序。
+        #
+        # 相关度这一级始终「高的在前」，所以不能用 reverse 一刀切（升序时
+        # reverse=False 会把低分排前面），只能把分数取负后统一升序。
+        if sort == "published_desc":
+            scored.sort(
+                key=lambda pair: (
+                    pair[1].get("published_at_utc") or pair[1].get("published_at") or "",
+                    pair[0],
+                    pair[1]["article_id"],
+                ),
+                reverse=True,
+            )
+        else:
+            scored.sort(
+                key=lambda pair: (
+                    pair[1].get("published_at_utc") or pair[1].get("published_at") or "",
+                    -pair[0],
+                    pair[1]["article_id"],
+                ),
+            )
+    else:
+        raise ValueError(f"未知排序: {sort}")
 
     buckets: dict[str, list[dict[str, Any]]] = {}
     for _, item in scored:
@@ -982,7 +1188,7 @@ def search_grouped(
     known = set(ordered)
     ordered.extend(sorted(k for k in buckets if k not in known))
 
-    groups = [
+    groups: list[dict[str, Any]] = [
         {
             "category": key,
             "count": len(buckets[key]),
@@ -994,8 +1200,15 @@ def search_grouped(
         "query": raw_query,
         "matched_tags": list(query.tag_ids),
         "terms": list(query.term_texts),
+        "sort": sort,
         "groups": groups,
         # 候选集（最多 2000 行）内命中的行数，不是全库真实命中数：泛词被截断时
         # 这个值会偏小。前端展示「共 N 条」时应理解为「本次返回范围内的条数」。
         "total": len(scored),
+        # 实际渲染出去的条数（每类封顶 per_category 之后），与 total 的差额
+        # 就是「还有更多没显示」，前端据此决定要不要显示「查看更多」。
+        "returned": sum(len(g["items"]) for g in groups),
+        # 候选集是否被 _CANDIDATE_LIMIT 截断。为 true 时 total 只是下界，
+        # 前端必须提示「结果可能不完整」，不能把 total 当成全库命中数展示。
+        "truncated": truncated,
     }

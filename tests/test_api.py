@@ -145,3 +145,63 @@ def test_async_job_lifecycle(client):
 
     listing = client.get("/v1/jobs", headers=headers).json()["data"]
     assert any(item["id"] == job_id for item in listing)
+
+# ------------------------------------------------- 新增：列表过滤/排序/统计端点
+
+def test_articles_rejects_unknown_sort(client):
+    resp = client.get("/v1/articles", params={"sort": "nope"}, headers={"X-API-Key": "secret"})
+    assert resp.status_code == 422
+
+
+def test_articles_rejects_bad_date(client):
+    resp = client.get(
+        "/v1/articles", params={"published_from": "2026/03/01"}, headers={"X-API-Key": "secret"}
+    )
+    assert resp.status_code == 422
+
+
+def test_articles_time_filter_reports_undated_excluded(client):
+    """带时间过滤时 meta 必须回显 undated_excluded，前端才能解释 total 为什么变小。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+    resp = client.get(
+        "/v1/articles",
+        params={"published_from": "2026-03-01", "published_to": "2026-03-31"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    meta = resp.json()["meta"]
+    assert "undated_excluded" in meta
+    assert meta["undated_excluded"] == 0
+
+
+def test_articles_sort_by_confidence_puts_nulls_last(client):
+    """缺分类置信度的历史行不能被当成「置信度最低」排到最前面。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+    resp = client.get("/v1/articles", params={"sort": "confidence_desc"}, headers=headers)
+    rows = resp.json()["data"]
+    assert rows
+    seen_null = False
+    for row in rows:
+        if row.get("category_confidence") is None:
+            seen_null = True
+        else:
+            assert not seen_null, "置信度为 NULL 的行必须排在最后"
+
+
+def test_sources_stats_endpoint(client):
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+    resp = client.get("/v1/sources", headers=headers)
+    assert resp.status_code == 200
+    rows = resp.json()["data"]
+    assert rows
+    total = client.get("/v1/articles", params={"limit": 1}, headers=headers).json()["meta"]["total"]
+    assert sum(r["count"] for r in rows) == total
+    for row in rows:
+        assert set(row) == {"source", "count", "avg_confidence", "latest_published_at"}
+
+
+def test_sources_stats_requires_key(client):
+    assert client.get("/v1/sources").status_code == 401

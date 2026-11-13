@@ -138,6 +138,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             conn.close()
 
+    # 路径与上游 news-crawler 的 GET /v1/sources（来源统计）保持一致，
+    # 前端两个服务共用一个 api 层时不必记两套命名。
+    # 不叫 /v1/sources/stats：categories/tags 之所以有「定义 + 统计」两级，
+    # 是因为它们的候选集合写在词汇表文件里；来源没有静态定义，统计就是全部信息。
+    @app.get("/v1/sources")
+    def sources_stats() -> dict:
+        """按抓取站点聚合：条数、平均分类置信度、最新发布时间。
+
+        前端「发布单位」筛选下拉直接吃这个列表，管理端统计看板也用它，
+        所以不额外做分页——站点数量是几十的量级。
+        """
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            rows = db.source_stats(conn)
+        finally:
+            conn.close()
+        return {"data": rows}
+
     @app.get("/v1/tags")
     def tags(category: str | None = Query(default=None)) -> dict:
         s: Settings = app.state.settings
@@ -195,16 +214,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def articles(
         tag: str | None = Query(default=None),
         category: str | None = Query(default=None),
+        source: Annotated[list[str] | None, Query(description="只在这些站点里筛选")] = None,
+        published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
+        published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
+        sort: str = Query(default="published_desc", description="排序键"),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
         s: Settings = app.state.settings
+        try:
+            since = db.normalize_day(published_from)
+            until = db.normalize_day_end(published_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if sort not in db.LIST_SORTS:
+            raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
+        # 空串按「没传」处理，与 /v1/search 的 category 口径保持一致：?source=
+        # 若被当成「筛一个空站点名」会静默返回空集。
+        sources = [x.strip() for x in (source or []) if x.strip()]
         conn = connect(s)
         try:
-            rows, total = db.list_analyzed(conn, tag=tag, category=category, limit=limit, offset=offset)
+            rows, total, undated = db.list_analyzed(
+                conn,
+                tag=tag,
+                category=category,
+                sources=sources or None,
+                published_from=since,
+                published_to=until,
+                sort=sort,
+                limit=limit,
+                offset=offset,
+            )
         finally:
             conn.close()
-        return {"data": rows, "meta": {"total": total, "limit": limit, "offset": offset}}
+        return {
+            "data": rows,
+            "meta": {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "sort": sort,
+                # 两个时间列都为空的行无法判断是否落在区间内，会被排除；条数单独
+                # 报出来，前端才能解释「为什么 total 比预期少」而不是当成丢数据。
+                "undated_excluded": undated,
+            },
+        }
 
     @app.get("/v1/search")
     def search_articles(
@@ -218,6 +272,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         category: Annotated[
             list[str] | None, Query(description="只在这些大类里检索")
         ] = None,
+        source: Annotated[list[str] | None, Query(description="只在这些站点里检索")] = None,
+        published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
+        published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
+        sort: str = Query(default="relevance", description="类内排序：relevance/published_desc/published_asc"),
         per_category: int = Query(default=20, ge=1, le=100, description="每个大类返回多少条"),
         include_body: bool = Query(default=False, description="是否返回正文（默认不返回，节省带宽）"),
     ) -> dict:
@@ -229,6 +287,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """
         s: Settings = app.state.settings
         cleaned = [c.strip() for c in (category or []) if c.strip()]
+        if sort not in db.SEARCH_SORTS:
+            raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
+        try:
+            since = db.normalize_day(published_from)
+            until = db.normalize_day_end(published_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sources = [x.strip() for x in (source or []) if x.strip()]
         _, tags = load_vocab(s.vocab_dir)
         _, categories = load_categories(s.vocab_dir)
         conn = connect(s)
@@ -244,8 +310,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # 可能变成空列表，而 search_candidates 把空列表当作「筛选后无结果」，
                 # 所以这里要显式转成 None（不传），否则 ?category= 反而返回空集。
                 categories=cleaned or None,
+                # 空列表在 search_candidates 里是「筛完什么都不剩」，与不传
+                # （None）不是一回事，所以这里同样显式转 None。
+                sources=sources or None,
+                published_from=since,
+                published_to=until,
                 per_category=per_category,
                 include_body=include_body,
+                sort=sort,
             )
         finally:
             conn.close()
