@@ -89,7 +89,9 @@ def test_auto_mode_falls_back_and_records_reason(settings, monkeypatch):
 
     monkeypatch.setattr(client, "_live_list", boom)
     rows, mode = client.list_articles(limit=5)
-    assert mode == "demo" and len(rows) == 4
+    # 不写死条数：演示夹具会随用例需要增删，这里验证的是「回退成功且不超过 limit」。
+    assert mode == "demo"
+    assert 0 < len(rows) <= 5
     assert client.fallback_reason == "连接超时"
 
 

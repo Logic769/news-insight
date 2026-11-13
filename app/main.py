@@ -29,8 +29,10 @@ LOG = logging.getLogger("news_insight.main")
 _OPEN_PATHS = ("/health", "/docs", "/redoc", "/openapi.json")
 
 
-def _split_sources(values: list[str] | None) -> list[str] | None:
-    """把 ?source= 归一成「去重、去空、支持逗号分隔」的站点名列表。
+def _split_multi(values: list[str] | None) -> list[str] | None:
+    """把多值查询参数（?source=、?category=）归一成「去重、去空、支持逗号分隔」的列表。
+
+    三类输入必须区分开，否则前端换个写法就静默查错：
 
     - ?source=a,b 原先整串被当成一个叫 "a,b" 的站点名，IN (...) 永不命中，
       静默返回 0 条。前端把多选值 join 起来传是很自然的写法，必须拆开。
@@ -40,6 +42,9 @@ def _split_sources(values: list[str] | None) -> list[str] | None:
 
     全部片段都为空时返回 None（不筛）。这与库层 sources=[]（筛完什么都不剩，返回
     空集）是两种语义：[] 只能由代码显式传入，HTTP 层永远不会产生它。
+
+    source 与 category 共用本函数：两者都是前端的多选控件，用户看不出区别，
+    只支持其中一种写法会让「站点多选生效、大类多选静默失效」。
     """
     if values is None:
         return None
@@ -260,7 +265,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 conn,
                 tag=tag,
                 category=category,
-                sources=_split_sources(source),
+                sources=_split_multi(source),
                 published_from=since,
                 published_to=until,
                 sort=sort,
@@ -301,14 +306,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         per_category: int = Query(default=20, ge=1, le=100, description="每个大类返回多少条"),
         include_body: bool = Query(default=False, description="是否返回正文（默认不返回，节省带宽）"),
     ) -> dict:
-        """按关键词检索，结果按 5 大类分组、类内按相关度排序。
+        """按关键词检索，结果按 6 大类分组、类内按相关度排序。
 
         排序相关的计算全在这里完成，前端只负责渲染。前端虽然能从 item 里读到标签
         置信度，但拿不到查询覆盖度（那要复算词表匹配），默认也拿不到正文，无法复
         算出同一个分数，所以 `groups[].items[]` 的顺序就是最终顺序。
         """
         s: Settings = app.state.settings
-        cleaned = [c.strip() for c in (category or []) if c.strip()]
         if sort not in db.SEARCH_SORTS:
             raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
         try:
@@ -316,7 +320,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             until = db.normalize_day_end(published_to)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        sources = _split_sources(source)
+        sources = _split_multi(source)
         _, tags = load_vocab(s.vocab_dir)
         _, categories = load_categories(s.vocab_dir)
         conn = connect(s)
@@ -326,12 +330,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raw_query=q,
                 tags=tags,
                 category_order=tuple(c.id for c in categories),
-                # ?category= 传空串时 FastAPI 给出 [""]，直接透传会让 SQL 变成
-                # COALESCE(category,'') IN ('')，只命中「分类上线前的历史 NULL 行」，
-                # 静默返回一堆与用户意图无关的结果。空串一律当「没传」——注意过滤后
-                # 可能变成空列表，而 search_candidates 把空列表当作「筛选后无结果」，
-                # 所以这里要显式转成 None（不传），否则 ?category= 反而返回空集。
-                categories=cleaned or None,
+                # 与 source 共用 _split_multi：?category= 传空串时 FastAPI 给出 [""]，
+                # 直接透传会让 SQL 变成 COALESCE(category,'') IN ('')，只命中「分类上线
+                # 前的历史 NULL 行」，静默返回一堆与用户意图无关的结果。空串一律当「没传」
+                # ——注意过滤后可能变成空列表，而 search_candidates 把空列表当作「筛选后
+                # 无结果」，所以 _split_multi 收尾返回 None（不传），否则 ?category= 反而
+                # 返回空集。逗号写法（?category=a,b）同样拆开，理由见 _split_multi。
+                categories=_split_multi(category),
                 sources=sources,
                 published_from=since,
                 published_to=until,

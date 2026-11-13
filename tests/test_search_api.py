@@ -1,4 +1,4 @@
-"""GET /v1/search：后端算好排序、按 5 大类分组返回给前端。
+"""GET /v1/search：后端算好排序、按 6 大类分组返回给前端。
 
 前端的职责只是渲染，因此这里断言的是「后端给出的结构与顺序」：分组键、
 类内顺序、空结果的形状、以及默认不返回正文（正文很大，只有显式要求时才给）。
@@ -20,7 +20,9 @@ def client(tmp_path, monkeypatch):
     app = create_app(load_settings())
     with TestClient(app) as c:
         # 先分析一批，让库里有数据可搜
-        c.post("/v1/analyze", params={"limit": 4}, headers={"X-API-Key": "secret"})
+        # limit 与 fixtures/articles.json 的条数一致：少分析一篇，依赖该篇的用例会
+        # 变成「筛出来是空的」这种看不出原因的失败。
+        c.post("/v1/analyze", params={"limit": 5}, headers={"X-API-Key": "secret"})
         yield c
 
 
@@ -205,13 +207,15 @@ def test_search_time_sort_keeps_high_relevance_first_on_ties(client):
             assert prev["relevance"]["score"] >= cur["relevance"]["score"]
 
 
-def _instant(item):
-    """过滤用的是真实时刻（published_at_utc 优先），断言也必须按同一口径。
+def _display_day(item):
+    """过滤按**卡片上显示的那一天**（站点墙钟 published_at 的日期），不是真实时刻。
 
-    早先这里断言 (published_at or '')[:10]，而 published_at 是站点墙钟：混时区数据下
-    「筛 03-05 却返回标着 03-04/03-06 的条目」会同时被过滤正确、断言错误掩盖掉。
+    后端 _DAY_EXPR 是「墙钟优先、utc 兜底」，断言必须同源：夹具里 e5c4a7b6f1d28e93
+    墙钟 2026-03-05 00:30 / utc 2026-03-04 16:30，两种口径不同日。若这里改回
+    published_at_utc 优先，筛 03-05 的断言会把它当成 03-04 而判错，反过来说
+    实现里 _DAY_EXPR 被换成 _TIME_EXPR 时也不会变红 —— B1 会静默复发。
     """
-    return item.get("published_at_utc") or item.get("published_at") or ""
+    return item.get("published_at") or item.get("published_at_utc") or ""
 
 
 def test_search_published_to_includes_whole_day(client):
@@ -225,7 +229,7 @@ def test_search_published_to_includes_whole_day(client):
     items = _all_items(data)
     assert items
     for item in items:
-        assert _instant(item)[:10] <= "2026-03-05", _instant(item)
+        assert _display_day(item)[:10] <= "2026-03-05", _display_day(item)
 
 
 def test_search_published_from_excludes_earlier_days(client):
@@ -238,7 +242,29 @@ def test_search_published_from_excludes_earlier_days(client):
     data = resp.json()["data"]
     assert data["total"] <= base["total"]
     for item in _all_items(data):
-        assert _instant(item)[:10] >= "2026-03-05", _instant(item)
+        assert _display_day(item)[:10] >= "2026-03-05", _display_day(item)
+
+
+def test_search_date_filter_follows_displayed_wall_clock_day(client):
+    """跨日样本必须按卡片上那一天的归属被筛到，这是 B1 的 API 层守护。
+
+    夹具 e5c4a7b6f1d28e93 墙钟 2026-03-05 00:30 / utc 2026-03-04 16:30（东八区）。
+    按展示口径：筛 03-05 应该出现，筛 03-04 不应该。若实现把 _DAY_EXPR 换回
+    真实时刻，两条断言都会反过来 —— 这正是上一轮静默复发的那个 bug。
+    """
+    hit = client.get(
+        "/v1/search",
+        params={"q": "申报", "published_from": "2026-03-05", "published_to": "2026-03-05"},
+        headers=HEADERS,
+    ).json()["data"]
+    assert "e5c4a7b6f1d28e93" in {i["article_id"] for i in _all_items(hit)}
+
+    miss = client.get(
+        "/v1/search",
+        params={"q": "申报", "published_from": "2026-03-04", "published_to": "2026-03-04"},
+        headers=HEADERS,
+    ).json()["data"]
+    assert "e5c4a7b6f1d28e93" not in {i["article_id"] for i in _all_items(miss)}
 
 
 def test_articles_rejects_out_of_range_date_with_422(client):

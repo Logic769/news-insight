@@ -330,6 +330,22 @@ def test_init_db_migrates_old_database_without_category_columns(tmp_path):
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_analyzed_category'"
         ).fetchone() is not None, "依赖新列的索引必须在补列之后建出来"
+        # 两个表达式索引必须在旧库迁移路径上建出来，且 DDL 里的表达式与查询用的常量
+        # **逐字一致**：SQLite 按语法文本匹配表达式索引，差一处 NULLIF 就退化全表扫描，
+        # 而且不报错。这里不断言 EXPLAIN 计划 —— 空表/一行数据时优化器会自选索引，
+        # 那种断言只会随机变红；真正要守的是「索引确实建了、且建在同一个表达式上」。
+        index_sql = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='index'"
+                " AND name IN ('idx_analyzed_day', 'idx_analyzed_recency_utc',"
+                " 'idx_analyzed_source_time')"
+            )
+        }
+        assert "idx_analyzed_day" in index_sql, "日期过滤索引必须在旧库迁移时也建出来"
+        assert db._DAY_EXPR in index_sql["idx_analyzed_day"], index_sql["idx_analyzed_day"]
+        for name in ("idx_analyzed_recency_utc", "idx_analyzed_source_time"):
+            assert db._TIME_EXPR in index_sql[name], index_sql[name]
         row = conn.execute(
             "SELECT category, category_confidence, category_engine FROM analyzed_articles WHERE article_id='legacy'"
         ).fetchone()
