@@ -205,6 +205,15 @@ def test_search_time_sort_keeps_high_relevance_first_on_ties(client):
             assert prev["relevance"]["score"] >= cur["relevance"]["score"]
 
 
+def _instant(item):
+    """过滤用的是真实时刻（published_at_utc 优先），断言也必须按同一口径。
+
+    早先这里断言 (published_at or '')[:10]，而 published_at 是站点墙钟：混时区数据下
+    「筛 03-05 却返回标着 03-04/03-06 的条目」会同时被过滤正确、断言错误掩盖掉。
+    """
+    return item.get("published_at_utc") or item.get("published_at") or ""
+
+
 def test_search_published_to_includes_whole_day(client):
     """published_to 是「含当天」：终点被推到次日 00:00:00，当天的行都要在。"""
     resp = client.get(
@@ -216,7 +225,7 @@ def test_search_published_to_includes_whole_day(client):
     items = _all_items(data)
     assert items
     for item in items:
-        assert (item.get("published_at") or "")[:10] <= "2026-03-05"
+        assert _instant(item)[:10] <= "2026-03-05", _instant(item)
 
 
 def test_search_published_from_excludes_earlier_days(client):
@@ -229,7 +238,21 @@ def test_search_published_from_excludes_earlier_days(client):
     data = resp.json()["data"]
     assert data["total"] <= base["total"]
     for item in _all_items(data):
-        assert (item.get("published_at") or "")[:10] >= "2026-03-05"
+        assert _instant(item)[:10] >= "2026-03-05", _instant(item)
+
+
+def test_articles_rejects_out_of_range_date_with_422(client):
+    """9999-12-31 是日期控件常用的「不限」，加一天会溢出，必须 422 而不是 500。"""
+    resp = client.get(
+        "/v1/articles", params={"published_to": "9999-12-31"}, headers=HEADERS
+    )
+    assert resp.status_code == 422, resp.text
+    resp = client.get(
+        "/v1/search",
+        params={"q": "申报", "published_to": "9999-12-31"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
 
 
 def test_search_source_filter_returns_only_that_source(client):

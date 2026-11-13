@@ -455,9 +455,10 @@ def mark_stale_jobs_failed(conn: sqlite3.Connection) -> int:
 # 历史行 utc 缺失时回退站点墙钟 published_at。两列都空的行无法判断是否落在区间内，
 # 只能排除——这是静默丢行，所以调用方会把这类行的条数单独报出来（undated_excluded），
 # 而不是让用户以为「这段时间没有数据」。
-# 注意这里刻意不带表别名前缀：SQLite 的表达式索引按语法文本匹配，查询里写
-# a.published_at 就匹配不上建在 published_at 上的索引，会退化成全表扫描。
-# 两处查询的 FROM 都只有 analyzed_articles 一张主表，不加前缀不会有歧义。
+# 注意这个表达式必须与 _POST_MIGRATION_SQL 里建索引时写的**逐字一致**：SQLite 的
+# 表达式索引按语法文本匹配，差一个别名前缀或一处 NULLIF 都会退化成全表扫描。
+# 所以它被抽成常量，过滤（_time_clauses）、排序（_LIST_ORDERS / cutoff_order）、
+# 聚合（source_stats）全部引用同一份文本，改一处就必须重建索引。
 _TIME_EXPR = "COALESCE(NULLIF(published_at_utc, ''), published_at)"
 
 
@@ -511,7 +512,12 @@ def normalize_day_end(value: str | None) -> str | None:
     start = normalize_day(value)
     if start is None:
         return None
-    parsed = dt.date.fromisoformat(start[:10]) + dt.timedelta(days=1)
+    try:
+        parsed = dt.date.fromisoformat(start[:10]) + dt.timedelta(days=1)
+    except OverflowError as exc:
+        # 日期控件常拿 9999-12-31 当「不限」，日期算术会越界；这是参数问题，
+        # 应该按 422 拒掉，而不是让请求以 500 结束。
+        raise ValueError(f"日期超出可比较范围: {value}") from exc
     return parsed.strftime("%Y-%m-%d 00:00:00")
 
 
@@ -527,9 +533,17 @@ def _source_clause(sources: Sequence[str] | None) -> tuple[list[str], list[Any]]
 
 # 列表排序：默认最新优先。按 category_confidence 排时用 IS NULL 前缀把缺值的行
 # 压到最后，否则 SQLite 把 NULL 当最小值，升序时一堆无评分行会排在最前面。
+#
+# 按时间排时**必须与时间过滤用同一个表达式**（_TIME_EXPR，真实时刻）。早先这里写的是
+# COALESCE(published_at, analyzed_at)（站点墙钟），于是同一批数据在「按某天筛」和
+# 「按时间排」上用了两套口径：生产库 472 行里 137 行（29%）utc 与墙钟差一天以上，
+# 用户筛 11-01 会看到标着 11-02 的条目，同刻不同源的行还会排错位。
+# 换成 _TIME_EXPR 后 ORDER BY 也能命中 idx_analyzed_recency_utc，省掉一次 TEMP B-TREE。
+# 代价：两列都空的行不再拿 analyzed_at 顶到最新，按「发布时间排序」的语义它们本就该排
+# 最后（DESC 时 NULL 居末）；生产库当前 0 行两列皆空，先不为它单独建兜底索引。
 _LIST_ORDERS = {
-    "published_desc": "COALESCE(a.published_at, a.analyzed_at) DESC, a.article_id DESC",
-    "published_asc": "COALESCE(a.published_at, a.analyzed_at) ASC, a.article_id ASC",
+    "published_desc": f"{_TIME_EXPR} DESC, a.article_id DESC",
+    "published_asc": f"{_TIME_EXPR} ASC, a.article_id ASC",
     "confidence_desc": "(a.category_confidence IS NULL), a.category_confidence DESC, a.article_id DESC",
     "confidence_asc": "(a.category_confidence IS NULL), a.category_confidence ASC, a.article_id ASC",
 }
@@ -750,12 +764,15 @@ def source_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     the newest one, and a board showing "last updated" must use real instants.
     """
     rows = conn.execute(
-        "SELECT source, COUNT(*) AS count,"
-        " ROUND(AVG(category_confidence), 3) AS avg_confidence,"
+        "SELECT COALESCE(a.source, '') AS source, COUNT(*) AS count,"
+        " ROUND(AVG(a.category_confidence), 3) AS avg_confidence,"
         f" MAX({_TIME_EXPR}) AS latest_published_at "
-        "FROM analyzed_articles a WHERE a.source IS NOT NULL AND a.source <> ''"
-        " GROUP BY a.source ORDER BY count DESC, a.source ASC"
+        "FROM analyzed_articles a GROUP BY COALESCE(a.source, '')"
+        " ORDER BY count DESC, source ASC"
     ).fetchall()
+    # 不在这里过滤空 source：/v1/articles 的 total 把它算进去，这里若跳过，
+    # sum(count) 会比 total 少，前端「全部来源」与站点计数会对不上。
+    # 空 source 由前端显示成「未标注来源」。
     return [dict(r) for r in rows]
 
 
@@ -996,10 +1013,15 @@ def search_candidates(
     # 结果集里只剩最新的 2000 行——不报错，但答案是错的。
     # relevance 模式仍按最新优先截断：相关度要在 Python 侧算完才知道，SQL 阶段
     # 拿不到，只能先按一个与产品偏好一致（新的更重要）的次序取候选。
+    # 截断键必须与 _LIST_ORDERS / search_grouped 用同一个时间表达式，否则「筛 11-01
+    # 的窗口」和「留哪 2000 行」用的是两套时间口径：升序查会把真实时刻最老的行截掉，
+    # 留下墙钟最老的（生产库 29% 的行两者不在同一天）。
+    if sort not in SEARCH_SORTS:
+        raise ValueError(f"未知排序: {sort}")
     cutoff_order = (
-        "COALESCE(a.published_at, a.analyzed_at) ASC, a.article_id ASC"
+        f"{_TIME_EXPR} ASC, a.article_id ASC"
         if sort == "published_asc"
-        else "COALESCE(a.published_at, a.analyzed_at) DESC, a.article_id DESC"
+        else f"{_TIME_EXPR} DESC, a.article_id DESC"
     )
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
