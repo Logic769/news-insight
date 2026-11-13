@@ -600,3 +600,71 @@ def test_candidate_cap_warns_only_when_rows_are_actually_dropped(
         capped = db.search_grouped(conn, raw_query="光伏", tags=TAGS, per_category=100)
     assert capped["total"] == 3
     assert [r for r in caplog.records if "候选集打满" in r.getMessage()]
+
+def test_search_candidates_keeps_newest_rows_when_truncating() -> None:
+    """候选截断前必须先定序，且保留的是最新的行。
+
+    CodeRabbit 线程 4 的问题不是「顺序不稳定」而已：没有 ORDER BY 时，命中超过
+    上限的那次查询截到哪 2000 行由扫描顺序决定，于是同一查询两次结果可能不同，
+    用户会看到「老文章一会儿搜得到一会儿搜不到」。定序之后截断集合固定，且产品上
+    取最新——这正是 search_grouped 会重排之外、候选层唯一影响用户的地方。
+
+    这里直接给 search_candidates 传 limit=600（接近默认 _CANDIDATE_LIMIT 的形态），
+    而不是 monkeypatch 那个常量：调用方本来就显式传 limit，改常量对这个用例无效。
+    """
+    conn = _conn()
+    for i in range(2500):
+        # published_at 与 i 严格同序：i 越大越新（用日期 + 秒两段拼，避免
+        # 取模导致日期回绕）。
+        day = i // 60
+        sec = i % 60
+        _add(conn, f"a{i:04d}", title="光伏补贴通知", published_at=f"2026-{1 + day // 28:02d}-{day % 28 + 1:02d} 00:00:{sec:02d}")
+
+    rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], limit=600)
+    assert len(rows) == 600
+    ids = [r["article_id"] for r in rows]
+    assert ids == sorted(ids, reverse=True), "候选集必须按最新优先返回"
+    assert ids[0] == "a2499"
+
+    again = [r["article_id"] for r in db.search_candidates(conn, terms=["光伏"], tag_ids=[], limit=600)]
+    assert again == ids, "同一查询两次必须截到同一集合"
+
+
+def test_search_candidates_order_uses_analyzed_at_when_published_missing() -> None:
+    """published_at 为空的行不能被排到最前或最后，要按 analyzed_at 参与定序。
+
+    老行可能没有 published_at（列表页没给日期）；定序表达式是
+    COALESCE(published_at, analyzed_at)，用它才不会把这些行挤成一堆。
+    """
+    conn = _conn()
+    _add(conn, "with_date", title="光伏补贴", published_at="2026-11-01 00:00:00")
+    _add(conn, "no_date", title="光伏补贴", published_at=None)  # type: ignore[arg-type]
+    conn.execute(
+        "UPDATE analyzed_articles SET analyzed_at = ? WHERE article_id = ?",
+        ("2026-11-05 00:00:00", "no_date"),
+    )
+    conn.commit()
+
+    rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], limit=10)
+    ids = [r["article_id"] for r in rows]
+    assert ids[0] == "no_date", ids
+
+
+def test_search_candidates_tie_break_is_article_id_desc() -> None:
+    """发布时间完全相同时，`article_id DESC` 兜底决定截断与返回顺序。
+
+    同秒发布的文章很常见（列表页只给到日期，多篇都是 00:00:00）。若排序键只写
+    `COALESCE(published_at, analyzed_at)` 而没有第二键，SQLite 对等值行的相对顺序
+    不保证稳定，截断边界上同样会出现「同一查询两次截到不同集合」。这里让 id 顺序
+    刻意与插入顺序相反，避免「碰巧按 rowid 返回」也算通过。
+    """
+    conn = _conn()
+    for aid in ("b3", "b1", "b2"):
+        _add(conn, aid, title="光伏补贴", published_at="2026-11-01 00:00:00")
+
+    rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], limit=2)
+    ids = [r["article_id"] for r in rows]
+    assert ids == ["b3", "b2"], ids
+
+    again = [r["article_id"] for r in db.search_candidates(conn, terms=["光伏"], tag_ids=[], limit=2)]
+    assert again == ids, "等值行也必须稳定截断"

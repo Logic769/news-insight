@@ -131,6 +131,7 @@ news-insight/
 | `create_app()` | `app/main.py` | 构建 FastAPI 应用、鉴权中间件与 `/v1` 路由 |
 | `resolve_query()` / `score_article()` | `app/search.py` | 把用户输入映射到闭集标签 + 字面词，并按「标签置信度 × 覆盖度 + 标题/正文命中」打分 |
 | `search_grouped()` | `app/db.py` | 检索入口：候选集 → 打分 → 按 5 大类分桶，类内降序，返回前端直接渲染的结构 |
+| `search_candidates()` | `app/db.py` | 候选集：`py_norm` 归一后的 `instr` 预筛，按「最新优先 + `article_id` 兜底」定序后 `LIMIT`，保证截断集合确定 |
 | `backfill_bodies()` | `app/backfill.py` | 给历史行补 `body`（逐篇取上游详情），可重复执行、单篇失败不中断 |
 | `save_analysis()` | `app/db.py` | 幂等替换单篇分析结果（SAVEPOINT + 可选批量提交） |
 | `prune_old_data()` | `app/db.py` | 子表 → 主表 → runs → 已完成 analysis_jobs 的硬删除 |
@@ -220,9 +221,9 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
   - 分数相同按 `published_at` 降序、再按 `article_id` 兜底，顺序不依赖 SQLite 返回顺序（只按时间兜底时，同分同时间的几篇会退回 rowid 顺序，查询计划一变就抖）；
   - 类顺序固定为 `categories.json` 的声明顺序，声明外的分类（如历史行 `category IS NULL`）排在最后；
   - 字面匹配用 `instr()` 而非 `LIKE`：关键词是用户自由输入，`%`/`_` 在 `LIKE` 里是通配符，搜「50%」会命中全库；`category=` 同 `/v1/articles` 一样不做闭集校验，未知类返回 200 空集；空串（`?category=`）在 `/v1/search` 里显式归一成「不传」（`cleaned or None`）—— 透传会让 SQL 变成 `COALESCE(category,'') IN ('')` 只命中历史 NULL 行，而过滤后剩下的空列表又会被 `search_candidates` 当成「筛完没结果」返回空集；`/v1/articles` 用的是 `if category is not None` 判空串语义，两者有意不同；
-  - 候选集上限 `_CANDIDATE_LIMIT = 2000`（`search_candidates` 的默认值），泛词会被截断，`total` 是**候选集内**命中的行数，不是全库真实命中数；`search_grouped` 用 `limit=_CANDIDATE_LIMIT + 1` 多取一行判断「是否还有更多」，`len(rows) > _CANDIDATE_LIMIT` 才记 WARNING（带 terms / tag_ids 数量）并截断 —— 直接比对 `== limit` 会在库里恰好 2000 行（其实全取完了）时误报；
+  - 候选集上限 `_CANDIDATE_LIMIT = 2000`（`search_candidates` 的默认值），泛词会被截断，`total` 是**候选集内**命中的行数，不是全库真实命中数；截断前按 `ORDER BY COALESCE(published_at, analyzed_at) DESC, article_id DESC` 取，**这个顺序不是展示顺序**（`search_grouped` 之后会重排），它只决定「哪些行活过截断」—— 没有 `ORDER BY` 时同一查询两次可能截到不同集合，用户会看到结果忽有忽无；`search_grouped` 用 `limit=_CANDIDATE_LIMIT + 1` 多取一行判断「是否还有更多」，`len(rows) > _CANDIDATE_LIMIT` 才记 WARNING（带 terms / tag_ids 数量）并截断 —— 直接比对 `== limit` 会在库里恰好 2000 行（其实全取完了）时误报；
   - SQL 预筛与内存打分跑**同一份归一代码**：`_ensure_norm_func()` 把 `search._norm` 注册成 SQL 函数 `py_norm`（`deterministic=True`，每次查询前注册，幂等），预筛写成 `instr(py_norm(a.title), ?) > 0`，与打分侧是同一个函数。**不能各写一套**：SQLite 的 `lower()` 只折 ASCII（`Ärger` 折完还是 `Ärger`），Python 的 `casefold()` 折成 `ärger`，两层不一致时「用户输入与标题字面完全一致」也会返回空集（200 + 空结果，不报错；真实触发词 ÖBB / Ärzte / Müller / École）。空白同理，搜「gpt 模型」而标题写「GPT模型」；
-  - 代价是每行每列每个形态一次 Python 回调，且**成本取决于是否「标题」命中**（本机 min-of-3，规模「候选集打满 2000 行 × 正文 6000 字」，不同机器差 2–3×）：标题命中预筛约 0.07s / 全链路约 0.8–1.1s（`OR` 首个条件为真，短路掉 body 的 6000 字归一）；**仅正文**命中约 0.68s / 约 1.3–1.7s（标题不含，必须算完 body 才为真，成本与不命中同档）；全不命中 1 形态约 0.66s / 约 1.1s、3 形态约 2.0s / ≥ 预筛（每行 3×2 列；只有 tags 也不命中时候选才为空、不打分）；`body IS NULL` 的历史行约 0.003s（回填前仍能按标题/标签命中）。**只有标题命中才便宜，而用户查的行业词/细分词大多只在正文出现——这是最常见路径，别按 0.07s 估**。纯 SQL `instr`（不命中全扫）约 0.04s，即 `py_norm` 带来一个数量级预筛开销，这是「两侧归一必须同源」的代价。全链路大头在逐行归一 + `score_article`（候选打满约 1s）。泛词会打满候选集，**超时按秒级设**（6000 字正文约 4s，2 万字正文 + 多形态可达 8s，建议 10s）；若将来候选集需放大到十万级，再考虑 FTS5 或物化归一列；
+  - 代价是每行每列每个形态一次 Python 回调，且**成本取决于是否「标题」命中**（本机 min-of-3，规模「候选集打满 2000 行 × 正文 6000 字」，不同机器差 2–3×）：标题命中预筛约 0.05s / 全链路约 0.5s（`OR` 首个条件为真，短路掉 body 的 6000 字归一）；**仅正文**命中约 0.55s / 约 2.0s（标题不含，必须算完 body 才为真，成本与不命中同档，且候选打满时每行都要打分）；全不命中约 0.52s / 约 0.5s（候选为空、不打分）；`body IS NULL` 的历史行约 0.003s（回填前仍能按标题/标签命中）。**只有标题命中才便宜，而用户查的行业词/细分词大多只在正文出现——这是最常见路径，别按 0.05s 估**。纯 SQL `instr`（不命中全扫）约 0.04s，即 `py_norm` 带来一个数量级预筛开销，这是「两侧归一必须同源」的代价。逐行归一 + `score_article` 是另一块大头（仅正文命中且候选打满时约 1.5s）。泛词会打满候选集，**超时按秒级设**（最坏约 2–3s，建议 10s）；若将来候选集需放大到十万级，再考虑 FTS5 或物化归一列；
   - `search.WS_CHARS` 覆盖 ASCII 控制空白、`\x85`、`\xa0`、`\u2000`–`\u200a`、`\u2028`、`\u2029`、`\u3000`（共 22 个）。从 Word / 网页复制的关键词常带 `\u2002`/`\u2003`/`\u2009`，漏一个就表现为「看起来一样的两个词搜不到」且不报错；
   - `q` 必须含至少 1 个非空白字符（`pattern=r"\S"`）：只靠 `min_length` 时 `q=""` 是 422 而 `q=" "` 会走到 200 空 groups，同一件事两种响应码；
 - **正文副本 `analyzed_articles.body`**：检索需要正文里有而标题里没有的词，因此正文随分析结果一起落库。写入用 `COALESCE(NULLIF(excluded.body, ''), body)` —— 只有本次真拿到文本时才覆盖，避免某次详情抖动把历史正文写成 `NULL` 让检索静默丢文章。历史行 `body IS NULL` 用 `python -m app backfill-bodies` 回填（只搬文本、不重跑模型、可重复执行、单篇失败不中断整批）；这使库体积约增加一倍多，且随 `RETENTION_DAYS` 一起被删除。
@@ -356,9 +357,11 @@ CREATE TABLE analysis_jobs (
 );
 ```
 
-索引：`idx_tags_tag(article_tags.tag)`、`idx_analysis_jobs_status(analysis_jobs.status, created_at)`、`idx_analyzed_published(analyzed_articles.published_at DESC)`、`idx_analyzed_category(analyzed_articles.category, published_at DESC)`、`idx_extractions_schema(extractions.schema_id, field)`。
+索引：`idx_tags_tag(article_tags.tag)`、`idx_analysis_jobs_status(analysis_jobs.status, created_at)`、`idx_analyzed_published(analyzed_articles.published_at DESC)`、`idx_analyzed_category(analyzed_articles.category, published_at DESC)`、`idx_analyzed_recency(analyzed_articles(COALESCE(published_at, analyzed_at) DESC, article_id DESC))`、`idx_extractions_schema(extractions.schema_id, field)`。
 
 `idx_analyzed_category` 建在 `_POST_MIGRATION_SQL` 而不是 `SCHEMA_SQL`：`executescript` 会先于补列执行，旧库那时还没有 `category` 列，索引语句会直接报错。
+
+`idx_analyzed_recency` 是**表达式索引**（SQLite ≥ 3.9，容器 python:3.12-slim 自带 ≥ 3.40），专门支撑 `search_candidates` 与回填候选集的 `ORDER BY COALESCE(published_at, analyzed_at) DESC, article_id DESC`。它的收益远大于「省掉一次排序」：没有索引时 SQLite 必须先算完全部命中行才能排序，于是每行的 `py_norm`（6000 字正文的归一）都会跑一遍，哪怕最后只留 `limit` 行；有索引后按索引顺序取满 `limit` 即停。实测 2 万行全命中、正文 6000 字、`limit=2000`（本机 min-of-2）：**标题命中 3.9s → 0.07s，仅正文命中 11.9s → 0.82s**。两者差一档，因为预筛的 `OR` 在标题命中后短路、根本不归一 6000 字正文——**用户查的行业词/细分词大多只在正文出现，别把 0.07s 当成常态成本**（与 §5 性能表同一条口径）。查询计划从 `SCAN a + TEMP B-TREE FOR ORDER BY` 变成 `SCAN a USING INDEX idx_analyzed_recency`。只测 `ORDER BY` 子句（不带 `py_norm`）会得到 0.01s → 0.002s，严重低估收益——那个计划本来就不用归一被丢弃的行。另注意用「命中数 ≤ limit」的数据测不出差异（那时两种写法都要全扫、都不截断）。
 
 ### 7.2 注意事项
 
@@ -390,7 +393,7 @@ docker compose run --rm insight python -m app <子命令> [args]
 | `analyze --limit 10 [--force] [--concurrency 100]` | 跑一批分析；结束后自动执行一次 prune（失败只记日志） |
 | `prune [--days 90] [--dry-run] [--vacuum]` | 删除超过保留期的分析结果；先 dry-run 看数量 |
 | `init` | 只建库建表 |
-| `backfill-bodies [--limit 500] [--batch 50]` | 给历史行补 `analyzed_articles.body`：逐篇调上游 detail 取 `raw_content or content`，只 UPDATE 正文列，不重跑模型、不改 `analyzed_at`；可重复执行（只挑 `body IS NULL OR body = ''`），单篇失败不中断整批，打印 `{"filled","failed","skipped","remaining"}` |
+| `backfill-bodies [--limit 500] [--batch 50]` | 给历史行补 `analyzed_articles.body`：逐篇调上游 detail 取 `raw_content or content`，只 UPDATE 正文列，不重跑模型、不改 `analyzed_at`；可重复执行（只挑 `body IS NULL OR body = ''`），单篇失败不中断整批，打印 `{"filled","failed","skipped","remaining"}`；`demo` 模式直接拒绝（不许碰网络）；候选与分批都按「最新优先 + `article_id` 兜底」取，因此死链不会永久占住小 `--limit` 窗口；每批先取回全部正文再开写事务，网络请求期间不持有未提交事务 |
 | `health` | 打印当前配置（llm_enabled / 数据源模式 / news_base_url / db 路径 / 保留天数） |
 
 示例：
@@ -443,7 +446,7 @@ docker compose run --rm insight python -m app prune --vacuum
 
 ## 10. 测试策略
 
-### 10.1 现有测试资产（`tests/`，15 个文件）
+### 10.1 现有测试资产（`tests/`，16 个文件）
 
 | 文件 | 覆盖 |
 | --- | --- |
@@ -459,11 +462,12 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_jobs_prune.py` | job 执行与结果、队列上限 429、锁占用快速失败、stale job 标记与复用、prune 各表 dry-run/真删、保留 0 天 |
 | `test_llm.py` | 429 重试成功、非对象 JSON 重试、401 不重试 |
 | `test_news_client.py` | `published_desc`、page_size 不超过上游 100、live 报错、auto 回退记录原因、分页、坏 `total_pages`、坏 `content_length`、详情异常不崩、4xx 不回退、去重、详情覆盖顺序 |
-| `test_search.py` | 检索层纯逻辑（`:memory:` 直插数据）：短语映射闭集标签、子片段权重低于整词、空查询、未知词回落字面检索、标签命中压过纯正文命中、分数有界 `[0,1]`、无信号被过滤、按类分组且类内降序、未知词空 groups、正文命中不跨类复制、`per_category` 截断但 `count` 报全量、`categories` 过滤、默认不返回 body 且按需返回、`matched_tags`/`terms` 可排障、非 ASCII 大小写（Ärger/ÖBB/MÜLLER）不敏感、`\u2003`/`\u2009`/`\u2028` 等窄空格被折掉、同一处文本只计一次（含重叠出现）、`matched_terms` 不含被长形态吃掉的形态、高频短词记账不退化成 O(n²)、候选集截断只在真丢行时告警 |
+| `test_search.py` | 检索层纯逻辑（`:memory:` 直插数据）：候选截断前按最新定序且保留最新 N 行、`published_at` 为空时按 `analyzed_at` 参与定序、短语映射闭集标签、子片段权重低于整词、空查询、未知词回落字面检索、标签命中压过纯正文命中、分数有界 `[0,1]`、无信号被过滤、按类分组且类内降序、未知词空 groups、正文命中不跨类复制、`per_category` 截断但 `count` 报全量、`categories` 过滤、默认不返回 body 且按需返回、`matched_tags`/`terms` 可排障、非 ASCII 大小写（Ärger/ÖBB/MÜLLER）不敏感、`\u2003`/`\u2009`/`\u2028` 等窄空格被折掉、同一处文本只计一次（含重叠出现）、`matched_terms` 不含被长形态吃掉的形态、高频短词记账不退化成 O(n²)、候选集截断只在真丢行时告警 |
 | `test_search_api.py` | `GET /v1/search` 的 HTTP 契约：未带 key 401、返回 groups、类顺序符合 `categories.json`、类内降序、未知词空 groups、`q` 为空 422、默认无 `body` 字段、`include_body=true` 时有 `body`、`category` 过滤生效 |
 | `test_yaml_lint.py` | 合法/重复键/非法 YAML、SKIP 集合与顶层目录语义、工作目录无关、非 UTF-8、仓库全部 YAML 通过 |
+| `test_backfill.py` | 回填正文：demo 模式拒绝访问网络、网络请求期间不持有未提交事务（读**主连接**的 `in_transaction`，不是新连接；必须 `batch>1` **且行数 > batch**，否则只覆盖到「单 chunk 边取边写」而漏掉「事务跨过下一批请求」）、`--limit 1` 下死链不钉死窗口（扫描预算与写入上限解耦）、`limit<0`/`batch<1` 在发请求前被拒绝（SQLite 把 `LIMIT -1` 当成不限）、候选截断前排序确定、已有正文的行不被覆盖 |
 
-基线：宿主机全量 `pytest` **186 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **198 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 
@@ -589,7 +593,7 @@ docker compose up -d --force-recreate && curl -f http://127.0.0.1:8020/health
 - `search.resolve_query(raw: str, tags: list[TagDef]) -> Query` / `search.score_article(query, *, title, body, tag_confidences) -> Relevance` / `search._masked_hits(text, terms) -> tuple[int, float, list[str]]`：纯函数，无 I/O，可直接单测。纯函数，行为细节（标记数组记账、重叠只计一次、`+1` 步进的用意）见 §5 排序契约中的命中计数条目，此处只固定契约：按 `terms` 顺序（`resolve_query` 已按权重降序输出）逐个计数，同一处文本只计一次；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；
 - `db._ensure_norm_func(conn)`：把 `search._norm` 注册为 SQL 函数 `py_norm`，预筛与打分共用同一份归一实现。新增涉及 `instr` 预筛的查询时必须先调用它，否则报 `no such function: py_norm`。权重常量在 `app/search.py` 顶部，改动须保持 `W_TAG + W_TITLE + W_BODY == 1.0`（否则 `score` 不再落在 `[0,1]`）并补用例；
 - `db.set_body(conn, *, article_id, body, commit=True)`：只 UPDATE `body` 一列，不碰 `analyzed_at` 与标签，供回填使用；正文写入走 `COALESCE(NULLIF(excluded.body, ''), body)`，本次没拿到就保留旧值；
-- `backfill_bodies(settings, *, limit=500, batch=50) -> dict`：给 `body IS NULL OR body = ''` 的历史行补正文，只搬文本不重跑模型；可重复执行，单篇失败不中断整批，返回 `{"filled", "failed", "skipped", "remaining"}`。
+- `backfill_bodies(settings, *, limit=500, batch=50) -> dict`：给 `body IS NULL OR body = ''` 的历史行补正文，只搬文本不重跑模型；可重复执行，单篇失败不中断整批，返回 `{"filled", "failed", "skipped", "remaining"}`。`limit` 是**写入上限**，扫描预算为 `limit * _SCAN_FACTOR`（`_SCAN_FACTOR = 5`），否则不可回填的行（死链、上游无正文）会永久占满小 `--limit` 的窗口。这是**有界**的权衡：连续 `5×limit` 篇不可回填时仍会退回每轮重试同一批（实测 `--limit 1` 下 4 篇连续死链可达更早行、5 篇不可达），此时应调大 `--limit` 或先处理死链；彻底解决需要跨进程游标/失败清单，本命令刻意不做（避免库外隐式状态）。`remaining` 含这类行，不一定归零。`demo` 模式直接抛 `RuntimeError`（`NewsClient.get_article` 只有 live 路径，会违反 settings 的「demo 不碰网络」承诺）。参数非法抛 `BackfillUsageError`（`ValueError` 子类，CLI 只捕它 + `RuntimeError` 并返回 2；不捕裸 `ValueError`，否则内部意外 bug 会被静默成退出码 2）：`limit < 0`（SQLite 把 `LIMIT -1` 当不限，会回填整库）、`batch < 1`（`range(0, n, 0)` 中途抛错），都在 `mkdir`/`init_db` 与任何网络请求之前拒绝；`limit=0` 合法，等于空跑。
 
 ### 12.5 隐私与安全红线
 

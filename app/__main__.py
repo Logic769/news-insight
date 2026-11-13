@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 
 from app import db
-from app.backfill import backfill_bodies
+from app.backfill import BackfillUsageError, backfill_bodies
 from app.pipeline import analyze_batch
 from app.prune import prune
 from app.settings import load_settings
@@ -54,7 +55,13 @@ def main() -> int:
         }, ensure_ascii=False))
         return 0
     if args.cmd == "backfill-bodies":
-        result = backfill_bodies(settings, limit=args.limit, batch=args.batch)
+        try:
+            result = backfill_bodies(settings, limit=args.limit, batch=args.batch)
+        except (RuntimeError, BackfillUsageError) as exc:
+            # demo 模式拒绝回填 / 参数不合法：都是使用问题，不是崩溃，别让用户看 traceback。
+            # 只捕 BackfillUsageError：裸 ValueError 会把内部意外 bug 也静默成退出码 2。
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 2
         print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.cmd == "prune":
