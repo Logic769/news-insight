@@ -260,12 +260,24 @@ python -m app backfill-bodies --limit 500 --batch 50
 - 卡在扫描预算上：`--limit 1` 时若前 5 篇都不可回填，每轮都在重试这 5 篇，`remaining`
   同样稳定，但**后面仍有可回填的文章**，此时停下来等于漏回填。
 
-两者的区分办法：调大 `--limit` 再跑一次，看 `filled` 是否重新变大。实测（5 篇死链 + 1 篇可回填）：
-`--limit 1` 时 `filled=0`、`remaining=6`、只探了 5 篇；改成 `--limit 50` 后 `filled=1`、`remaining=5`。
-而在「真的只剩不可回填」的场景（3 篇死链、没有别的行）下，`--limit 1` 与 `--limit 50` 都是
-`filled=1`、`remaining=3`，调大不再有变化。**`filled` 变大 = 之前被预算卡住；`filled` 仍为 0 而
-`remaining` 不变 = 真的回填完了。** 也可以直接看日志里「已回填 X/Y（候选 Z）」的 `Z`（= `5×limit`）：
-`Z` 小于 `remaining` 就说明这一轮还没扫到全部缺正文的行。
+区分办法要看**是否扫描覆盖了全部剩余候选**，而不是只看 `filled` 有没有变。日志「已回填 X/Y（候选 Z）」
+里的 `Z = 5×limit` 就是本轮实际扫过的候选数。判据：
+
+- `Z < remaining`：**这一轮根本没扫完**，`filled=0` 什么都证明不了，必须调大 `--limit`（`Z` 随之放大）
+  直到 `Z ≥ remaining` 再判断；
+- `Z ≥ remaining` 且 `filled=0`：才说明这一轮确实扫过了全部缺正文的行、且都没能取到正文，可以停。
+
+只看「调大 `--limit` 后 `filled` 是否为 0」会误判。实测（死链在前、唯一可回填的行在最旧处）：
+
+| 场景 | `--limit 1`（Z=5） | `--limit 50`（Z=250） |
+| --- | --- | --- |
+| 5 篇死链 + 1 篇可回填 | `filled=0` `remaining=6` | `filled=1` `remaining=5` |
+| 250 篇死链 + 1 篇可回填 | `filled=0` `remaining=251` | **`filled=0` `remaining=251`（Z=250 < 251，仍没扫到）** |
+| 3 篇死链、没有别的行 | `filled=1` `remaining=3` | `filled=1` `remaining=3` |
+
+第二行就是反例：把 `--limit` 从 1 调到 50 后 `filled` 依然为 0，但回填并没有完成——预算 250 恰好被
+250 篇死链吃满，最旧那篇可回填的行仍没进入候选集。所以 `filled=0` 只有在 `Z ≥ remaining` 时才可信。
+这个上限是结构性的（预算有限），不想被卡住就继续调大 `--limit`，或先手工清掉这批死链。
 
 **已知取舍**：
 
