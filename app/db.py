@@ -122,6 +122,9 @@ CREATE INDEX IF NOT EXISTS idx_analyzed_recency_utc ON analyzed_articles(COALESC
 -- (source, 时间) 组合索引：来源筛选和「发布单位 + 时间范围」同时出现时，
 -- 单列 source 索引仍要把命中行全取出来再排序。
 CREATE INDEX IF NOT EXISTS idx_analyzed_source_time ON analyzed_articles(source, COALESCE(NULLIF(published_at_utc, ''), published_at) DESC);
+-- 日期筛选按展示用的墙钟日（_DAY_EXPR）比较，与上面的真实时刻不是同一个表达式，
+-- 需要单独的索引，否则带日期过滤的分页要把整表取出来再过筛。
+CREATE INDEX IF NOT EXISTS idx_analyzed_day ON analyzed_articles(substr(COALESCE(NULLIF(published_at, ''), NULLIF(published_at_utc, '')), 1, 10) DESC);
 """
 
 # init_db 只有 CREATE TABLE IF NOT EXISTS，升级前建好的库不会自动长出新列。
@@ -451,32 +454,50 @@ def mark_stale_jobs_failed(conn: sqlite3.Connection) -> int:
     return int(cur.rowcount)
 
 
-# 列表与检索共用的时间过滤：按「真实时刻」比较，优先 published_at_utc，
-# 历史行 utc 缺失时回退站点墙钟 published_at。两列都空的行无法判断是否落在区间内，
-# 只能排除——这是静默丢行，所以调用方会把这类行的条数单独报出来（undated_excluded），
-# 而不是让用户以为「这段时间没有数据」。
+# 排序与聚合共用的「真实时刻」：优先 published_at_utc，历史行 utc 缺失时回退
+# 站点墙钟 published_at。混时区站点里墙钟最大的那篇不一定最新，按时间排必须用它。
 # 注意这个表达式必须与 _POST_MIGRATION_SQL 里建索引时写的**逐字一致**：SQLite 的
-# 表达式索引按语法文本匹配，差一个别名前缀或一处 NULLIF 都会退化成全表扫描。
-# 所以它被抽成常量，过滤（_time_clauses）、排序（_LIST_ORDERS / cutoff_order）、
-# 聚合（source_stats）全部引用同一份文本，改一处就必须重建索引。
+# 表达式索引按语法文本匹配，差一处 NULLIF 都会退化成全表扫描。所以它被抽成常量，
+# 排序（_LIST_ORDERS / cutoff_order）和聚合（source_stats）都引用同一份文本。
+# 日期**过滤**用的是另一套口径（_DAY_EXPR，见下），两者不可互换。
 _TIME_EXPR = "COALESCE(NULLIF(published_at_utc, ''), published_at)"
+
+
+# 日期筛选按「卡片上显示的那一天」判定，也就是站点本地墙钟日期。
+#
+# 为什么不用真实时刻（published_at_utc）做区间：两者在生产库上差得很远——472 行里
+# 137 行（29%）墙钟日与 UTC 日不同日。按 UTC 日筛 11-01，会返回卡片上标着
+# 「2026-11-03 00:00」的条目（东八区 11-03 00:00 == UTC 11-02 16:00），
+# 用户看到的第一反应是「筛错了」。规范书要求的是「按发布时间范围筛选」，
+# 用户判定的依据只能是界面上那个日期，所以区间必须跟展示同源。
+#
+# 代价：跨时区时「同一时刻」的两篇可能被分到不同天。当前 6 个源全是 Asia/Shanghai，
+# 且 published_at 自带时区偏移，日期的本地性没有歧义。若将来接入多时区源并需要
+# 「同一时刻」的严格全集，应改成给每次查询传一个展示时区、把边界换算成 UTC 再比，
+# 而不是退回现在的写法。
+# 墙钟优先、utc 兜底：与 _TIME_EXPR 的优先级相反，但这里要的是「界面上显示的那一天」。
+# 两列都空的行无法判定，会被排除并计入 undated_excluded。
+_DAY_EXPR = "substr(COALESCE(NULLIF(published_at, ''), NULLIF(published_at_utc, '')), 1, 10)"
 
 
 def _time_clauses(
     published_from: str | None,
     published_to: str | None,
 ) -> tuple[list[str], list[Any]]:
-    """[from, to) 半开区间，参数已是 'YYYY-MM-DD HH:MM:SS' 字符串。"""
+    """[from, to) 半开区间，按 published_at 的日期前缀比较（纯日期字符串）。
+
+    参数允许是 'YYYY-MM-DD' 或 'YYYY-MM-DD HH:MM:SS'，取前 10 位。
+    """
     clauses: list[str] = []
     args: list[Any] = []
     if published_from:
-        clauses.append(f"{_TIME_EXPR} >= ?")
-        args.append(published_from)
+        clauses.append(f"{_DAY_EXPR} >= ?")
+        args.append(published_from[:10])
     if published_to:
-        # 用 < 而不是 <=：区间由调用方把日期转成「次日 00:00:00」，
-        # 这样 23:59:59 与带上毫秒的时间戳都不会被漏掉。
-        clauses.append(f"{_TIME_EXPR} < ?")
-        args.append(published_to)
+        # 用 < 而不是 <=：区间由调用方把日期转成「次日」，这样当天 23:59:59
+        # 与带毫秒的时间戳都不会被漏掉。
+        clauses.append(f"{_DAY_EXPR} < ?")
+        args.append(published_to[:10])
     return clauses, args
 
 
@@ -485,6 +506,9 @@ _DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 def normalize_day(value: str | None) -> str | None:
     """把 'YYYY-MM-DD' 归一成 'YYYY-MM-DD 00:00:00'；空串/None 视为未传。
+
+    保留时分秒是为了让调用方的区间语义（[from, to) 的 to 是「次日零点」）读起来
+    仍是时间戳；_time_clauses 只取前 10 位做日期比较。
 
     只接受纯日期：检索条件里的日期来自日期选择器，带时分秒的输入没有明确语义
     （是区间起点还是整点截止？），与其猜不如在参数校验阶段就拒掉。
@@ -597,8 +621,9 @@ def list_analyzed(
         # 不数出来的话用户看到的 total 会比预期少一截且无解释。
         undated_clauses = [
             *clauses,
-            "(a.published_at_utc IS NULL OR a.published_at_utc = '')",
+            # 两个时间列都空才叫「无日期」：只要有一列，_DAY_EXPR 就能给出日期。
             "(a.published_at IS NULL OR a.published_at = '')",
+            "(a.published_at_utc IS NULL OR a.published_at_utc = '')",
         ]
         undated = conn.execute(
             "SELECT COUNT(*) FROM analyzed_articles a WHERE " + " AND ".join(undated_clauses),

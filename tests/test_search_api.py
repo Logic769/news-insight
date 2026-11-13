@@ -283,3 +283,49 @@ def test_search_unknown_source_returns_empty_not_everything(client):
     data = resp.json()["data"]
     assert data["total"] == 0
     assert data["groups"] == []
+
+
+def test_articles_source_filter_accepts_comma_separated(client):
+    """?source=a,b 是前端最常见的多选写法，必须拆开而不是当成一个站点名。
+
+    原先整串被当成站点名 "a,b"，IN (...) 永远不命中，静默返回 0 条 —— 用户会以为
+    这个组合下没有数据。
+    """
+    resp = client.get(
+        "/v1/articles",
+        params={"source": "prov-sci-tech,other-site", "limit": 5},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()["data"]
+    assert body, "至少要有 prov-sci-tech 的数据"
+    assert {i["source"] for i in body} == {"prov-sci-tech"}
+
+
+def test_articles_source_filter_empty_string_is_treated_as_absent(client):
+    """?source=（空串）是「清空多选」残留的空参数，一律当没传。
+
+    若当成「筛一个不存在的站点」返回空集，用户清空站点筛选后看到的是「无结果」，
+    而不是全部数据 —— 会以为筛选坏了。
+    """
+    base = client.get("/v1/articles", params={"limit": 1}, headers=HEADERS).json()
+    blank = client.get("/v1/articles", params={"source": ""}, headers=HEADERS)
+    assert blank.status_code == 200
+    assert blank.json()["meta"]["total"] == base["meta"]["total"] > 0
+
+
+def test_articles_without_source_filter_is_not_empty(client):
+    resp = client.get("/v1/articles", params={"limit": 1}, headers=HEADERS)
+    assert resp.json()["meta"]["total"] > 0
+
+
+def test_search_source_filter_accepts_comma_separated(client):
+    resp = client.get(
+        "/v1/search",
+        params={"q": "申报", "source": "prov-sci-tech,other-site"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 200
+    items = _all_items(resp.json()["data"])
+    assert items
+    assert {i["source"] for i in items} == {"prov-sci-tech"}

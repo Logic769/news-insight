@@ -976,10 +976,13 @@ def test_list_and_search_agree_on_time_order_when_timezones_mix() -> None:
     assert searched == ["B", "A"], searched
 
 
-def test_time_filter_window_matches_displayed_real_instant() -> None:
-    """筛 [2026-03-01, 2026-03-02) 时，返回项的真实时刻必须真的落在这个区间内。
+def test_time_filter_window_matches_displayed_wall_clock_day() -> None:
+    """日期筛选按「界面上显示的那一天」判定，不是按 UTC 日。
 
-    早先过滤按真实时刻、排序与展示按墙钟：筛 03-01 会返回一条标着 03-02 的记录。
+    A 的墙钟是 2026-03-02 00:00（东八区）、真实时刻是 2026-03-01 16:00Z。
+    筛 03-01 时：按 UTC 日 A 会被选中，但卡片上写着 03-02，用户会以为筛错了；
+    按墙钟日 A 落在 03-02，筛 03-01 只返回 B。生产库 472 行里 137 行属于这种
+    「墙钟日 != UTC 日」的情形，所以这是主路径而不是边角。
     """
     conn = _conn()
     _mixed_tz_rows(conn)
@@ -992,11 +995,20 @@ def test_time_filter_window_matches_displayed_real_instant() -> None:
         published_from="2026-03-01 00:00:00",
         published_to="2026-03-02 00:00:00",
     )
-    assert total == 2
-    for row in rows:
-        # 用 _TIME_EXPR 的口径复算，两列都空的行已在 SQL 阶段被排除
-        stamp = row["published_at_utc"] or row["published_at"]
-        assert "2026-03-01 00:00:00" <= stamp < "2026-03-02 00:00:00", (row["article_id"], stamp)
+    assert total == 1
+    assert [r["article_id"] for r in rows] == ["B"]
+
+    # 反过来筛 03-02 必须能取到 A，且只有 A
+    rows, total, _ = db.list_analyzed(
+        conn,
+        tag=None,
+        limit=10,
+        offset=0,
+        published_from="2026-03-02 00:00:00",
+        published_to="2026-03-03 00:00:00",
+    )
+    assert total == 1
+    assert [r["article_id"] for r in rows] == ["A"]
 
 
 def test_search_candidates_ascending_keeps_oldest_by_real_instant() -> None:

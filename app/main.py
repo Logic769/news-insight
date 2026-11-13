@@ -29,6 +29,31 @@ LOG = logging.getLogger("news_insight.main")
 _OPEN_PATHS = ("/health", "/docs", "/redoc", "/openapi.json")
 
 
+def _split_sources(values: list[str] | None) -> list[str] | None:
+    """把 ?source= 归一成「去重、去空、支持逗号分隔」的站点名列表。
+
+    - ?source=a,b 原先整串被当成一个叫 "a,b" 的站点名，IN (...) 永不命中，
+      静默返回 0 条。前端把多选值 join 起来传是很自然的写法，必须拆开。
+    - ?source=（空串）是「清空多选」残留的空参数，一律当没传：否则用户清空筛选后
+      看到的是「无结果」而不是全部数据。
+    - 空片段（"a,,b"）同样忽略，与前者同一套规则：空值 = 不参与筛选。
+
+    全部片段都为空时返回 None（不筛）。这与库层 sources=[]（筛完什么都不剩，返回
+    空集）是两种语义：[] 只能由代码显式传入，HTTP 层永远不会产生它。
+    """
+    if values is None:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for piece in raw.split(","):
+            name = piece.strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out or None
+
+
 class AnalyzeJobRequest(BaseModel):
     type: Literal["analyze"] = "analyze"
     limit: int = Field(default=100, ge=1, le=10000)
@@ -229,16 +254,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if sort not in db.LIST_SORTS:
             raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
-        # 空串按「没传」处理，与 /v1/search 的 category 口径保持一致：?source=
-        # 若被当成「筛一个空站点名」会静默返回空集。
-        sources = [x.strip() for x in (source or []) if x.strip()]
         conn = connect(s)
         try:
             rows, total, undated = db.list_analyzed(
                 conn,
                 tag=tag,
                 category=category,
-                sources=sources or None,
+                sources=_split_sources(source),
                 published_from=since,
                 published_to=until,
                 sort=sort,
@@ -294,7 +316,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             until = db.normalize_day_end(published_to)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        sources = [x.strip() for x in (source or []) if x.strip()]
+        sources = _split_sources(source)
         _, tags = load_vocab(s.vocab_dir)
         _, categories = load_categories(s.vocab_dir)
         conn = connect(s)
@@ -310,9 +332,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # 可能变成空列表，而 search_candidates 把空列表当作「筛选后无结果」，
                 # 所以这里要显式转成 None（不传），否则 ?category= 反而返回空集。
                 categories=cleaned or None,
-                # 空列表在 search_candidates 里是「筛完什么都不剩」，与不传
-                # （None）不是一回事，所以这里同样显式转 None。
-                sources=sources or None,
+                sources=sources,
                 published_from=since,
                 published_to=until,
                 per_category=per_category,
