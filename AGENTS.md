@@ -86,6 +86,7 @@ news-insight/
 │   ├── tagging.py             # 一级分类（单选）+ 类内闭集多标签打标（LLM + 规则降级）
 │   ├── extraction.py          # schema 驱动事实抽取（日期归一 + 原文定位校验）
 │   ├── checklist.py           # 申报准备清单（派生视图，LLM + 规则降级）
+│   ├── checklist_service.py   # 清单输入适配与生成服务（API 与 pipeline 共用）
 │   ├── pipeline.py            # 单批次编排：拉取 → 并发分析 → 主线程批量落库
 │   ├── jobs.py                # 进程内异步作业 JobManager + ANALYZE_LOCK
 │   ├── prune.py               # 保留期清理（默认 90 天）
@@ -125,6 +126,7 @@ news-insight/
 | `tag_article()` | `app/tagging.py` | 返回 `(hits, engine)`；有 LLM 走模型，失败或无凭证降级规则引擎 |
 | `load_schemas()` / `extract_article()` | `app/extraction.py` | 按 `trigger_tags` 路由 schema；日期归一与原文定位校验 |
 | `build_checklist()` | `app/checklist.py` | 由已抽取事实生成准备清单；LLM 失败降级规则引擎 |
+| `checklist_input_from_detail()` / `build_for_input()` | `app/checklist_service.py` | 从文章详情构造清单输入（要求项目申报标签、抽取块与正文）；API 与 pipeline 共用的生成入口 |
 | `analyze_batch()` | `app/pipeline.py` | 单批次全流程编排，返回本次统计 |
 | `JobManager` | `app/jobs.py` | 异步作业提交/执行/状态落库；单 worker 串行 |
 | `prune()` | `app/prune.py` | 删除超过保留期的分析结果，可选 VACUUM |
@@ -202,6 +204,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
+| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable` |
 | GET | `/v1/schemas` | 已注册的抽取 schema 列表 |
 | GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询 |
 | GET | `/v1/runs` | 运行记录（模式、扫描/分析/跳过/错误数） |

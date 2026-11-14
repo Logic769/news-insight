@@ -60,6 +60,47 @@ def test_checklist_endpoint(client):
     assert missing.json()["error"]["code"] == "article_not_found"
 
 
+def test_checklist_generation_is_idempotent_and_force_regenerates(client):
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    first = client.get("/v1/articles/a1f0c3e2b7d94a51/checklist", headers=headers)
+    assert first.status_code == 200
+    first_data = first.json()["data"]
+
+    # 默认幂等：已有清单直接复用，不重新生成
+    reused = client.post("/v1/articles/a1f0c3e2b7d94a51/checklist", headers=headers)
+    assert reused.status_code == 200
+    assert reused.json()["data"]["generated_at"] == first_data["generated_at"]
+    assert reused.json()["data"]["items"] == first_data["items"]
+
+    # force=true 才重新生成，并覆盖 generated_at
+    time.sleep(1.05)
+    regenerated = client.post(
+        "/v1/articles/a1f0c3e2b7d94a51/checklist",
+        json={"force": True},
+        headers=headers,
+    )
+    assert regenerated.status_code == 200
+    regenerated_data = regenerated.json()["data"]
+    assert regenerated_data["generated_at"] != first_data["generated_at"]
+    assert regenerated_data["engine"] == "rules"
+    assert any("2026-04-20" in item["text"] for item in regenerated_data["items"])
+
+
+def test_checklist_generation_rejects_inapplicable_and_missing_articles(client):
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    not_applicable = client.post("/v1/articles/c3a2e5f4d9b06c73/checklist", headers=headers)
+    assert not_applicable.status_code == 409
+    assert not_applicable.json()["error"]["code"] == "checklist_not_applicable"
+
+    missing = client.post("/v1/articles/notexist/checklist", headers=headers)
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "article_not_found"
+
+
 def test_categories_listing_and_filter(client):
     """/v1/categories 要把 6 个大类连同一句中文名一起返回，且统计要能对上过滤结果。"""
     headers = {"X-API-Key": "secret"}

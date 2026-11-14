@@ -8,8 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
-from app import db
-from app.checklist import build_checklist, to_dicts
+from app import checklist_service, db
 from app.extraction import extract_article, load_schemas
 from app.llm import LLMClient
 from app.news_client import NewsClient, UpstreamError
@@ -28,22 +27,12 @@ from app.tagging import (
 LOG = logging.getLogger("news_insight.pipeline")
 
 
-def _field_payload(fields) -> tuple[dict, dict, dict]:
-    """Split FieldValue objects into value/raw_text/verified maps for the checklist."""
-    values = {f.name: f.value for f in fields}
-    raw_texts = {f.name: f.raw_text for f in fields if f.raw_text}
-    verified = {f.name: f.verified for f in fields}
-    return values, raw_texts, verified
-
-
 @dataclass
 class _ChecklistRegen:
     """A skipped article whose derived checklist is missing and can be rebuilt."""
 
     article: Any
-    fields: dict
-    raw_texts: dict
-    verified: dict
+    source: checklist_service.ChecklistInput
 
 
 def _checklist_regen_source(conn, art) -> _ChecklistRegen | None:
@@ -51,33 +40,17 @@ def _checklist_regen_source(conn, art) -> _ChecklistRegen | None:
     detail = db.get_article(conn, art.id)
     if not detail:
         return None
-    if "project_application" not in {t["tag"] for t in detail.get("tags", [])}:
-        return None
     if db.get_checklist(conn, art.id) is not None:
         return None
-    block = detail.get("extractions", {}).get("project_application") or {}
-    if not block or not art.body.strip():
+    source = checklist_service.checklist_input_from_detail(detail)
+    if source is None:
         return None
-    return _ChecklistRegen(
-        article=art,
-        fields={name: info["value"] for name, info in block.items()},
-        raw_texts={name: info["raw_text"] for name, info in block.items() if info.get("raw_text")},
-        verified={name: info["verified"] for name, info in block.items()},
-    )
+    return _ChecklistRegen(article=art, source=source)
 
 
 def _build_missing_checklist(settings: Settings, llm: LLMClient, regen: _ChecklistRegen):
     """LLM-only worker body; persistence stays on the main thread."""
-    checklist = build_checklist(
-        llm,
-        regen.article.title,
-        regen.article.body,
-        regen.fields,
-        raw_texts=regen.raw_texts,
-        verified=regen.verified,
-        body_chars=settings.extract_body_chars,
-    )
-    return regen.article.id, checklist
+    return regen.article.id, checklist_service.build_for_input(settings, regen.source, llm=llm)
 
 
 @dataclass
@@ -146,17 +119,20 @@ def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art, categor
         )
         if app_result is not None:
             try:
-                fields, raw_texts, verified = _field_payload(app_result.fields)
-                checklist = build_checklist(
-                    llm,
-                    art.title,
-                    art.body,
-                    fields,
-                    raw_texts=raw_texts,
-                    verified=verified,
-                    body_chars=settings.extract_body_chars,
+                fields, raw_texts, verified = checklist_service.field_payload(app_result.fields)
+                checklist = checklist_service.build_for_input(
+                    settings,
+                    checklist_service.ChecklistInput(
+                        article_id=art.id,
+                        title=art.title,
+                        body=art.body,
+                        fields=fields,
+                        raw_texts=raw_texts,
+                        verified=verified,
+                    ),
+                    llm=llm,
                 )
-                result.checklist = (checklist.engine, to_dicts(checklist.items))
+                result.checklist = (checklist.engine, checklist_service.items_payload(checklist))
             except Exception:  # 清单失败不能把整篇标记为错误
                 LOG.exception("生成申报清单失败 %s", art.id)
     except Exception as exc:  # one bad article must not sink the batch
@@ -306,7 +282,7 @@ def analyze_batch(
                         conn,
                         article_id=article_id,
                         engine=checklist.engine,
-                        items=to_dicts(checklist.items),
+                        items=checklist_service.items_payload(checklist),
                         commit=False,
                     )
                     LOG.info("补生成缺失清单 %s", article_id)

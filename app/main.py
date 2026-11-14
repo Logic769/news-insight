@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import __version__, db
+from app import __version__, checklist_service, db
 from app.extraction import load_schemas
 from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull
 from app.pipeline import analyze_batch, connect
@@ -64,6 +64,24 @@ class AnalyzeJobRequest(BaseModel):
     limit: int = Field(default=100, ge=1, le=10000)
     force: bool = False
     concurrency: int | None = Field(default=None, ge=1, le=200)
+
+
+def _checklist_data(row: dict, checklist: dict) -> dict:
+    """The single wire shape shared by GET and POST /checklist."""
+    return {
+        "data": {
+            "article_id": row["article_id"],
+            "title": row["title"],
+            "url": row["url"],
+            "engine": checklist["engine"],
+            "generated_at": checklist["generated_at"],
+            "items": checklist["items"],
+        }
+    }
+
+
+class ChecklistGenerateRequest(BaseModel):
+    force: bool = False
 
 
 @asynccontextmanager
@@ -392,16 +410,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     }
                 },
             )
-        return {
-            "data": {
-                "article_id": article_id,
-                "title": row["title"],
-                "url": row["url"],
-                "engine": checklist["engine"],
-                "generated_at": checklist["generated_at"],
-                "items": checklist["items"],
-            }
-        }
+        return _checklist_data(row, checklist)
+
+    @app.post("/v1/articles/{article_id}/checklist")
+    def generate_article_checklist(article_id: str, payload: ChecklistGenerateRequest | None = None):
+        """按需生成或重新生成申报准备清单。
+
+        默认复用已有清单（幂等）；只有 force=true 才重新调用生成器。生成失败或
+        文章不适用时返回可解释错误，不把「没有清单」伪装成 404 空结果。
+        """
+        s: Settings = app.state.settings
+        force = bool(payload and payload.force)
+        conn = connect(s)
+        try:
+            row = db.get_article(conn, article_id)
+            existing = None if force else db.get_checklist(conn, article_id)
+        finally:
+            conn.close()
+        if row is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "article_not_found",
+                        "status": 404,
+                        "message": f"未找到已分析文章: {article_id}",
+                    }
+                },
+            )
+        if existing is not None:
+            return _checklist_data(row, existing)
+        source = checklist_service.checklist_input_from_detail(row)
+        if source is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "checklist_not_applicable",
+                        "status": 409,
+                        "message": "该文章不是项目申报类，或缺少可用的申报要素/正文，无法生成清单",
+                    }
+                },
+            )
+        result = checklist_service.build_for_input(s, source)
+        items = checklist_service.items_payload(result)
+        conn = connect(s)
+        try:
+            db.save_checklist(conn, article_id=article_id, engine=result.engine, items=items)
+            checklist = db.get_checklist(conn, article_id)
+        finally:
+            conn.close()
+        if checklist is None:  # pragma: no cover - save_checklist 成功时不会发生
+            raise HTTPException(status_code=500, detail="清单已生成但读取失败")
+        return _checklist_data(row, checklist)
 
     @app.get("/v1/schemas")
     def schemas() -> dict:
