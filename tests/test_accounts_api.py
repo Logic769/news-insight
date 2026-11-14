@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app import accounts, auth, db
 from app.main import create_app
+from app.news_client import UpstreamError
 from app.settings import load_settings
 
 API_KEY = {"X-API-Key": "secret"}
@@ -230,17 +231,46 @@ def test_admin_cannot_disable_or_demote_self(client):
     assert client.get("/v1/auth/me", headers=headers).json()["data"]["role"] == "admin"
 
 
-def test_admin_sites_stats_and_operation_logs(client):
+def test_admin_sites_stats_and_operation_logs(client, monkeypatch):
     _create_user(client, "root", role="admin")
     headers = _auth(_token(client, "root"))
+
+    # 管理台站点配置现在代理到 crawler 的 sources.local.json；单测不启动第二个
+    # 服务，用内存实现替换客户端，只验证鉴权/审计/状态码与路径参数契约。
+    store: dict[str, dict] = {}
+
+    def fake_list(self):
+        return list(store.values())
+
+    def fake_create(self, payload):
+        row = dict(payload)
+        row.setdefault("has_api", False)
+        store[row["name"]] = row
+        return row
+
+    def fake_update(self, name, payload):
+        if name not in store:
+            return None
+        store[name].update(payload)
+        return store[name]
+
+    def fake_delete(self, name):
+        if name not in store:
+            raise UpstreamError("站点不存在", status_code=404, fallbackable=False)
+        store.pop(name)
+
+    monkeypatch.setattr("app.main.NewsClient.list_sites", fake_list)
+    monkeypatch.setattr("app.main.NewsClient.create_site", fake_create)
+    monkeypatch.setattr("app.main.NewsClient.update_site", fake_update)
+    monkeypatch.setattr("app.main.NewsClient.delete_site", fake_delete)
 
     site = client.post(
         "/v1/admin/sites",
         json={"name": "示例站", "list_url": "https://example.com/news", "region": "上海"},
         headers=headers,
     )
-    assert site.status_code == 200, site.text
-    site_id = site.json()["data"]["id"]
+    assert site.status_code == 201, site.text
+    site_id = site.json()["data"]["name"]
     assert client.get("/v1/admin/sites", headers=headers).json()["meta"]["total"] == 1
 
     updated = client.patch(
@@ -264,6 +294,41 @@ def test_admin_sites_stats_and_operation_logs(client):
     actions = [row["action"] for row in logs.json()["data"]]
     assert "admin.user_create" not in actions  # 本用例没建用户
     assert "admin.site_create" in actions
+
+
+def test_admin_stats_merges_cli_runs_and_counts_errors(client):
+    """管理台成功率必须同时反映 API 作业与 CLI 分析运行，否则线上 CLI 跑多少次都显示 0。"""
+    _create_user(client, "root", role="admin")
+    headers = _auth(_token(client, "root"))
+
+    before = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]["jobs"]
+    settings = client.app.state.settings
+    conn = db.connect(settings.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
+            " VALUES (?, ?, 'live', 10, 9, 1, 0)",
+            ("2026-11-14T01:00:00Z", "2026-11-14T01:01:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
+            " VALUES (?, ?, 'live', 10, 0, 0, 3)",
+            ("2026-11-14T02:00:00Z", "2026-11-14T02:01:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO runs (started_at, mode, scanned, analyzed, skipped, errors)"
+            " VALUES (?, 'live', 10, 0, 0, 0)",
+            ("2026-11-14T03:00:00Z",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    after = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]
+    assert after["jobs"]["succeeded"] == before.get("succeeded", 0) + 1
+    assert after["jobs"]["failed"] == before.get("failed", 0) + 1
+    finished = after["jobs"]["succeeded"] + after["jobs"]["failed"]
+    assert after["success_rate"] == round(after["jobs"]["succeeded"] * 100.0 / finished, 1)
 
 
 def test_notifications_are_isolated_per_user(client):

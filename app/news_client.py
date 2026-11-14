@@ -21,6 +21,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -222,6 +223,57 @@ class NewsClient:
         if not isinstance(detail, dict):
             raise UpstreamError(f"文章详情 {article_id} 返回格式不正确")
         return detail
+
+    # ---------------------------------------------------------- admin sites
+    def _admin_call(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> Any:
+        url = f"{self.settings.news_base_url}{path}"
+        try:
+            resp = self._client().request(
+                method, url, headers=self._headers(), json=payload
+            )
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"无法连接新闻 API {url}: {exc}") from exc
+        if resp.status_code == 404:
+            raise UpstreamError("站点不存在", status_code=404, fallbackable=False)
+        if resp.status_code >= 400:
+            detail = resp.text[:300]
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and body.get("detail"):
+                    detail = str(body["detail"])
+            except ValueError:
+                pass
+            raise UpstreamError(
+                f"新闻 API 返回 {resp.status_code}: {detail}",
+                status_code=resp.status_code,
+                fallbackable=False,
+            )
+        if resp.status_code == 204 or not resp.content:
+            return None
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise UpstreamError(f"新闻 API 返回非 JSON: {exc}") from exc
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return body
+
+    def list_sites(self) -> list[dict[str, Any]]:
+        data = self._admin_call("GET", "/v1/admin/sites")
+        return data if isinstance(data, list) else []
+
+    def create_site(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._admin_call("POST", "/v1/admin/sites", payload) or {}
+
+    def update_site(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # 站点名允许中文；不编码时 httpx 虽能兜底，但路径里的 ?/# 会被当成
+        # 查询串/片段，导致更新到错误的站点。
+        return self._admin_call("PUT", f"/v1/admin/sites/{quote(name, safe='')}", payload) or {}
+
+    def delete_site(self, name: str) -> None:
+        self._admin_call("DELETE", f"/v1/admin/sites/{quote(name, safe='')}")
 
     def hydrate_bodies(self, articles: Iterable[NewsArticle], mode: str) -> list[NewsArticle]:
         """Fill in body text. Demo rows already carry it; live rows need the detail call."""

@@ -160,6 +160,24 @@ def test_auto_mode_does_not_fall_back_on_4xx(settings, monkeypatch):
         client.list_articles(limit=5)
 
 
+def test_site_admin_paths_quote_chinese_names(settings, monkeypatch):
+    """站点名允许中文；必须整体编码，不能把 ?/# 当路径分隔符。"""
+    client = NewsClient(settings)
+    calls = []
+
+    def fake_admin(method, path, payload=None):
+        calls.append((method, path, payload))
+        return {"name": "示例站"} if method == "PUT" else None
+
+    monkeypatch.setattr(client, "_admin_call", fake_admin)
+    client.update_site("示例/站#1", {"enabled": False})
+    client.delete_site("示例/站#1")
+    assert calls[0][0] == "PUT"
+    assert calls[0][1] == "/v1/admin/sites/%E7%A4%BA%E4%BE%8B%2F%E7%AB%99%231"
+    assert calls[0][2] == {"enabled": False}
+    assert calls[1] == ("DELETE", "/v1/admin/sites/%E7%A4%BA%E4%BE%8B%2F%E7%AB%99%231", None)
+
+
 def test_hydrate_bodies_deduplicates_same_article(settings, monkeypatch):
     client = NewsClient(settings)
     article = NewsArticle(

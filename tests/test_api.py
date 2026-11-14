@@ -275,6 +275,44 @@ def test_articles_time_filter_reports_undated_excluded(client):
     assert meta["undated_excluded"] == 0
 
 
+def test_articles_relevance_sort_returns_scores_in_order(client):
+    """列表按相关度排序时每篇都要带 0-1 的 relevance，升降序一致。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    desc = client.get(
+        "/v1/articles", params={"sort": "relevance_desc", "limit": 4}, headers=headers
+    ).json()["data"]
+    assert desc
+    scores = [row["relevance"] for row in desc]
+    assert all(isinstance(score, float) and 0.0 <= score <= 1.0 for score in scores)
+    assert scores == sorted(scores, reverse=True)
+    assert all(row.get("relevance_reason") for row in desc)
+
+    asc = client.get(
+        "/v1/articles", params={"sort": "relevance_asc", "limit": 4}, headers=headers
+    ).json()["data"]
+    assert [row["relevance"] for row in asc] == sorted(row["relevance"] for row in asc)
+
+
+def test_recommendations_and_todos_endpoints(client):
+    """/v1/recommendations 与 /v1/todos 是首页两块数据的唯一来源。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    rec = client.get("/v1/recommendations", params={"limit": 3}, headers=headers)
+    assert rec.status_code == 200
+    body = rec.json()
+    assert body["meta"] == {"total": len(body["data"]), "limit": 3, "personalized": False}
+    assert len(body["data"]) <= 3
+    assert all("relevance" in row for row in body["data"])
+
+    todos = client.get("/v1/todos", params={"limit": 5}, headers=headers)
+    assert todos.status_code == 200
+    assert isinstance(todos.json()["data"], list)
+    assert todos.json()["meta"]["limit"] == 5
+
+
 def test_articles_sort_by_confidence_puts_nulls_last(client):
     """缺分类置信度的历史行不能被当成「置信度最低」排到最前面。"""
     headers = {"X-API-Key": "secret"}

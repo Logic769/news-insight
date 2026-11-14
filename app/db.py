@@ -758,7 +758,9 @@ _LIST_ORDERS = {
     "confidence_desc": "(a.category_confidence IS NULL), a.category_confidence DESC, a.article_id DESC",
     "confidence_asc": "(a.category_confidence IS NULL), a.category_confidence ASC, a.article_id ASC",
 }
-LIST_SORTS = tuple(_LIST_ORDERS)
+# relevance_* 由 API 层用 recommend.annotate_rows 在 Python 侧算完再排序；
+# 这里只做校验白名单，不放进 _LIST_ORDERS，避免把没有 SQL 表达式可用的键传进 list_analyzed。
+LIST_SORTS = (*tuple(_LIST_ORDERS), "relevance_desc", "relevance_asc")
 
 # 检索的类内排序：默认按相关度，另外允许按时间翻。"相关度排序" 是产品默认，
 # 按时间排是给「先看最新的」这类浏览型查询用的，两者都得由后端算完，

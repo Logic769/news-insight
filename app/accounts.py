@@ -562,10 +562,24 @@ def admin_summary(conn: sqlite3.Connection, *, days: int = 7) -> dict[str, Any]:
         "SELECT COALESCE(category, '') AS category, COUNT(*) AS count"
         " FROM analyzed_articles GROUP BY COALESCE(category, '') ORDER BY count DESC"
     ).fetchall()
+    # 管理台必须同时看到两条执行链：API 提交的 analysis_jobs 和 CLI/定时任务写入
+    # 的 runs。只统计前者时，线上实际跑的分析（CLI）会让「成功率」「任务数」看起
+    # 来永远是 0/100。runs 没有 status 列，用 errors 是否为 0 归类；未完成的 run
+    # （finished_at 为空）不计入成功率分母，避免刚启动就被算成失败。
     job_rows = conn.execute(
         "SELECT status, COUNT(*) AS count FROM analysis_jobs GROUP BY status"
     ).fetchall()
     jobs = {str(row["status"]): int(row["count"]) for row in job_rows}
+    run_stats = conn.execute(
+        """SELECT
+             SUM(CASE WHEN finished_at IS NOT NULL AND errors = 0 THEN 1 ELSE 0 END) AS succeeded,
+             SUM(CASE WHEN finished_at IS NOT NULL AND errors > 0 THEN 1 ELSE 0 END) AS failed
+           FROM runs"""
+    ).fetchone()
+    run_succeeded = int(run_stats["succeeded"] or 0) if run_stats else 0
+    run_failed = int(run_stats["failed"] or 0) if run_stats else 0
+    jobs["succeeded"] = jobs.get("succeeded", 0) + run_succeeded
+    jobs["failed"] = jobs.get("failed", 0) + run_failed
     finished = jobs.get("succeeded", 0) + jobs.get("failed", 0)
     success_rate = round(jobs.get("succeeded", 0) * 100.0 / finished, 1) if finished else 100.0
     return {

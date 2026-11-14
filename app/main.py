@@ -18,9 +18,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import __version__, accounts, auth, checklist_service, db
+from app import __version__, accounts, auth, checklist_service, db, recommend
 from app.extraction import load_schemas
 from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull
+from app.news_client import NewsClient, UpstreamError
 from app.pipeline import analyze_batch, connect
 from app.prune import prune
 from app.settings import Settings, load_settings
@@ -147,15 +148,24 @@ class AdminSiteCreate(BaseModel):
     region: str = Field(default="", max_length=64)
     timezone: str = Field(default="Asia/Shanghai", max_length=64)
     enabled: bool = True
+    render: bool = False
+    item_xpath: str = Field(default="//li", max_length=2000)
+    title_xpath: str = Field(default=".//a", max_length=2000)
+    url_xpath: str = Field(default=".//a/@href", max_length=2000)
+    date_xpath: str = Field(default="", max_length=2000)
 
 
 class AdminSiteUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=128)
     list_url: str | None = Field(default=None, min_length=1, max_length=500)
     category: str | None = Field(default=None, max_length=64)
     region: str | None = Field(default=None, max_length=64)
     timezone: str | None = Field(default=None, max_length=64)
     enabled: bool | None = None
+    render: bool | None = None
+    item_xpath: str | None = Field(default=None, max_length=2000)
+    title_xpath: str | None = Field(default=None, max_length=2000)
+    url_xpath: str | None = Field(default=None, max_length=2000)
+    date_xpath: str | None = Field(default=None, max_length=2000)
 
 
 @asynccontextmanager
@@ -710,78 +720,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             conn.close()
         return {"data": {"user_id": user_id, "temporary_password": temp}}
 
+    # 站点配置的唯一真相是 crawler 的 sources.local.json。管理台不再维护一份
+    # 只有六个字段的本地 sites 表（那份表既不参与抓取，也无法表达 XPath），
+    # 而是通过新闻 API 的 /v1/admin/sites 代理读写。
     @app.get("/v1/admin/sites")
     def admin_sites(request: Request) -> dict:
         _require_admin(request)
         s: Settings = app.state.settings
-        conn = connect(s)
+        client = NewsClient(s)
         try:
-            items = accounts.list_sites(conn)
+            items = client.list_sites()
+        except UpstreamError as exc:
+            raise HTTPException(status_code=502, detail=f"读取爬虫站点配置失败: {exc}") from exc
         finally:
-            conn.close()
-        return {"data": items, "meta": {"total": len(items)}}
+            client.close()
+        return {"data": items, "meta": {"total": len(items), "source": "crawler"}}
 
-    @app.post("/v1/admin/sites")
+    @app.post("/v1/admin/sites", status_code=201)
     def admin_create_site(payload: AdminSiteCreate, request: Request) -> dict:
         _require_admin(request)
         s: Settings = app.state.settings
+        values = payload.model_dump()
+        client = NewsClient(s)
+        try:
+            site = client.create_site(values)
+        except UpstreamError as exc:
+            code = 409 if exc.status_code == 409 else 502
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+        finally:
+            client.close()
         conn = connect(s)
         try:
-            site = accounts.create_site(
-                conn,
-                name=payload.name.strip(),
-                list_url=payload.list_url.strip(),
-                category=payload.category,
-                region=payload.region,
-                timezone=payload.timezone,
-                enabled=payload.enabled,
-            )
             _audit(request, conn, "admin.site_create", target=payload.name)
             conn.commit()
-        except sqlite3.IntegrityError:
-            raise HTTPException(status_code=409, detail="站点名称已存在") from None
         finally:
             conn.close()
         return {"data": site}
 
-    @app.patch("/v1/admin/sites/{site_id}")
-    def admin_update_site(site_id: int, payload: AdminSiteUpdate, request: Request) -> dict:
+    @app.patch("/v1/admin/sites/{name}")
+    def admin_update_site(name: str, payload: AdminSiteUpdate, request: Request) -> dict:
         _require_admin(request)
         s: Settings = app.state.settings
+        values = payload.model_dump(exclude_none=True)
+        client = NewsClient(s)
+        try:
+            site = client.update_site(name, values)
+        except UpstreamError as exc:
+            code = 404 if exc.status_code == 404 else 502
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+        finally:
+            client.close()
         conn = connect(s)
         try:
-            site = accounts.update_site(
-                conn,
-                site_id,
-                name=payload.name,
-                list_url=payload.list_url,
-                category=payload.category,
-                region=payload.region,
-                timezone=payload.timezone,
-                enabled=payload.enabled,
-            )
-            if site is None:
-                raise HTTPException(status_code=404, detail="站点不存在")
-            _audit(request, conn, "admin.site_update", target=str(site_id))
+            _audit(request, conn, "admin.site_update", target=name)
             conn.commit()
         finally:
             conn.close()
         return {"data": site}
 
-    @app.delete("/v1/admin/sites/{site_id}")
-    def admin_delete_site(site_id: int, request: Request) -> dict:
+    @app.delete("/v1/admin/sites/{name}")
+    def admin_delete_site(name: str, request: Request) -> dict:
         _require_admin(request)
         s: Settings = app.state.settings
+        client = NewsClient(s)
+        try:
+            client.delete_site(name)
+        except UpstreamError as exc:
+            code = 404 if exc.status_code == 404 else 502
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+        finally:
+            client.close()
         conn = connect(s)
         try:
-            removed = accounts.delete_site(conn, site_id)
-            if not removed:
-                raise HTTPException(status_code=404, detail="站点不存在或已停用")
-            _audit(request, conn, "admin.site_delete", target=str(site_id))
+            _audit(request, conn, "admin.site_delete", target=name)
             conn.commit()
         finally:
             conn.close()
-        return {"data": {"site_id": site_id, "enabled": False}}
+        return {"data": {"name": name, "deleted": True}}
 
     @app.get("/v1/admin/stats")
     def admin_stats(
@@ -954,6 +969,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/articles")
     def articles(
+        request: Request,
         tag: str | None = Query(default=None),
         category: Annotated[
             list[str] | None, Query(description="只在这些大类里筛选，可重复或逗号分隔")
@@ -964,7 +980,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         source: Annotated[list[str] | None, Query(description="只在这些站点里筛选")] = None,
         published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
         published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
-        sort: str = Query(default="published_desc", description="排序键"),
+        sort: str = Query(default="published_desc", description="排序键，支持 relevance_desc/asc"),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
@@ -978,20 +994,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
         conn = connect(s)
         try:
-            rows, total, undated = db.list_analyzed(
-                conn,
-                tag=tag,
-                # 列表端点保留「空串=筛一个不存在的类」的既有语义；非空值统一
-                # 支持重复参数与逗号分隔，和 /v1/search 的多选控件行为对齐。
-                category=_split_multi(category, empty_returns_none=False),
-                industry=_split_multi(industry, empty_returns_none=False),
-                sources=_split_multi(source),
-                published_from=since,
-                published_to=until,
-                sort=sort,
-                limit=limit,
-                offset=offset,
-            )
+            user = getattr(request.state, "user", None)
+            profile = recommend.build_profile(conn, int(user["id"])) if user else None
+            # 相关度排序必须在 Python 侧用用户画像算完：分页之前就要全量排序，
+            # 否则只能对当前页排序，翻页会看到乱序。当前库 480 篇，用 2000 的
+            # 候选上限足够；达到上限时 total 仍来自 SQL，界面会显示真实总数。
+            if sort in ("relevance_desc", "relevance_asc"):
+                rows, total, undated = db.list_analyzed(
+                    conn,
+                    tag=tag,
+                    category=_split_multi(category, empty_returns_none=False),
+                    industry=_split_multi(industry, empty_returns_none=False),
+                    sources=_split_multi(source),
+                    published_from=since,
+                    published_to=until,
+                    sort="published_desc",
+                    limit=2000,
+                    offset=0,
+                )
+                recommend.annotate_rows(rows, profile)
+                rows.sort(
+                    key=lambda item: (
+                        float(item.get("relevance") or 0.0),
+                        item.get("article_id", ""),
+                    ),
+                    reverse=(sort == "relevance_desc"),
+                )
+                rows = rows[offset : offset + limit]
+            else:
+                rows, total, undated = db.list_analyzed(
+                    conn,
+                    tag=tag,
+                    # 列表端点保留「空串=筛一个不存在的类」的既有语义；非空值统一
+                    # 支持重复参数与逗号分隔，和 /v1/search 的多选控件行为对齐。
+                    category=_split_multi(category, empty_returns_none=False),
+                    industry=_split_multi(industry, empty_returns_none=False),
+                    sources=_split_multi(source),
+                    published_from=since,
+                    published_to=until,
+                    sort=sort,
+                    limit=limit,
+                    offset=offset,
+                )
+                recommend.annotate_rows(rows, profile)
         finally:
             conn.close()
         return {
@@ -1006,6 +1051,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "undated_excluded": undated,
             },
         }
+
+    @app.get("/v1/recommendations")
+    def recommendations(
+        request: Request,
+        limit: int = Query(default=10, ge=1, le=50),
+    ) -> dict:
+        """首页推荐：登录用户按画像排序，匿名用户按内容质量排序。"""
+        s: Settings = app.state.settings
+        user = getattr(request.state, "user", None)
+        conn = connect(s)
+        try:
+            items = recommend.recommendations(
+                conn, user_id=int(user["id"]) if user else None, limit=limit
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {
+                "total": len(items),
+                "limit": limit,
+                "personalized": bool(user),
+            },
+        }
+
+    @app.get("/v1/todos")
+    def todos(limit: int = Query(default=5, ge=1, le=50)) -> dict:
+        """首页待办：项目申报类公告中尚未到期的截止日期，按日期升序。"""
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            items = recommend.upcoming_deadlines(conn, limit=limit)
+        finally:
+            conn.close()
+        return {"data": items, "meta": {"total": len(items), "limit": limit}}
 
     @app.get("/v1/search")
     def search_articles(
