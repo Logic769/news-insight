@@ -200,8 +200,9 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有分析或清单生成任务持锁时 409，失败 502 |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
-| GET | `/v1/articles?tag=&category=&limit=&offset=` | 已分析文章列表，可按标签和/或大类过滤（AND 组合，`limit` ≤ 200） |
-| GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
+| GET | `/v1/articles?tag=&category=&industry=&limit=&offset=` | 已分析文章列表，可按标签、大类和/或受控行业过滤（AND 组合，`limit` ≤ 200） |
+| GET | `/v1/search?q=&category=&industry=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`industry`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
+| GET | `/v1/industries` | 受控行业词表 + 每个行业文章数（`meta.total`/词表版本），供前端筛选与徽标 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable`（字符串）；已有分析/清单生成任务持锁时也 409，但 `error.code` 为数字 409 |
@@ -233,7 +234,13 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
   - 代价是每行每列每个形态一次 Python 回调，且**成本取决于是否「标题」命中**（本机 min-of-3，规模「候选集打满 2000 行 × 正文 6000 字」，不同机器差 2–3×）：标题命中预筛约 0.05s / 全链路约 0.5s（`OR` 首个条件为真，短路掉 body 的 6000 字归一）；**仅正文**命中约 0.55s / 约 2.0s（标题不含，必须算完 body 才为真，成本与不命中同档，且候选打满时每行都要打分）；全不命中约 0.52s / 约 0.5s（候选为空、不打分）；`body IS NULL` 的历史行约 0.003s（回填前仍能按标题/标签命中）。**只有标题命中才便宜，而用户查的行业词/细分词大多只在正文出现——这是最常见路径，别按 0.05s 估**。纯 SQL `instr`（不命中全扫）约 0.04s，即 `py_norm` 带来一个数量级预筛开销，这是「两侧归一必须同源」的代价。逐行归一 + `score_article` 是另一块大头（仅正文命中且候选打满时约 1.5s）。泛词会打满候选集，**超时按秒级设**（最坏约 2–3s，建议 10s）；若将来候选集需放大到十万级，再考虑 FTS5 或物化归一列；
   - `search.WS_CHARS` 覆盖 ASCII 控制空白、`\x85`、`\xa0`、`\u2000`–`\u200a`、`\u2028`、`\u2029`、`\u3000`（共 22 个）。从 Word / 网页复制的关键词常带 `\u2002`/`\u2003`/`\u2009`，漏一个就表现为「看起来一样的两个词搜不到」且不报错；
   - `q` 必须含至少 1 个非空白字符（`pattern=r"\S"`）：只靠 `min_length` 时 `q=""` 是 422 而 `q=" "` 会走到 200 空 groups，同一件事两种响应码；
-- **正文副本 `analyzed_articles.body`**：检索需要正文里有而标题里没有的词，因此正文随分析结果一起落库。写入用 `COALESCE(NULLIF(excluded.body, ''), body)` —— 只有本次真拿到文本时才覆盖，避免某次详情抖动把历史正文写成 `NULL` 让检索静默丢文章。历史行 `body IS NULL` 用 `python -m app backfill-bodies` 回填（只搬文本、不重跑模型、可重复执行、单篇失败不中断整批）；这使库体积约增加一倍多，且随 `RETENTION_DAYS` 一起被删除。
+- **正文副本 `analyzed_articles.body`**：检索需要正文里有而标题里没有的词，因此正文随分析结果一起落库。写入用 `COALESCE(NULLIF(excluded.body, ''), body)` —— 只有本次真拿到文本时才覆盖，避免某次详情抖动把历史正文写成 `NULL` 让检索静默丢文章。历史行 `body IS NULL` 用 `python -m app backfill-bodies` 回填（只搬文本、不重跑模型、可重复执行、单篇失败不中断整批）；`body_html` 存清洗后的正文 HTML（`html_sanitize.sanitize_body_html` 白名单），同一条回填命令一并处理，已有一侧不会被空值覆盖；这使库体积约增加一倍多，且随 `RETENTION_DAYS` 一起被删除。
+
+### 6.1 受控行业 `app/vocab/industries.json`
+
+十个行业（**闭集单选**）：`next_gen_it` 新一代信息技术、`high_end_equipment` 高端装备制造、`new_materials` 新材料、`biomedicine` 生物医药、`new_energy` 新能源、`energy_saving` 节能环保、`digital_creative` 数字创意、`modern_agriculture` 现代农业、`modern_services` 现代服务业、`other` 其他。
+
+结构：`version` + `industries`（每条 `{id, name, description, keywords}`）；`id` 是持久化契约（落 `analyzed_articles.industry`），改名不改 id。分类走 `tagging.classify_industry`：LLM 可用先按 `INDUSTRY_SYSTEM_PROMPT` 选一个，`LLMError` 降级为关键词规则（标题命中 +1.0、正文 +0.5，最高分胜出）；表外 id 丢弃并回落到 `other`。历史行用 `python -m app backfill-industries` 回填，只写 `industry`/`industry_confidence`/`industry_engine` 三列，不重跑标签/抽取/清单。
 
 ---
 
@@ -305,9 +312,13 @@ CREATE TABLE analyzed_articles (
     published_at_utc TEXT,               -- 真实时刻，相对日期换算基准
     content_length   INTEGER NOT NULL DEFAULT 0,
     body             TEXT,               -- 正文副本，供关键词检索；NULL = 落库时上游未提供（历史行，需 backfill-bodies）
+    body_html        TEXT,               -- 清洗后的正文 HTML，详情页渲染用；同样可由 backfill-bodies 回填
     category         TEXT,               -- 一级分类 id；NULL = 分类上线前的历史行，与 'other' 不同
     category_confidence REAL,
     category_engine  TEXT,               -- llm / rules / none
+    industry         TEXT,               -- 受控行业 id；NULL = 行业功能上线前的历史行
+    industry_confidence REAL,
+    industry_engine  TEXT,               -- llm / rules / none
     tag_engine       TEXT,               -- llm / rules
     extract_engine   TEXT,               -- llm / rules / none
     analyzed_at      TEXT NOT NULL
@@ -412,7 +423,8 @@ docker compose run --rm insight python -m app <子命令> [args]
 | `analyze --limit 10 [--force] [--concurrency 100]` | 跑一批分析；结束后自动执行一次 prune（失败只记日志） |
 | `prune [--days 90] [--dry-run] [--vacuum]` | 删除超过保留期的分析结果；先 dry-run 看数量 |
 | `init` | 只建库建表 |
-| `backfill-bodies [--limit 500] [--batch 50]` | 给历史行补 `analyzed_articles.body`：逐篇调上游 detail 取 `raw_content or content`，只 UPDATE 正文列，不重跑模型、不改 `analyzed_at`；可重复执行（只挑 `body IS NULL OR body = ''`），单篇失败不中断整批，打印 `{"filled","failed","skipped","remaining"}`；`demo` 模式直接拒绝（不许碰网络）；候选与分批都按「最新优先 + `article_id` 兜底」取，因此死链不会永久占住小 `--limit` 窗口；每批先取回全部正文再开写事务，网络请求期间不持有未提交事务 |
+| `backfill-bodies [--limit 500] [--batch 50]` | 给历史行补 `analyzed_articles.body` 与 `body_html`：逐篇调上游 detail 取 `raw_content or content` 与 `body_html`，只 UPDATE 两列且不覆盖已有值，不重跑模型、不改 `analyzed_at`；可重复执行（只挑任一侧为空的行），单篇失败不中断整批，打印 `{"filled","html_filled","failed","skipped","remaining"}`；`demo` 模式直接拒绝（不许碰网络）；候选与分批都按「最新优先 + `article_id` 兜底」取，因此死链不会永久占住小 `--limit` 窗口；每批先取回全部正文再开写事务，网络请求期间不持有未提交事务 |
+| `backfill-industries [--limit 500] [--workers N]` | 给历史行补受控行业：只写 `industry`/`industry_confidence`/`industry_engine`，不重跑标签/抽取/清单；可重复执行（只挑 `industry` 为空的行），打印 `{"scanned","analyzed","skipped","errors","remaining","engines"}` |
 | `health` | 打印当前配置（llm_enabled / 数据源模式 / news_base_url / db 路径 / 保留天数） |
 
 示例：
@@ -485,7 +497,8 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_search.py` | 检索层纯逻辑（`:memory:` 直插数据）：候选截断前按最新定序且保留最新 N 行、`published_at` 为空时按 `analyzed_at` 参与定序、短语映射闭集标签、子片段权重低于整词、空查询、未知词回落字面检索、标签命中压过纯正文命中、分数有界 `[0,1]`、无信号被过滤、按类分组且类内降序、未知词空 groups、正文命中不跨类复制、`per_category` 截断但 `count` 报全量、`categories` 过滤、默认不返回 body 且按需返回、`matched_tags`/`terms` 可排障、非 ASCII 大小写（Ärger/ÖBB/MÜLLER）不敏感、`\u2003`/`\u2009`/`\u2028` 等窄空格被折掉、同一处文本只计一次（含重叠出现）、`matched_terms` 不含被长形态吃掉的形态、高频短词记账不退化成 O(n²)、候选集截断只在真丢行时告警 |
 | `test_search_api.py` | `GET /v1/search` 的 HTTP 契约：未带 key 401、返回 groups、类顺序符合 `categories.json`、类内降序、未知词空 groups、`q` 为空 422、默认无 `body` 字段、`include_body=true` 时有 `body`、`category` 过滤生效 |
 | `test_yaml_lint.py` | 合法/重复键/非法 YAML、SKIP 集合与顶层目录语义、工作目录无关、非 UTF-8、仓库全部 YAML 通过 |
-| `test_backfill.py` | 回填正文：demo 模式拒绝访问网络、网络请求期间不持有未提交事务（读**主连接**的 `in_transaction`，不是新连接；必须 `batch>1` **且行数 > batch**，否则只覆盖到「单 chunk 边取边写」而漏掉「事务跨过下一批请求」）、`--limit 1` 下死链不钉死窗口（扫描预算与写入上限解耦）、`limit<0`/`batch<1` 在发请求前被拒绝（SQLite 把 `LIMIT -1` 当成不限）、候选截断前排序确定、已有正文的行不被覆盖 |
+| `test_backfill.py` | 回填正文与正文 HTML：demo 模式拒绝访问网络、网络请求期间不持有未提交事务（读**主连接**的 `in_transaction`，不是新连接；必须 `batch>1` **且行数 > batch**，否则只覆盖到「单 chunk 边取边写」而漏掉「事务跨过下一批请求」）、`--limit 1` 下死链不钉死窗口（扫描预算与写入上限解耦）、`limit<0`/`batch<1` 在发请求前被拒绝（SQLite 把 `LIMIT -1` 当成不限）、候选截断前排序确定、已有正文的行不被覆盖、已有正文但缺 HTML 时只补 HTML |
+| `test_industries.py` | 受控行业：词表 10 项与缺失文件、规则引擎标题优先与 other 兜底、LLM 表外 id 丢弃并夹紧置信度、LLMError 降级规则、save_analysis 行业落库、set_industry 不覆盖已有值、backfill-industries 只补空行且负数 limit 拒绝、检索按行业过滤、/v1/industries 与 /v1/articles?industry= |
 
 基线：宿主机全量 `pytest` **198 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 

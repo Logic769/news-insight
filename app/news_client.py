@@ -63,6 +63,7 @@ class NewsArticle:
     raw_content: str | None
     content_length: int
     updated_at: str | None
+    body_html: str | None = None
     # False = 详情接口没拿到（正文为空不代表文章没正文），调用方不应据此定档
     body_ok: bool = True
 
@@ -83,6 +84,7 @@ class NewsArticle:
             timezone=str(row.get("timezone") or "Asia/Shanghai"),
             content=row.get("content"),
             raw_content=row.get("raw_content"),
+            body_html=row.get("body_html"),
             content_length=_to_int(row.get("content_length")),
             updated_at=row.get("updated_at"),
         )
@@ -253,6 +255,7 @@ class NewsClient:
             art.published_at = merged.published_at or art.published_at
             art.content = merged.content
             art.raw_content = merged.raw_content
+            art.body_html = merged.body_html
             art.content_length = merged.content_length or art.content_length
 
         concurrency = max(1, min(self.settings.news_detail_concurrency, len(pending)))

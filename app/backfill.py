@@ -2,14 +2,14 @@
 
 Why this exists
 ----------------
-`body` is only populated for articles analyzed after the column existed. Every
-row analyzed before that has `body IS NULL`, which makes keyword search blind
-to正文 for the entire back catalogue. Re-running `analyze --force` would fix it
-but burns LLM tokens for results we already have -- the body is a copy of
-upstream data, not an analysis output.
+`body` and `body_html` are only populated for articles analyzed after the
+columns existed. Every row analyzed before that has `body IS NULL`, which makes
+keyword search blind to正文 for the entire back catalogue. Re-running
+`analyze --force` would fix it but burns LLM tokens for results we already
+have -- the body is a copy of upstream data, not an analysis output.
 
-So this module only moves text: read the crawler API, write `body`, leave every
-derived field (category, tags, extractions) untouched.
+So this module only moves text: read the crawler API, write `body` and
+`body_html`, leave every derived field (category, tags, extractions) untouched.
 """
 
 from __future__ import annotations
@@ -38,8 +38,8 @@ _SCAN_FACTOR = 5
 _GONE_STATUS_CODES = frozenset({404, 410})
 
 
-def _articles_missing_body(conn: Any, scan_budget: int) -> list[dict[str, Any]]:
-    """Rows analyzed but without a body, newest first.
+def _articles_missing_content(conn: Any, scan_budget: int) -> list[dict[str, Any]]:
+    """Rows analyzed but missing body text or body HTML, newest first.
 
     Newest first because that is what users search: the backfill is resumable,
     so running it with a small --limit should fix the most visible rows first.
@@ -59,7 +59,7 @@ def _articles_missing_body(conn: Any, scan_budget: int) -> list[dict[str, Any]]:
     scan_budget = max(scan_budget, 0)
     rows = conn.execute(
         "SELECT article_id, url FROM analyzed_articles"
-        " WHERE body IS NULL OR body = ''"
+        " WHERE body IS NULL OR body = '' OR body_html IS NULL OR body_html = ''"
         " ORDER BY COALESCE(published_at, analyzed_at) DESC, article_id DESC"
         " LIMIT ?",
         (scan_budget,),
@@ -112,7 +112,7 @@ def _validate_limits(*, limit: int, batch: int) -> None:
 
 
 def backfill_bodies(settings: Settings, *, limit: int = 500, batch: int = 50) -> dict[str, Any]:
-    """Copy bodies from the crawler API into insight.db.
+    """Copy bodies and body HTML from the crawler API into insight.db.
 
     Returns counts rather than raising on individual failures: a dead upstream
     link must not abort a 500-row run, and the caller reruns until `missing`
@@ -135,19 +135,20 @@ def backfill_bodies(settings: Settings, *, limit: int = 500, batch: int = 50) ->
     conn = connect(settings)
     client = NewsClient(settings)
     filled = 0
+    html_filled = 0
     failed = 0
     skipped = 0
     try:
         # `limit` 是写入上限，扫描预算比它大：不可回填的行（死链、上游无正文）
         # 永远留在候选集里，若只扫 limit 行，小的 --limit 会被它们占死——
         # --limit 1 且最新一篇是死链时，每轮都在重试它，更早的文章永远到不了。
-        pending = _articles_missing_body(conn, limit * _SCAN_FACTOR)
+        pending = _articles_missing_content(conn, limit * _SCAN_FACTOR)
         LOG.info("待回填正文: 候选 %d 篇，最多写入 %d 篇", len(pending), limit)
         for start in range(0, len(pending), batch):
             if filled >= limit:
                 break
             chunk = pending[start : start + batch]
-            fetched: list[tuple[str, str]] = []
+            fetched: list[tuple[str, str, str]] = []
             for row in chunk:
                 article_id = row["article_id"]
                 try:
@@ -163,7 +164,8 @@ def backfill_bodies(settings: Settings, *, limit: int = 500, batch: int = 50) ->
                     failed += 1
                     continue
                 body = (payload or {}).get("raw_content") or (payload or {}).get("content") or ""
-                if not body.strip():
+                body_html = (payload or {}).get("body_html") or ""
+                if not body.strip() and not body_html.strip():
                     # 上游确实没有正文：不算失败，也不写库。代价是这条行仍然是
                     # "缺正文"状态，下一轮还会被选中并再发一次请求——所以
                     # remaining 里始终包含这类不可回填的行，跑几轮都不会归零。
@@ -171,30 +173,40 @@ def backfill_bodies(settings: Settings, *, limit: int = 500, batch: int = 50) ->
                     # 引入隐式状态）。
                     skipped += 1
                     continue
-                fetched.append((article_id, body))
+                fetched.append((article_id, body, body_html))
             # 网络阶段结束，才开写事务；写完立刻提交。
-            for article_id, body in fetched:
+            for article_id, body, body_html in fetched:
                 if filled >= limit:
                     # 一个 chunk 内也可能超出 --limit（候选是批量取的），
                     # 超出的留到下一轮，别让一次运行写穿用户给的预算。
                     break
-                # set_body 带「只写还没有正文的行」守卫，并发下可能一行都没更新；
-                # 那种情况不算 filled，否则进度条会比实际好看。
-                if db.set_body(conn, article_id=article_id, body=body, commit=False):
+                # set_body/set_body_html 带「只写还没有值的行」守卫，并发下可能
+                # 一行都没更新；那种情况不算 filled，否则进度条会比实际好看。
+                wrote = False
+                if body.strip() and db.set_body(conn, article_id=article_id, body=body, commit=False):
+                    wrote = True
+                if body_html.strip() and db.set_body_html(
+                    conn, article_id=article_id, body_html=body_html, commit=False
+                ):
+                    html_filled += 1
+                    wrote = True
+                if wrote:
                     filled += 1
             conn.commit()
-            LOG.info("已回填 %d/%d（候选 %d）", filled, limit, len(pending))
+            LOG.info("已回填 %d/%d（含 HTML %d，候选 %d）", filled, limit, html_filled, len(pending))
         remaining = conn.execute(
-            "SELECT COUNT(*) FROM analyzed_articles WHERE body IS NULL OR body = ''"
+            "SELECT COUNT(*) FROM analyzed_articles"
+            " WHERE body IS NULL OR body = '' OR body_html IS NULL OR body_html = ''"
         ).fetchone()[0]
     finally:
         conn.close()
         client.close()
     return {
         "filled": filled,
+        "html_filled": html_filled,
         "failed": failed,
         # skipped：上游此刻没有正文，不写库、下一轮还会再试
         "skipped": skipped,
-        # remaining：仍然缺正文的行数，含 skipped 这类不可回填的，不一定能归零
+        # remaining：仍然缺正文或正文 HTML 的行数，含 skipped 这类不可回填的，不一定能归零
         "remaining": int(remaining),
     }

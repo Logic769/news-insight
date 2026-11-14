@@ -9,6 +9,7 @@ import sys
 
 from app import db
 from app.backfill import BackfillUsageError, backfill_bodies
+from app.backfill_industries import backfill_industries
 from app.pipeline import analyze_batch
 from app.prune import prune
 from app.settings import load_settings
@@ -29,9 +30,13 @@ def main() -> int:
     p_pr.add_argument("--vacuum", action="store_true", help="清理后执行 VACUUM 回收磁盘")
 
 
-    p_bf = sub.add_parser("backfill-bodies", help="从新闻 API 补正文（不调用 LLM，可重复运行）")
+    p_bf = sub.add_parser("backfill-bodies", help="从新闻 API 补正文与正文 HTML（不调用 LLM，可重复运行）")
     p_bf.add_argument("--limit", type=int, default=500)
     p_bf.add_argument("--batch", type=int, default=50)
+
+    p_bi = sub.add_parser("backfill-industries", help="为已分析文章补受控行业分类（可重复运行）")
+    p_bi.add_argument("--limit", type=int, default=500)
+    p_bi.add_argument("--workers", type=int, default=None)
 
     sub.add_parser("init", help="初始化数据库")
     sub.add_parser("health", help="打印当前配置")
@@ -62,6 +67,10 @@ def main() -> int:
             # 只捕 BackfillUsageError：裸 ValueError 会把内部意外 bug 也静默成退出码 2。
             print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
             return 2
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.cmd == "backfill-industries":
+        result = backfill_industries(settings, limit=args.limit, workers=args.workers)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.cmd == "prune":
