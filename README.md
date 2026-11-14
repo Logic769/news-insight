@@ -145,7 +145,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
-| GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签、大类（`category=funding_subsidy`）或受控行业（`industry=new_energy`）过滤（AND 组合） |
+| GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签、大类（`category=funding_subsidy`）或受控行业（`industry=new_energy`）过滤（AND 组合）；`category`、`industry` 均可重复或逗号分隔 |
 | GET | `/v1/search?q=申报&category=project_application&industry=new_energy&per_category=20&include_body=false&source=&published_from=&published_to=&sort=relevance` | **关键词检索**：结果按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端直接渲染；详见下节）。`sort` 取 `relevance`/`published_desc`/`published_asc`，`category`、`industry` 与 `source` 均可重复或逗号分隔 |
 | GET | `/v1/industries` | 受控行业词表（10 个 id/中文名/描述/关键词）+ 每个行业的文章数，供前端行业筛选与徽标 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
@@ -353,6 +353,7 @@ python -m app backfill-bodies --limit 500 --batch 50
     `COALESCE(category,'') IN ('')` 只命中「分类功能上线前」的历史行；若只在 Python 侧过滤掉空串，
     剩下的空列表又会被当成「筛完没结果」直接返回空集。两条路都会让用户只是清空了筛选框却看不到结果；
   - `/v1/tags?category=`：词表照旧返回，计数按该类统计（空串下计数全 0）；
+- `industry` 的空串语义：`/v1/articles?industry=` 按空集处理返回 0 行（不再命中未分类行业，也无法用空串筛「未分类」）；`/v1/search?industry=` 归一为「不传」。
 - `categories.json` 里少了兜底类 `other` 时不会启动失败，但会记一条 WARNING：模型答出表外大类就没有去处，那篇文章的二级打标与抽取都会被跳过。
 
 ### 加标签

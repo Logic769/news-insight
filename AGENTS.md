@@ -203,7 +203,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有分析或清单生成任务持锁时 409，失败 502 |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
-| GET | `/v1/articles?tag=&category=&industry=&limit=&offset=` | 已分析文章列表，可按标签、大类和/或受控行业过滤（AND 组合，`limit` ≤ 200） |
+| GET | `/v1/articles?tag=&category=&industry=&limit=&offset=` | 已分析文章列表，可按标签、大类和/或受控行业过滤（AND 组合，`limit` ≤ 200）；`category`/`industry` 可重复或逗号分隔 |
 | GET | `/v1/search?q=&category=&industry=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`industry`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
 | GET | `/v1/industries` | 受控行业词表 + 每个行业文章数（`meta.total`/词表版本），供前端筛选与徽标 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |

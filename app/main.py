@@ -1205,8 +1205,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict:
         """站内消息提醒：新分析出的项目申报类公告。
 
-        unread 始终是「全库未读数」，不受 unread_only 影响——铃铛角标要的是它，
-        下拉列表才需要只看未读。列表带文章跳转所需的 article_id/url。
+        unread 是「当前用户未读数」：登录用户按 notification_reads 统计，未登录只读模式
+        回退为全库未读数；它不受 unread_only 影响——铃铛角标要的是它，下拉列表才需要只看未读。
+        列表带文章跳转所需的 article_id/url。
         """
         s: Settings = app.state.settings
         conn = connect(s)
