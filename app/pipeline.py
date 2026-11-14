@@ -181,6 +181,23 @@ def _persist_result(conn, result: _AnalysisResult) -> None:
                 db.delete_checklist(conn, art.id, commit=False)
         except Exception:
             LOG.exception("删除旧清单失败 %s", art.id)
+    # 站内提醒：只推「新分析出项目申报类公告」，这是策划书第 6~7 月「消息推送提醒」
+    # 的最小闭环。create_notification 以 article_id 去重，--force 重分析不会重复提醒。
+    is_project_notice = result.category == "project_application" or any(
+        h.tag_id == "project_application" for h in result.hits
+    )
+    if is_project_notice:
+        try:
+            db.create_notification(
+                conn,
+                article_id=art.id,
+                kind="project_application",
+                title="新增项目申报公告",
+                message=art.title,
+                commit=False,
+            )
+        except Exception:  # 通知失败不影响分析事实
+            LOG.exception("保存站内通知失败 %s", art.id)
 
 
 def analyze_batch(

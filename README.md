@@ -6,7 +6,8 @@
 2. **打标签** —— 再**只在该大类允许的标签**里做闭集多标签打标，模型不许自己造标签；
 3. **抽关键线索** —— 命中 `project_application` 这类标签后，进入 schema 驱动的事实抽取，例如项目申报的申报主体、材料清单、**截止时间**、资助额度、申报渠道；
 4. **出准备清单** —— 把抽到的事实按申报执行顺序排成可直接照做的清单（确认项目 → 核对资格 → 备材料 → 系统填报 → 截止提交），每条标注原文依据或「流程建议」；
-5. **落库 + 出接口** —— 结果存独立 SQLite，通过 HTTP API 查询，供后续业务系统消费。
+5. **落库 + 出接口** —— 结果存独立 SQLite，通过 HTTP API 查询，供后续业务系统消费；
+6. **推提醒** —— 新分析出项目申报类公告时写入站内通知，前端铃铛展示未读角标，点开直达详情。
 
 它不抓网页、不解析正文、不碰爬虫的数据库。与 news-crawler 之间只有一条 HTTP 契约。
 
@@ -146,6 +147,9 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `article_not_found`；非项目申报或缺少可用要素/正文 409 `checklist_not_applicable` |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.unread` 为全库未读数（不受 `unread_only` 影响）；同一篇文章只提醒一次 |
+| POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
+| POST | `/v1/notifications/read-all` | 全部标记已读，返回 `{"data": {"updated": N, "unread": 0}}` |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含分类功能上线前的历史行） |
 | GET | `/v1/sources` | 按抓取站点聚合：`source`（空串表示未标注来源，前端显示「未标注来源」）、`source_filter`（筛选时回传的值：普通来源等于 `source`，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`（平均分类置信度）、`latest_published_at`（按真实时刻取最新发布时间）；前端「发布单位」筛选应使用 `source_filter`，统计看板用 `source` 展示 |
@@ -392,6 +396,7 @@ python -m app backfill-bodies --limit 500 --batch 50
 | `article_tags` | `(article_id, tag)` 主键，含置信度、原文依据、引擎 |
 | `extractions` | `(article_id, schema_id, field)` 主键，含值、原文片段、置信度、是否定位成功 |
 | `article_checklists` | `article_id` 主键，清单项 JSON（`text`/`basis`/`source_text`）、生成引擎与时间 |
+| `notifications` | 站内消息提醒：`article_id` 唯一（同一篇只提醒一次），`kind`、标题快照、消息、`created_at`（带 Z 的 UTC）、`read_at` |
 | `runs` | 每次批处理的统计 |
 | `analysis_jobs` | 异步分析作业状态与结果（`queued`/`running`/`succeeded`/`failed`） |
 
@@ -432,7 +437,7 @@ docker compose run --rm -v "$(pwd)/tests:/app/tests" -v "$(pwd)/tools:/app/tools
 - 相对截止时间只覆盖常见表述（`N日内`/`N个工作日`/`本月底`），「公示结束后5个工作日」这类链式表述仍会漏；
 - 分析作业在进程内全局串行（同步接口与异步 job 共用一把锁），长批次请用 `POST /v1/jobs`；单进程单 SQLite，不适合多副本水平扩展；
 - 清单生成按篇多一次 LLM 调用（正文按 `EXTRACT_BODY_CHARS` 截断），每篇最多 4 次 LLM 请求（分大类 1 + 类内打标 1 + 抽取 1 + 清单 1；归到 other 时只有 1 次）；实际吞吐取决于供应商并发与限流，`ANALYZE_CONCURRENCY` 只是本地上限，`LLM_MAX_CONCURRENCY` 另外限制真正同时在途的供应商请求；遇到 429/5xx 会优先按 `Retry-After`、否则指数退避并加抖动重试；
-- `RETENTION_DAYS` 默认 90：启动时和每次成功分析后自动硬删除更早的 `analyzed_articles`/`article_tags`/`extractions`/`article_checklists`、`runs` 以及已完成的 `analysis_jobs`，不保留归档；
+- `RETENTION_DAYS` 默认 90：启动时和每次成功分析后自动硬删除更早的 `analyzed_articles`/`article_tags`/`extractions`/`article_checklists`/`notifications`、`runs` 以及已完成的 `analysis_jobs`，不保留归档；
 - 一级分类的边界靠 `categories.json` 的 `description` 与 `keywords` 人工维护：规则引擎按关键词计分，遇到「专项资金申报通知」这种同时命中资金补贴与项目申报的文章，会归到分数更高的那一类，另一类的二级标签随之拿不到（目前 `funding_subsidy` 的白名单不含 `project_application`，这类文章不会触发申报抽取）；需要时给该类补 `project_application` 标签即可；
 - 分类按「保留式」写入：重跑时没做分类（例如临时移走 `categories.json`、回退到旧版本）只会更新标签，不会清空已有分类；但此时标签是按全词表打的，可能出现分类与标签不同源的行（`category=project_application` 却带 `ipo` 标签）。恢复词表后再跑一次即回到类内一致；
 - 分类功能上线前已分析的历史行 `category` 为 `NULL`：`/v1/categories` 里统计不到、`?category=` 也筛不出来，需要 `analyze --force` 重跑才会补上分类；这与归到 `other` 是不同的状态；

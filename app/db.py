@@ -93,6 +93,19 @@ CREATE TABLE IF NOT EXISTS article_checklists (
     generated_at TEXT NOT NULL
 );
 
+-- 站内消息提醒：目前只承载「新分析出项目申报类公告」这一种事件。
+-- article_id 唯一键让同一篇文章重复分析（--force）不会反复冒红点；标题存快照，
+-- 因为通知是「当时发生了什么」的记录，不随文章后续改名而改写。
+CREATE TABLE IF NOT EXISTS notifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_id  TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    message     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,   -- ISO8601 UTC，带 Z 后缀，前端可直接 new Date()
+    read_at     TEXT
+);
+
 -- 异步分析作业：API 提交后立即返回，后台线程执行；状态落库，进程重启后能看出中断。
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     id          TEXT PRIMARY KEY,
@@ -107,6 +120,8 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON article_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON analysis_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(read_at, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_analyzed_published ON analyzed_articles(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_extractions_schema ON extractions(schema_id, field);
 """
@@ -191,6 +206,11 @@ def _load_json(raw: Any) -> Any:
 
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_iso() -> str:
+    """UTC ISO8601（带 Z）：通知要由浏览器解析相对时间，不能丢时区信息。"""
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ensure_norm_func(conn: sqlite3.Connection) -> None:
@@ -903,6 +923,85 @@ def list_runs(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+# ------------------------------------------------------------------ notifications
+def create_notification(
+    conn: sqlite3.Connection,
+    *,
+    article_id: str,
+    kind: str,
+    title: str,
+    message: str,
+    commit: bool = True,
+) -> bool:
+    """为文章创建站内通知；同一篇文章只提醒一次（--force 重分析不会重复冒红点）。
+
+    返回 True 表示这次真的插入了新通知。调用方在批量事务里传 commit=False。
+    """
+    cur = conn.execute(
+        "INSERT INTO notifications (article_id, kind, title, message, created_at)"
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(article_id) DO NOTHING",
+        (article_id, kind, title, message, _now_iso()),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.rowcount) > 0
+
+
+def _notification_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["read"] = item["read_at"] is not None
+    return item
+
+
+def list_notifications(
+    conn: sqlite3.Connection, *, limit: int = 20, unread_only: bool = False
+) -> tuple[list[dict[str, Any]], int, int]:
+    """返回 (通知列表, 总数, 未读数)；未读数不受 unread_only 影响，供铃铛角标使用。"""
+    where = "WHERE n.read_at IS NULL" if unread_only else ""
+    rows = conn.execute(
+        f"""SELECT n.id, n.article_id, n.kind, n.title, n.message, n.created_at, n.read_at,
+                   a.url, a.source, a.category, a.published_at
+            FROM notifications n
+            LEFT JOIN analyzed_articles a ON a.article_id = n.article_id
+            {where}
+            ORDER BY n.created_at DESC, n.id DESC
+            LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    total = int(conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0])
+    unread = int(
+        conn.execute("SELECT COUNT(*) FROM notifications WHERE read_at IS NULL").fetchone()[0]
+    )
+    return [_notification_row(r) for r in rows], total, unread
+
+
+def mark_notification_read(conn: sqlite3.Connection, notification_id: int) -> dict[str, Any] | None:
+    """标记单条已读；重复调用保持首次已读时间不变。不存在返回 None。"""
+    conn.execute(
+        "UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+        (_now_iso(), notification_id),
+    )
+    row = conn.execute(
+        """SELECT n.id, n.article_id, n.kind, n.title, n.message, n.created_at, n.read_at,
+                  a.url, a.source, a.category, a.published_at
+           FROM notifications n
+           LEFT JOIN analyzed_articles a ON a.article_id = n.article_id
+           WHERE n.id = ?""",
+        (notification_id,),
+    ).fetchone()
+    conn.commit()
+    return _notification_row(row) if row is not None else None
+
+
+def mark_all_notifications_read(conn: sqlite3.Connection) -> int:
+    cur = conn.execute(
+        "UPDATE notifications SET read_at = ? WHERE read_at IS NULL", (_now_iso(),)
+    )
+    conn.commit()
+    return int(cur.rowcount)
+
+
 # --------------------------------------------------------------- retention
 def _retention_cutoff(retention_days: int) -> str:
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)).strftime(
@@ -921,7 +1020,7 @@ def prune_old_data(
     """
     cutoff = _retention_cutoff(retention_days)
     article_subquery = "SELECT article_id FROM analyzed_articles WHERE analyzed_at < ?"
-    tables = ("article_tags", "extractions", "article_checklists")
+    tables = ("article_tags", "extractions", "article_checklists", "notifications")
     counts: dict[str, int] = {}
     try:
         for table in tables:

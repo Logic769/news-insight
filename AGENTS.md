@@ -167,7 +167,7 @@ analyze_batch()
         └── db.record_run_finish()               # runs 统计（scanned/analyzed/skipped/errors/detail）
         │
         ▼
-insight.db（analyzed_articles / article_tags / extractions / article_checklists / runs / analysis_jobs）
+insight.db（analyzed_articles / article_tags / extractions / article_checklists / notifications / runs / analysis_jobs）
         │  analyzed_articles.body 随分析结果落库（检索用），历史行靠 backfill-bodies 回填
         │
         ▼
@@ -205,6 +205,9 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable` |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）；`meta.unread` 为全库未读数，同一篇只提醒一次 |
+| POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
+| POST | `/v1/notifications/read-all` | 全部标记已读，返回更新条数与 `unread: 0` |
 | GET | `/v1/schemas` | 已注册的抽取 schema 列表 |
 | GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询 |
 | GET | `/v1/runs` | 运行记录（模式、扫描/分析/跳过/错误数） |
@@ -337,6 +340,16 @@ CREATE TABLE article_checklists (        -- 派生视图：重新生成不碰事
     generated_at TEXT NOT NULL
 );
 
+CREATE TABLE notifications (             -- 站内提醒：同一篇只提醒一次
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_id  TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    message     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,           -- ISO8601 UTC 带 Z，前端直接 new Date()
+    read_at     TEXT
+);
+
 CREATE TABLE runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at  TEXT NOT NULL,
@@ -452,11 +465,12 @@ docker compose run --rm insight python -m app prune --vacuum
 
 ## 10. 测试策略
 
-### 10.1 现有测试资产（`tests/`，16 个文件）
+### 10.1 现有测试资产（`tests/`，17 个文件）
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=` |
+| `test_notifications.py` | 项目申报公告生成通知、未读/单条已读/全部已读、`--force` 重分析不重复通知、404 |
 | `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
 | `test_tagging.py` | 词表外标签丢弃、去重、max_tags 截断、规则引擎多标签 |
 | `test_extraction_rules.py` | 日期区间取右端、裸开始日期不当截止、中文两位数、闰日、规则引擎不标 verified |

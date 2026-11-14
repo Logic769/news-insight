@@ -464,6 +464,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail="清单已生成但读取失败")
         return _checklist_data(row, checklist)
 
+    @app.get("/v1/notifications")
+    def notifications(
+        limit: int = Query(default=20, ge=1, le=100),
+        unread_only: bool = Query(default=False),
+    ) -> dict:
+        """站内消息提醒：新分析出的项目申报类公告。
+
+        unread 始终是「全库未读数」，不受 unread_only 影响——铃铛角标要的是它，
+        下拉列表才需要只看未读。列表带文章跳转所需的 article_id/url。
+        """
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            items, total, unread = db.list_notifications(
+                conn, limit=limit, unread_only=unread_only
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {"total": total, "unread": unread, "returned": len(items), "limit": limit},
+        }
+
+    @app.post("/v1/notifications/read-all")
+    def notifications_read_all() -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            updated = db.mark_all_notifications_read(conn)
+        finally:
+            conn.close()
+        return {"data": {"updated": updated, "unread": 0}}
+
+    @app.post("/v1/notifications/{notification_id}/read")
+    def notification_read(notification_id: int) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            item = db.mark_notification_read(conn, notification_id)
+        finally:
+            conn.close()
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"未找到通知: {notification_id}")
+        return {"data": item}
+
     @app.get("/v1/schemas")
     def schemas() -> dict:
         s: Settings = app.state.settings
