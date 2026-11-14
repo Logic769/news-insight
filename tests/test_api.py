@@ -200,6 +200,23 @@ def test_empty_category_filter_returns_empty_not_everything(client):
     assert tags and {t["article_count"] for t in tags} == {0}
 
 
+def test_articles_category_and_industry_accept_multi(client):
+    """列表端的 category/industry 与检索端一样支持重复/逗号多选。"""
+    headers = {"X-API-Key": "secret"}
+    client.post("/v1/analyze", params={"limit": 4}, headers=headers)
+
+    both = client.get(
+        "/v1/articles", params={"category": "project_application,other"}, headers=headers
+    ).json()
+    assert both["meta"]["total"] >= 2
+    assert {row["category"] for row in both["data"]} <= {"project_application", "other"}
+
+    # industry= 空串必须与 category= 空串同语义：筛不到任何行，而不是命中未分类行
+    assert client.get("/v1/articles", params={"industry": ""}, headers=headers).json()[
+        "meta"
+    ]["total"] == 0
+
+
 def test_analyze_limit_capped(client):
     resp = client.post(
         "/v1/analyze", params={"limit": 500}, headers={"X-API-Key": "secret"}

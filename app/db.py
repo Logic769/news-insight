@@ -772,9 +772,9 @@ def list_analyzed(
     tag: str | None,
     limit: int,
     offset: int,
-    category: str | None = None,
+    category: str | Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
-    industry: str | None = None,
+    industry: str | Sequence[str] | None = None,
     published_from: str | None = None,
     published_to: str | None = None,
     sort: str = "published_desc",
@@ -789,14 +789,29 @@ def list_analyzed(
     if tag:
         clauses.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag = ?)")
         args.append(tag)
+    def _values(value: str | Sequence[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return [value] if isinstance(value, str) else list(value)
+
     # 用 is not None 而不是真值判断：category= 空串是「筛一个不存在的类」，
-    # 应该和未知类名一样返回空集，而不是静默退化成「不过滤」
-    if category is not None:
-        clauses.append("a.category = ?")
-        args.append(category)
-    if industry is not None:
-        clauses.append("COALESCE(a.industry, '') = ?")
-        args.append(industry)
+    # 应该和未知类名一样返回空集，而不是静默退化成「不过滤」。空列表同理。
+    categories = _values(category)
+    if categories is not None:
+        if categories:
+            placeholders = ",".join("?" for _ in categories)
+            clauses.append(f"a.category IN ({placeholders})")
+            args.extend(categories)
+        else:
+            clauses.append("0")
+    industries = _values(industry)
+    if industries is not None:
+        if industries:
+            placeholders = ",".join("?" for _ in industries)
+            clauses.append(f"COALESCE(a.industry, '') IN ({placeholders})")
+            args.extend(industries)
+        else:
+            clauses.append("0")
     src_clauses, src_args = _source_clause(sources)
     clauses.extend(src_clauses)
     args.extend(src_args)

@@ -139,6 +139,9 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
+| POST | `/v1/auth/login`、`GET /v1/auth/me`、`POST /v1/auth/logout`、`POST /v1/auth/password` | 本地账号：登录发数据库会话 Token（`Authorization: Bearer`）、查当前用户、登出、改密（需原密码，新密码≥8位且含大小写/数字/特殊字符） |
+| GET/PATCH | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏（增删查）、浏览历史（倒序/清空）、关注领域与推送偏好 |
+| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员：用户/站点 CRUD、重置密码、统计看板、操作日志；登录管理员不能禁用/降级自己，服务级 API key 等同超级权限 |
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
@@ -148,7 +151,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `article_not_found`；非项目申报或缺少可用要素/正文 409 `checklist_not_applicable`（字符串错误码）；已有分析/清单生成任务持有同一把全局锁时也返回 409，但错误码为数字 `409`，客户端按 `error.code` 类型区分业务不适用与并发冲突 |
-| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.total` 与列表同筛选（`unread_only=true` 时为未读总数），`meta.unread` 为全库未读数（不受 `unread_only` 影响）；同一篇文章只提醒一次 |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.total` 与列表同筛选（`unread_only=true` 时为未读总数），`meta.unread` 为当前登录用户的未读数（未登录只读模式为全库；不受 `unread_only` 影响）；写已读必须登录或使用服务级 API key；同一篇文章只提醒一次 |
 | POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
 | POST | `/v1/notifications/read-all` | 全部标记已读，返回 `{"data": {"updated": N, "unread": 0}}` |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
@@ -318,7 +321,7 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 ### 鉴权
 
-设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/openapi.json` 外都要求 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。注意 `NEWS_API_KEY` 是**出站**凭证（访问爬虫），与本服务入站鉴权无关。
+入站支持两种凭据：用户登录后的数据库会话 `Authorization: Bearer <token>`（`/v1/auth/login` 获取，按 users/sessions 校验、可撤销、过期失效），或服务级 `X-API-Key: <INSIGHT_API_KEY>`。设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/openapi.json` 外都要求其中一种；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。无鉴权部署下匿名只能读 `/v1/notifications`，写已读必须登录或服务 key。注意 `NEWS_API_KEY` 是**出站**凭证（访问爬虫），与本服务入站鉴权无关。
 
 `/v1/analyze` 是同步兼容接口，`limit` 上限 50；分析作业**全局串行**，同步接口遇到已有批次会立刻返回 409，异步作业遇到分析锁被占用会直接标 `failed`（不会并行烧 token），排队作业总数超过 `ANALYZE_MAX_PENDING_JOBS` 时 `POST /v1/jobs` 返回 429。长批次请用 `POST /v1/jobs` + 轮询；单篇内部仍是「打标 → 抽取 → 清单」三次串行 LLM 调用，整体吞吐由 `ANALYZE_CONCURRENCY`（默认 100）决定。
 

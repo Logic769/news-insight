@@ -210,6 +210,26 @@ def test_admin_user_management_and_role_guard(client):
     assert reset.json()["data"]["temporary_password"]
 
 
+def test_admin_cannot_disable_or_demote_self(client):
+    _create_user(client, "selfadmin", role="admin")
+    token = _token(client, "selfadmin")
+    headers = _auth(token)
+    me = client.get("/v1/auth/me", headers=headers).json()["data"]
+    assert me["role"] == "admin"
+
+    disabled = client.patch(
+        f"/v1/admin/users/{me['id']}", json={"status": "disabled"}, headers=headers
+    )
+    assert disabled.status_code == 400
+    assert "不能禁用或降级当前登录的管理员" in disabled.json()["error"]["message"]
+
+    demoted = client.patch(
+        f"/v1/admin/users/{me['id']}", json={"role": "user"}, headers=headers
+    )
+    assert demoted.status_code == 400
+    assert client.get("/v1/auth/me", headers=headers).json()["data"]["role"] == "admin"
+
+
 def test_admin_sites_stats_and_operation_logs(client):
     _create_user(client, "root", role="admin")
     headers = _auth(_token(client, "root"))

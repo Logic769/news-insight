@@ -192,6 +192,9 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
+| POST/GET | `/v1/auth/login`、`/v1/auth/me`、`/v1/auth/logout`、`/v1/auth/password` | 本地账号登录（数据库会话 Token，`Authorization: Bearer`）、查当前用户、登出、改密；密码策略≥8位且含大小写/数字/特殊字符 |
+| GET/PATCH/POST/DELETE | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏、浏览历史、关注领域与推送偏好（按会话 user_id 隔离） |
+| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员四模块；登录管理员不能禁用/降级自己；服务级 API key 等同超级权限 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含 `category IS NULL` 的历史行） |
 | GET | `/v1/sources` | 按抓取站点聚合：`source`（空串=未标注来源）、`source_filter`（筛选回传值，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`、`latest_published_at`（真实时刻） |
@@ -206,7 +209,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable`（字符串）；已有分析/清单生成任务持锁时也 409，但 `error.code` 为数字 409 |
-| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）；`meta.total` 与列表同筛选，`meta.unread` 为全库未读数，同一篇只提醒一次 |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）；`meta.total` 与列表同筛选，`meta.unread` 为当前登录用户的未读数（未登录只读模式为全库），写已读必须登录或服务级 API key，同一篇只提醒一次 |
 | POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
 | POST | `/v1/notifications/read-all` | 全部标记已读，返回更新条数与 `unread: 0` |
 | GET | `/v1/schemas` | 已注册的抽取 schema 列表 |
@@ -477,11 +480,12 @@ docker compose run --rm insight python -m app prune --vacuum
 
 ## 10. 测试策略
 
-### 10.1 现有测试资产（`tests/`，17 个文件）
+### 10.1 现有测试资产（`tests/`，19 个文件）
 
 | 文件 | 覆盖 |
 | --- | --- |
-| `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=` |
+| `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=`、`/v1/articles` 的 category/industry 多值归一 |
+| `test_accounts_api.py` | 账号与会话：登录成功/失败、Bearer 会话、改密、管理员用户/站点 CRUD、重置密码、操作日志、管理员自保护（不能禁用/降级自己） |
 | `test_notifications.py` | 项目申报公告生成通知、未读/单条已读/全部已读、`--force` 重分析不重复通知、404 |
 | `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
 | `test_tagging.py` | 词表外标签丢弃、去重、max_tags 截断、规则引擎多标签 |
@@ -500,7 +504,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_backfill.py` | 回填正文与正文 HTML：demo 模式拒绝访问网络、网络请求期间不持有未提交事务（读**主连接**的 `in_transaction`，不是新连接；必须 `batch>1` **且行数 > batch**，否则只覆盖到「单 chunk 边取边写」而漏掉「事务跨过下一批请求」）、`--limit 1` 下死链不钉死窗口（扫描预算与写入上限解耦）、`limit<0`/`batch<1` 在发请求前被拒绝（SQLite 把 `LIMIT -1` 当成不限）、候选截断前排序确定、已有正文的行不被覆盖、已有正文但缺 HTML 时只补 HTML |
 | `test_industries.py` | 受控行业：词表 10 项与缺失文件、规则引擎标题优先与 other 兜底、LLM 表外 id 丢弃并夹紧置信度、LLMError 降级规则、save_analysis 行业落库、set_industry 不覆盖已有值、backfill-industries 只补空行且负数 limit 拒绝、检索按行业过滤、/v1/industries 与 /v1/articles?industry= |
 
-基线：宿主机全量 `pytest` **198 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **281 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 

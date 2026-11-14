@@ -17,7 +17,9 @@ from typing import Any
 from app import accounts, db
 from app.settings import Settings
 
-PBKDF2_ITERATIONS = 120_000
+# OWASP 2023 对 PBKDF2-HMAC-SHA256 的建议值。旧用户行保留各自的
+# password_iterations，验证时按行内值计算，升级默认值不会让历史账号失效。
+PBKDF2_ITERATIONS = 600_000
 SALT_BYTES = 16
 TOKEN_BYTES = 32
 
@@ -63,6 +65,9 @@ def create_user(
     role: str = "user",
     must_change_password: bool = False,
 ) -> dict[str, Any]:
+    policy_error = password_policy_error(password)
+    if policy_error:
+        raise ValueError(policy_error)
     digest, salt, iterations = hash_password(password)
     return accounts.create_user(
         conn,
@@ -144,5 +149,6 @@ def revoke_token(settings: Settings, token: str) -> None:
 
 
 def generate_temp_password() -> str:
-    """A one-time password that satisfies the same policy as user-chosen ones."""
-    return f"Tmp@{os.urandom(9).hex()}"
+    """A one-time password that always satisfies password_policy_error()."""
+    # 固定后缀 9aZ 保证一定有数字、小写和大写字母，不靠随机的十六进制碰运气。
+    return f"Tmp@{os.urandom(9).hex()}9aZ"

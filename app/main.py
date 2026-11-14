@@ -34,7 +34,9 @@ LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
 
 
-def _split_multi(values: list[str] | None) -> list[str] | None:
+def _split_multi(
+    values: list[str] | None, *, empty_returns_none: bool = True
+) -> list[str] | None:
     """把多值查询参数（?source=、?category=）归一成「去重、去空、支持逗号分隔」的列表。
 
     三类输入必须区分开，否则前端换个写法就静默查错：
@@ -45,8 +47,12 @@ def _split_multi(values: list[str] | None) -> list[str] | None:
       看到的是「无结果」而不是全部数据。
     - 空片段（"a,,b"）同样忽略，与前者同一套规则：空值 = 不参与筛选。
 
-    全部片段都为空时返回 None（不筛）。这与库层 sources=[]（筛完什么都不剩，返回
-    空集）是两种语义：[] 只能由代码显式传入，HTTP 层永远不会产生它。
+    全部片段都为空时默认返回 None（不筛）。这与库层 sources=[]（筛完什么都不剩，
+    返回空集）是两种语义：[] 只能由代码显式传入，HTTP 层永远不会产生它。
+
+    /v1/articles 的 category/industry 需要保留「空串=筛一个不存在的值」的既有
+    语义（见 test_empty_category_filter_returns_empty_not_everything），因此调用方
+    传 empty_returns_none=False 时返回 []。
 
     source 与 category 共用本函数：两者都是前端的多选控件，用户看不出区别，
     只支持其中一种写法会让「站点多选生效、大类多选静默失效」。
@@ -61,7 +67,7 @@ def _split_multi(values: list[str] | None) -> list[str] | None:
             if name and name not in seen:
                 seen.add(name)
                 out.append(name)
-    return out or None
+    return out or (None if empty_returns_none else [])
 
 
 class AnalyzeJobRequest(BaseModel):
@@ -248,6 +254,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if user is None:
             raise HTTPException(status_code=401, detail="请先登录")
         return user
+
+    def _notification_reader(request: Request, *, write: bool = False) -> dict | None:
+        """通知的用户上下文。
+
+        已登录用户按 user_id 隔离；服务级 API key 视为受信系统调用，可读写全局。
+        无鉴权部署下匿名 GET 保持只读兼容（没有副作用），但任何写操作都必须
+        401——否则跨站页面可用无 body 的简单 POST 把所有人的通知标成已读。
+        """
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            return user
+        if getattr(request.state, "auth_kind", "") == "api_key":
+            return None
+        if write:
+            raise HTTPException(status_code=401, detail="请先登录")
+        return None
 
     def _require_admin(request: Request) -> dict | None:
         """管理员接口：允许服务级 API key，或 role=admin 的登录用户。"""
@@ -933,8 +955,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/articles")
     def articles(
         tag: str | None = Query(default=None),
-        category: str | None = Query(default=None),
-        industry: str | None = Query(default=None),
+        category: Annotated[
+            list[str] | None, Query(description="只在这些大类里筛选，可重复或逗号分隔")
+        ] = None,
+        industry: Annotated[
+            list[str] | None, Query(description="只在这些行业里筛选，可重复或逗号分隔")
+        ] = None,
         source: Annotated[list[str] | None, Query(description="只在这些站点里筛选")] = None,
         published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
         published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
@@ -955,8 +981,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rows, total, undated = db.list_analyzed(
                 conn,
                 tag=tag,
-                category=category,
-                industry=industry,
+                # 列表端点保留「空串=筛一个不存在的类」的既有语义；非空值统一
+                # 支持重复参数与逗号分隔，和 /v1/search 的多选控件行为对齐。
+                category=_split_multi(category, empty_returns_none=False),
+                industry=_split_multi(industry, empty_returns_none=False),
                 sources=_split_multi(source),
                 published_from=since,
                 published_to=until,
@@ -1183,7 +1211,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s: Settings = app.state.settings
         conn = connect(s)
         try:
-            user = getattr(request.state, "user", None)
+            user = _notification_reader(request)
             items, total, unread = db.list_notifications(
                 conn,
                 user_id=int(user["id"]) if user is not None else None,
@@ -1202,7 +1230,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s: Settings = app.state.settings
         conn = connect(s)
         try:
-            user = getattr(request.state, "user", None)
+            user = _notification_reader(request, write=True)
             updated = db.mark_all_notifications_read(
                 conn, user_id=int(user["id"]) if user is not None else None
             )
@@ -1215,7 +1243,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s: Settings = app.state.settings
         conn = connect(s)
         try:
-            user = getattr(request.state, "user", None)
+            user = _notification_reader(request, write=True)
             item = db.mark_notification_read(
                 conn,
                 notification_id,
