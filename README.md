@@ -141,7 +141,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
 | POST | `/v1/auth/login`、`GET /v1/auth/me`、`POST /v1/auth/logout`、`POST /v1/auth/password` | 本地账号：登录发数据库会话 Token（`Authorization: Bearer`）、查当前用户、登出、改密（需原密码，新密码≥8位且含大小写/数字/特殊字符） |
 | GET/PATCH | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏（增删查）、浏览历史（倒序/清空）、关注领域与推送偏好 |
-| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员：用户/站点 CRUD、重置密码、统计看板、操作日志；登录管理员不能禁用/降级自己，服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`（写前由爬虫备份配置，接口型源只能改非接口字段） |
+| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员：用户/站点 CRUD、重置密码、统计看板、操作日志；登录管理员不能禁用/降级自己，服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`（写前由爬虫备份配置，接口型源只能改非接口字段）；`admin/stats` 的每日趋势、任务数与成功率均按近 N 天（本地日）统计 |
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |

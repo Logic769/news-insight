@@ -1107,9 +1107,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         conn = connect(s)
         try:
             items = recommend.upcoming_deadlines(conn, limit=limit)
+            total = recommend.count_upcoming_deadlines(conn)
         finally:
             conn.close()
-        return {"data": items, "meta": {"total": len(items), "limit": limit}}
+        return {"data": items, "meta": {"total": total, "limit": limit}}
 
     @app.get("/v1/search")
     def search_articles(

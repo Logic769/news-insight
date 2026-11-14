@@ -92,4 +92,6 @@ def test_upcoming_deadlines_filters_expired_and_sorts():
     items = recommend.upcoming_deadlines(conn, today=dt.date(2026, 3, 1))
     assert [item["article_id"] for item in items] == ["soon", "late"]
     assert items[0]["days_left"] == 4
+    # 首页卡片显示的是全部未到期条数，不是当页条数；接口 meta.total 用它。
+    assert recommend.count_upcoming_deadlines(conn, today=dt.date(2026, 3, 1)) == 2
     conn.close()

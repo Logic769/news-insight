@@ -215,8 +215,10 @@ def recommendations(conn: Any, *, user_id: int | None, limit: int = 10) -> list[
     return rows[: max(1, min(limit, 50))]
 
 
-def upcoming_deadlines(conn: Any, *, limit: int = 5, today: dt.date | None = None) -> list[dict[str, Any]]:
-    """Project-application deadlines in the near future, soonest first."""
+def _future_deadline_items(
+    conn: Any, *, today: dt.date | None = None
+) -> list[dict[str, Any]]:
+    """All project-application deadlines still ahead, soonest first."""
     base = today or dt.datetime.now(_CST).date()
     rows = conn.execute(
         """SELECT e.article_id, e.value_json, e.raw_text AS deadline_raw,
@@ -247,4 +249,16 @@ def upcoming_deadlines(conn: Any, *, limit: int = 5, today: dt.date | None = Non
         item["days_left"] = days_left
         items.append(item)
     items.sort(key=lambda item: (item["deadline"], item["article_id"]))
-    return items[: max(1, min(limit, 50))]
+    return items
+
+
+def upcoming_deadlines(
+    conn: Any, *, limit: int = 5, today: dt.date | None = None
+) -> list[dict[str, Any]]:
+    """Project-application deadlines in the near future, soonest first."""
+    return _future_deadline_items(conn, today=today)[: max(1, min(limit, 50))]
+
+
+def count_upcoming_deadlines(conn: Any, *, today: dt.date | None = None) -> int:
+    """Total number of deadlines still ahead (the endpoint's meta.total)."""
+    return len(_future_deadline_items(conn, today=today))

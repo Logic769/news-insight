@@ -342,6 +342,54 @@ def test_admin_stats_merges_cli_runs_and_counts_errors(client):
     assert after["success_rate"] == round(after["jobs"]["succeeded"] * 100.0 / finished, 1)
 
 
+def test_admin_stats_window_boundary_uses_local_midnight(client):
+    """窗口首日本地 00:00–08:00 的运行不能因为 UTC 字符串比较被漏计。"""
+    _create_user(client, "root", role="admin")
+    headers = _auth(_token(client, "root"))
+    before = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]["jobs"]
+
+    today = accounts._local_today()
+    first_day = today - dt.timedelta(days=6)
+    boundary = (
+        dt.datetime.combine(first_day, dt.time.min, tzinfo=accounts._CST)
+        .astimezone(dt.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    settings = client.app.state.settings
+    conn = db.connect(settings.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
+            " VALUES (?, ?, 'live', 1, 1, 0, 0)",
+            (boundary, boundary),
+        )
+        conn.execute(
+            "INSERT INTO analysis_jobs (id, status, payload, created_at, finished_at)"
+            " VALUES ('boundary-job', 'succeeded', '{}', ?, ?)",
+            (boundary, boundary),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    after = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]["jobs"]
+    assert after["succeeded"] == before.get("succeeded", 0) + 2
+
+
+def test_admin_sites_proxy_passes_upstream_422(client, monkeypatch):
+    """crawler 的参数校验错误要原样透传，不能被折成 502。"""
+    _create_user(client, "root", role="admin")
+    headers = _auth(_token(client, "root"))
+
+    def reject(self, name, payload):
+        raise UpstreamError("站点名称不合法", status_code=422, fallbackable=False)
+
+    monkeypatch.setattr("app.main.NewsClient.update_site", reject)
+    resp = client.patch("/v1/admin/sites/demo", json={"enabled": False}, headers=headers)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == 422
+
+
 def test_notifications_are_isolated_per_user(client):
     _create_user(client, "u1")
     _create_user(client, "u2")

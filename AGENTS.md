@@ -194,7 +194,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
 | POST/GET | `/v1/auth/login`、`/v1/auth/me`、`/v1/auth/logout`、`/v1/auth/password` | 本地账号登录（数据库会话 Token，`Authorization: Bearer`）、查当前用户、登出、改密；密码策略≥8位且含大小写/数字/特殊字符 |
 | GET/PATCH/POST/DELETE | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏、浏览历史、关注领域与推送偏好（按会话 user_id 隔离） |
-| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员四模块；登录管理员不能禁用/降级自己；服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`，写入前由爬虫备份配置，接口型源只能改非接口字段 |
+| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员四模块；登录管理员不能禁用/降级自己；服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`，写入前由爬虫备份配置，接口型源只能改非接口字段；`admin/stats` 的每日趋势、任务数与成功率均按近 N 天（本地日）统计 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含 `category IS NULL` 的历史行） |
 | GET | `/v1/sources` | 按抓取站点聚合：`source`（空串=未标注来源）、`source_filter`（筛选回传值，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`、`latest_published_at`（真实时刻） |
