@@ -131,7 +131,7 @@ news-insight/
 | `create_app()` | `app/main.py` | 构建 FastAPI 应用、鉴权中间件与 `/v1` 路由 |
 | `resolve_query()` / `score_article()` | `app/search.py` | 把用户输入映射到闭集标签 + 字面词，并按「标签置信度 × 覆盖度 + 标题/正文命中」打分 |
 | `search_grouped()` | `app/db.py` | 检索入口：候选集 → 打分 → 按 6 大类（含 `other` 兜底）分桶，类内按所选 `sort` 排序（默认相关度降序），返回前端直接渲染的结构 |
-| `search_candidates()` | `app/db.py` | 候选集：`py_norm` 归一后的 `instr` 预筛，按「最新优先 + `article_id` 兜底」定序后 `LIMIT`，保证截断集合确定 |
+| `search_candidates()` | `app/db.py` | 候选集：`py_norm` 归一后的 `instr` 预筛，截断前按与 `sort` 一致的时间序（`published_asc` 最早优先，其余最新优先，`article_id` 兜底）定序后 `LIMIT`，保证截断集合确定 |
 | `backfill_bodies()` | `app/backfill.py` | 给历史行补 `body`（逐篇取上游详情），可重复执行、单篇失败不中断 |
 | `save_analysis()` | `app/db.py` | 幂等替换单篇分析结果（SAVEPOINT + 可选批量提交） |
 | `prune_old_data()` | `app/db.py` | 子表 → 主表 → runs → 已完成 analysis_jobs 的硬删除 |
@@ -221,7 +221,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
   - 分数相同按 `published_at` 降序、再按 `article_id` 兜底，顺序不依赖 SQLite 返回顺序（只按时间兜底时，同分同时间的几篇会退回 rowid 顺序，查询计划一变就抖）；
   - 类顺序固定为 `categories.json` 的声明顺序，声明外的分类（如历史行 `category IS NULL`）排在最后；
   - 字面匹配用 `instr()` 而非 `LIKE`：关键词是用户自由输入，`%`/`_` 在 `LIKE` 里是通配符，搜「50%」会命中全库；`category=` 同 `/v1/articles` 一样不做闭集校验，未知类返回 200 空集；空串（`?category=`）在 `/v1/search` 里显式归一成「不传」（`cleaned or None`）—— 透传会让 SQL 变成 `COALESCE(category,'') IN ('')` 只命中历史 NULL 行，而过滤后剩下的空列表又会被 `search_candidates` 当成「筛完没结果」返回空集；`/v1/articles` 用的是 `if category is not None` 判空串语义，两者有意不同；
-  - 候选集上限 `_CANDIDATE_LIMIT = 2000`（`search_candidates` 的默认值），泛词会被截断，`total` 是**候选集内**命中的行数，不是全库真实命中数；截断前按 `ORDER BY COALESCE(published_at, analyzed_at) DESC, article_id DESC` 取，**这个顺序不是展示顺序**（`search_grouped` 之后会重排），它只决定「哪些行活过截断」—— 没有 `ORDER BY` 时同一查询两次可能截到不同集合，用户会看到结果忽有忽无；`search_grouped` 用 `limit=_CANDIDATE_LIMIT + 1` 多取一行判断「是否还有更多」，`len(rows) > _CANDIDATE_LIMIT` 才记 WARNING（带 terms / tag_ids 数量）并截断 —— 直接比对 `== limit` 会在库里恰好 2000 行（其实全取完了）时误报；
+  - 候选集上限 `_CANDIDATE_LIMIT = 2000`（`search_candidates` 的默认值），泛词会被截断，`total` 是**候选集内**命中的行数，不是全库真实命中数；截断前按与 `sort` 一致的真实时刻顺序取（`published_asc` 用 `_TIME_EXPR ASC, article_id ASC` 保留**最早**的 2000 行，其余排序用 `_TIME_EXPR DESC, article_id DESC` 保留**最新**的 2000 行），**这个顺序不是展示顺序**（`search_grouped` 之后会重排），它只决定「哪些行活过截断」—— 没有 `ORDER BY` 时同一查询两次可能截到不同集合，用户会看到结果忽有忽无；`search_grouped` 用 `limit=_CANDIDATE_LIMIT + 1` 多取一行判断「是否还有更多」，`len(rows) > _CANDIDATE_LIMIT` 才记 WARNING（带 terms / tag_ids 数量）并截断 —— 直接比对 `== limit` 会在库里恰好 2000 行（其实全取完了）时误报；
   - SQL 预筛与内存打分跑**同一份归一代码**：`_ensure_norm_func()` 把 `search._norm` 注册成 SQL 函数 `py_norm`（`deterministic=True`，每次查询前注册，幂等），预筛写成 `instr(py_norm(a.title), ?) > 0`，与打分侧是同一个函数。**不能各写一套**：SQLite 的 `lower()` 只折 ASCII（`Ärger` 折完还是 `Ärger`），Python 的 `casefold()` 折成 `ärger`，两层不一致时「用户输入与标题字面完全一致」也会返回空集（200 + 空结果，不报错；真实触发词 ÖBB / Ärzte / Müller / École）。空白同理，搜「gpt 模型」而标题写「GPT模型」；
   - 代价是每行每列每个形态一次 Python 回调，且**成本取决于是否「标题」命中**（本机 min-of-3，规模「候选集打满 2000 行 × 正文 6000 字」，不同机器差 2–3×）：标题命中预筛约 0.05s / 全链路约 0.5s（`OR` 首个条件为真，短路掉 body 的 6000 字归一）；**仅正文**命中约 0.55s / 约 2.0s（标题不含，必须算完 body 才为真，成本与不命中同档，且候选打满时每行都要打分）；全不命中约 0.52s / 约 0.5s（候选为空、不打分）；`body IS NULL` 的历史行约 0.003s（回填前仍能按标题/标签命中）。**只有标题命中才便宜，而用户查的行业词/细分词大多只在正文出现——这是最常见路径，别按 0.05s 估**。纯 SQL `instr`（不命中全扫）约 0.04s，即 `py_norm` 带来一个数量级预筛开销，这是「两侧归一必须同源」的代价。逐行归一 + `score_article` 是另一块大头（仅正文命中且候选打满时约 1.5s）。泛词会打满候选集，**超时按秒级设**（最坏约 2–3s，建议 10s）；若将来候选集需放大到十万级，再考虑 FTS5 或物化归一列；
   - `search.WS_CHARS` 覆盖 ASCII 控制空白、`\x85`、`\xa0`、`\u2000`–`\u200a`、`\u2028`、`\u2029`、`\u3000`（共 22 个）。从 Word / 网页复制的关键词常带 `\u2002`/`\u2003`/`\u2009`，漏一个就表现为「看起来一样的两个词搜不到」且不报错；

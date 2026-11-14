@@ -147,6 +147,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含分类功能上线前的历史行） |
+| GET | `/v1/sources` | 按抓取站点聚合：`source`（空串表示未标注来源，前端显示「未标注来源」）、`count`、`avg_confidence`（平均分类置信度）、`latest_published_at`（按真实时刻取最新发布时间）；前端「发布单位」筛选与统计看板的数据源 |
 | GET | `/v1/tags` | 标签词表 + 每个标签的命中数；带 `category=` 时只统计该大类下的命中 |
 | GET | `/v1/tags/stats` | 标签分布与平均置信度 |
 | GET | `/v1/schemas` | 已注册的抽取 schema |
@@ -210,7 +211,7 @@ curl -H "X-API-Key: $KEY" "http://localhost:8020/v1/search?q=%E4%BA%BA%E6%89%8D%
   6000 字正文里单字高频命中（「的」「年」）会退化到 O(n²)，实测 0.87s；标记数组同一场景 0.004s。
   `matched_terms` 只列实际贡献了命中的形态 —— 被长形态吃掉的短形态不列，否则排障时会误判它是加分来源；
 - 分数相同按发布时间降序、再按 `article_id` 兜底，顺序不依赖 SQLite 的返回顺序（只按时间兜底时，同分同时间的几篇会退回行序，查询计划一变就抖）；
-- 类顺序固定为 `categories.json` 的声明顺序，前端五段布局可以硬编码；
+- 类顺序固定为 `categories.json` 的声明顺序，但分组数不是固定的：除 6 大类外，历史未分类行会单独成组并排在最后，前端应按响应里的 `groups` 动态渲染，不要硬编码分段数；
 - 字面匹配用 `instr()` 而不是 `LIKE`：关键词是用户自由输入，`%` 和 `_` 在 `LIKE` 里是通配符，搜「50%」会命中全库。
   SQL 预筛与内存打分跑**同一份归一代码**：`search._norm` 被注册成 SQL 函数 `py_norm`，
   `instr(py_norm(title), ?)` 与打分侧的 `_norm()` 是同一个函数，物理上不会分叉。这不是洁癖 ——
@@ -299,8 +300,9 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 - 检索是字面 + 闭集标签的混合，没有分词也没有同义词扩展，「补贴」与「资助」靠词表里的 `keywords` 打通；
 - 候选集上限 2000 行（`search_candidates(limit=2000)`），命中极多的泛词（如「的」）会被截断，所以 `total` 是**候选集内**命中的行数，不是全库真实命中数；
-  命中超过上限时保留**最新**的 2000 行（按 `COALESCE(published_at, analyzed_at) DESC, article_id DESC`），
-  所以极老的命中可能搜不到；
+  截断前按与 `sort` 一致的时间顺序取候选：`sort=published_asc` 保留**最早**的 2000 行（按真实时刻 `ASC, article_id ASC`），
+  其余排序（`relevance`/`published_desc`）保留**最新**的 2000 行（按真实时刻 `DESC, article_id DESC`）——
+  所以升序查不会丢掉最老的文章，但最新的命中可能搜不到；降序查则相反，极老的命中可能搜不到；
   候选集打满上限时服务端会记一条 WARNING（带 terms / tag_ids 数量），便于判断是不是关键词太泛导致结果不完整；
   判断方式是「多取一行看是否还有更多」，所以库里恰好 2000 行（全取完）不会误报；
 - `category=` 不做闭集校验，未知类返回空结果而不是 422（同 `/v1/articles?category=`）；
