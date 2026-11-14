@@ -102,11 +102,12 @@ def test_create_notification_is_idempotent_and_keeps_first_read_time(tmp_path):
             conn, article_id="a1", kind="project_application", title="标题", message="消息"
         ) is False
         assert conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 1
-        first = db.mark_notification_read(conn, 1)
-        second = db.mark_notification_read(conn, 1)
+        notification_id = conn.execute("SELECT id FROM notifications LIMIT 1").fetchone()[0]
+        first = db.mark_notification_read(conn, notification_id)
+        second = db.mark_notification_read(conn, notification_id)
         assert first is not None and second is not None
         assert first["read_at"] == second["read_at"]
-        assert db.mark_notification_read(conn, 999) is None
+        assert db.mark_notification_read(conn, notification_id + 999) is None
     finally:
         conn.close()
 

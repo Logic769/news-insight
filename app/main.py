@@ -242,7 +242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict:
         s: Settings = app.state.settings
         if not ANALYZE_LOCK.acquire(blocking=False):
-            raise HTTPException(status_code=409, detail="已有分析任务在运行，请稍后再试")
+            raise HTTPException(status_code=409, detail="已有分析或清单生成任务在运行，请稍后再试")
         try:
             result = analyze_batch(s, limit=limit, force=force)
         except Exception as exc:

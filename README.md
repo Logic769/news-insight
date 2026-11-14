@@ -146,8 +146,8 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/search?q=申报&category=project_application&per_category=20&include_body=false&source=&published_from=&published_to=&sort=relevance` | **关键词检索**：结果按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端直接渲染；详见下节）。`sort` 取 `relevance`/`published_desc`/`published_asc`，`category` 与 `source` 均可重复或逗号分隔 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
-| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `article_not_found`；非项目申报或缺少可用要素/正文 409 `checklist_not_applicable` |
-| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.unread` 为全库未读数（不受 `unread_only` 影响）；同一篇文章只提醒一次 |
+| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `article_not_found`；非项目申报或缺少可用要素/正文 409 `checklist_not_applicable`（字符串错误码）；已有分析/清单生成任务持有同一把全局锁时也返回 409，但错误码为数字 `409`，客户端按 `error.code` 类型区分业务不适用与并发冲突 |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.total` 与列表同筛选（`unread_only=true` 时为未读总数），`meta.unread` 为全库未读数（不受 `unread_only` 影响）；同一篇文章只提醒一次 |
 | POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
 | POST | `/v1/notifications/read-all` | 全部标记已读，返回 `{"data": {"updated": N, "unread": 0}}` |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
