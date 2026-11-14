@@ -183,10 +183,7 @@ def _persist_result(conn, result: _AnalysisResult) -> None:
             LOG.exception("删除旧清单失败 %s", art.id)
     # 站内提醒：只推「新分析出项目申报类公告」，这是策划书第 6~7 月「消息推送提醒」
     # 的最小闭环。create_notification 以 article_id 去重，--force 重分析不会重复提醒。
-    is_project_notice = result.category == "project_application" or any(
-        h.tag_id == "project_application" for h in result.hits
-    )
-    if is_project_notice:
+    if _is_project_notice(result):
         try:
             db.create_notification(
                 conn,
@@ -198,6 +195,17 @@ def _persist_result(conn, result: _AnalysisResult) -> None:
             )
         except Exception:  # 通知失败不影响分析事实
             LOG.exception("保存站内通知失败 %s", art.id)
+
+
+def _is_project_notice(result: _AnalysisResult) -> bool:
+    """判断一条分析结果是否值得提醒。
+
+    标签引擎允许模型返回 confidence=0 的标签（表示「看到了但不确信」），这种标签
+    在检索层已被 e7a54e3 视为无信号；提醒同样不能因为零置信度标签点亮红点。
+    """
+    return result.category == "project_application" or any(
+        h.tag_id == "project_application" and (h.confidence or 0) > 0 for h in result.hits
+    )
 
 
 def analyze_batch(

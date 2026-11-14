@@ -5,7 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import create_app
+from app.main import ANALYZE_LOCK, create_app
 from app.settings import load_settings
 
 
@@ -99,6 +99,21 @@ def test_checklist_generation_rejects_inapplicable_and_missing_articles(client):
     missing = client.post("/v1/articles/notexist/checklist", headers=headers)
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "article_not_found"
+
+
+def test_checklist_generation_returns_409_when_another_job_running(client):
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    assert ANALYZE_LOCK.acquire(blocking=False)
+    try:
+        blocked = client.post(
+            "/v1/articles/a1f0c3e2b7d94a51/checklist", json={"force": True}, headers=headers
+        )
+        assert blocked.status_code == 409
+        assert "已有分析或清单生成任务在运行" in blocked.json()["error"]["message"]
+    finally:
+        ANALYZE_LOCK.release()
 
 
 def test_categories_listing_and_filter(client):

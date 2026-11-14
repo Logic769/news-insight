@@ -957,7 +957,11 @@ def _notification_row(row: sqlite3.Row) -> dict[str, Any]:
 def list_notifications(
     conn: sqlite3.Connection, *, limit: int = 20, unread_only: bool = False
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """返回 (通知列表, 总数, 未读数)；未读数不受 unread_only 影响，供铃铛角标使用。"""
+    """返回 (通知列表, 总数, 未读数)。
+
+    total 与列表使用同一筛选条件：unread_only=true 时它等于未读总数，
+    而不是全库总量；unread 则始终是全库未读数，供铃铛角标使用。
+    """
     where = "WHERE n.read_at IS NULL" if unread_only else ""
     rows = conn.execute(
         f"""SELECT n.id, n.article_id, n.kind, n.title, n.message, n.created_at, n.read_at,
@@ -969,7 +973,9 @@ def list_notifications(
             LIMIT ?""",
         (limit,),
     ).fetchall()
-    total = int(conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0])
+    total = int(
+        conn.execute(f"SELECT COUNT(*) FROM notifications n {where}").fetchone()[0]
+    )
     unread = int(
         conn.execute("SELECT COUNT(*) FROM notifications WHERE read_at IS NULL").fetchone()[0]
     )

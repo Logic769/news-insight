@@ -452,14 +452,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     }
                 },
             )
-        result = checklist_service.build_for_input(s, source)
-        items = checklist_service.items_payload(result)
-        conn = connect(s)
+        # 清单生成会调用 LLM，和批量分析共用同一把非阻塞锁：既防重复烧 token，
+        # 也避免多个并发 force 请求把上游打满。拿不到锁时明确返回 409。
+        if not ANALYZE_LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="已有分析或清单生成任务在运行，请稍后再试")
         try:
-            db.save_checklist(conn, article_id=article_id, engine=result.engine, items=items)
-            checklist = db.get_checklist(conn, article_id)
+            result = checklist_service.build_for_input(s, source)
+            items = checklist_service.items_payload(result)
+            conn = connect(s)
+            try:
+                db.save_checklist(conn, article_id=article_id, engine=result.engine, items=items)
+                checklist = db.get_checklist(conn, article_id)
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            ANALYZE_LOCK.release()
         if checklist is None:  # pragma: no cover - save_checklist 成功时不会发生
             raise HTTPException(status_code=500, detail="清单已生成但读取失败")
         return _checklist_data(row, checklist)
