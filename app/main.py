@@ -100,7 +100,7 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=200)
 
 
-class ChangePasswordRequest(BaseModel):
+class PasswordChangeRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=200)
     new_password: str = Field(min_length=1, max_length=200)
 
@@ -405,7 +405,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"data": {"logged_out": True}}
 
     @app.post("/v1/auth/password")
-    def auth_change_password(payload: ChangePasswordRequest, request: Request) -> dict:
+    def auth_change_password(payload: PasswordChangeRequest, request: Request) -> dict:
         s: Settings = app.state.settings
         user = _current_user(request)
         if payload.current_password == payload.new_password:
