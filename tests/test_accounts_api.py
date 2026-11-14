@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -303,22 +305,31 @@ def test_admin_stats_merges_cli_runs_and_counts_errors(client):
 
     before = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]["jobs"]
     settings = client.app.state.settings
+    today = accounts._local_today()
+    recent = (today - dt.timedelta(days=1)).isoformat()
+    stale = (today - dt.timedelta(days=30)).isoformat()
     conn = db.connect(settings.db_path)
     try:
         conn.execute(
             "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
             " VALUES (?, ?, 'live', 10, 9, 1, 0)",
-            ("2026-11-14T01:00:00Z", "2026-11-14T01:01:00Z"),
+            (f"{recent}T01:00:00Z", f"{recent}T01:01:00Z"),
         )
         conn.execute(
             "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
             " VALUES (?, ?, 'live', 10, 0, 0, 3)",
-            ("2026-11-14T02:00:00Z", "2026-11-14T02:01:00Z"),
+            (f"{recent}T02:00:00Z", f"{recent}T02:01:00Z"),
         )
         conn.execute(
             "INSERT INTO runs (started_at, mode, scanned, analyzed, skipped, errors)"
             " VALUES (?, 'live', 10, 0, 0, 0)",
-            ("2026-11-14T03:00:00Z",),
+            (f"{recent}T03:00:00Z",),
+        )
+        # 窗口外的失败 run 不能拉低近 7 天成功率：days 过滤必须同时作用于 runs。
+        conn.execute(
+            "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
+            " VALUES (?, ?, 'live', 10, 0, 0, 5)",
+            (f"{stale}T02:00:00Z", f"{stale}T02:01:00Z"),
         )
         conn.commit()
     finally:

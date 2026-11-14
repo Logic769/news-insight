@@ -33,6 +33,9 @@ LOG = logging.getLogger("news_insight.main")
 _OPEN_PATHS = ("/health", "/docs", "/redoc", "/openapi.json")
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
+# 相关度排序要在 Python 里用用户画像算完再切页，因此只能对固定候选池排序。
+# 超过这个窗口必须显式报错，不能像以前那样返回空页却仍报真实 total。
+RELEVANCE_CANDIDATE_LIMIT = 2000
 
 
 def _split_multi(
@@ -142,30 +145,33 @@ class AdminUserUpdate(BaseModel):
 
 
 class AdminSiteCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=128)
-    list_url: str = Field(min_length=1, max_length=500)
-    category: str = Field(default="", max_length=64)
-    region: str = Field(default="", max_length=64)
-    timezone: str = Field(default="Asia/Shanghai", max_length=64)
+    # 与 news_api/models.py 的 SiteConfigCreate 保持同一组上限：本层先拒掉
+    # 明显超长的输入，避免把 422 留到上游才暴露（两套上限不一致时前端很难判断
+    # 究竟是哪一层拒绝的）。
+    name: str = Field(min_length=1, max_length=100)
+    list_url: str = Field(min_length=1, max_length=2048)
+    category: str = Field(default="", max_length=50)
+    region: str = Field(default="", max_length=100)
+    timezone: str = Field(default="Asia/Shanghai", max_length=100)
     enabled: bool = True
     render: bool = False
-    item_xpath: str = Field(default="//li", max_length=2000)
-    title_xpath: str = Field(default=".//a", max_length=2000)
-    url_xpath: str = Field(default=".//a/@href", max_length=2000)
-    date_xpath: str = Field(default="", max_length=2000)
+    item_xpath: str = Field(default="//li", max_length=1000)
+    title_xpath: str = Field(default=".//a", max_length=1000)
+    url_xpath: str = Field(default=".//a/@href", max_length=1000)
+    date_xpath: str = Field(default="", max_length=1000)
 
 
 class AdminSiteUpdate(BaseModel):
-    list_url: str | None = Field(default=None, min_length=1, max_length=500)
-    category: str | None = Field(default=None, max_length=64)
-    region: str | None = Field(default=None, max_length=64)
-    timezone: str | None = Field(default=None, max_length=64)
+    list_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    category: str | None = Field(default=None, max_length=50)
+    region: str | None = Field(default=None, max_length=100)
+    timezone: str | None = Field(default=None, max_length=100)
     enabled: bool | None = None
     render: bool | None = None
-    item_xpath: str | None = Field(default=None, max_length=2000)
-    title_xpath: str | None = Field(default=None, max_length=2000)
-    url_xpath: str | None = Field(default=None, max_length=2000)
-    date_xpath: str | None = Field(default=None, max_length=2000)
+    item_xpath: str | None = Field(default=None, max_length=1000)
+    title_xpath: str | None = Field(default=None, max_length=1000)
+    url_xpath: str | None = Field(default=None, max_length=1000)
+    date_xpath: str | None = Field(default=None, max_length=1000)
 
 
 @asynccontextmanager
@@ -307,6 +313,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def _client_ip(request: Request) -> str:
         return request.client.host if request.client is not None else ""
+
+    def _upstream_status(exc: UpstreamError, *, default: int = 502) -> int:
+        """把爬虫的 4xx 原样传回，只有网络/5xx 才折成 502。
+
+        管理台需要看到「名字重复（409）/字段不合法（422）」这类可修正的错误；
+        全部折成 502 会让前端只能提示「服务不可用」，用户不知道该改什么。
+        """
+        code = exc.status_code or 0
+        if code in (400, 404, 409, 422):
+            return code
+        return default
 
     def _audit(
         request: Request,
@@ -731,7 +748,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             items = client.list_sites()
         except UpstreamError as exc:
-            raise HTTPException(status_code=502, detail=f"读取爬虫站点配置失败: {exc}") from exc
+            raise HTTPException(
+                status_code=_upstream_status(exc), detail=f"读取爬虫站点配置失败: {exc}"
+            ) from exc
         finally:
             client.close()
         return {"data": items, "meta": {"total": len(items), "source": "crawler"}}
@@ -745,8 +764,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             site = client.create_site(values)
         except UpstreamError as exc:
-            code = 409 if exc.status_code == 409 else 502
-            raise HTTPException(status_code=code, detail=str(exc)) from exc
+            raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
         finally:
             client.close()
         conn = connect(s)
@@ -766,8 +784,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             site = client.update_site(name, values)
         except UpstreamError as exc:
-            code = 404 if exc.status_code == 404 else 502
-            raise HTTPException(status_code=code, detail=str(exc)) from exc
+            raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
         finally:
             client.close()
         conn = connect(s)
@@ -786,8 +803,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             client.delete_site(name)
         except UpstreamError as exc:
-            code = 404 if exc.status_code == 404 else 502
-            raise HTTPException(status_code=code, detail=str(exc)) from exc
+            raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
         finally:
             client.close()
         conn = connect(s)
@@ -1000,6 +1016,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # 否则只能对当前页排序，翻页会看到乱序。当前库 480 篇，用 2000 的
             # 候选上限足够；达到上限时 total 仍来自 SQL，界面会显示真实总数。
             if sort in ("relevance_desc", "relevance_asc"):
+                if offset + limit > RELEVANCE_CANDIDATE_LIMIT:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"相关度排序最多支持前 {RELEVANCE_CANDIDATE_LIMIT} 条，"
+                            "请缩小筛选范围或改用发布时间排序"
+                        ),
+                    )
                 rows, total, undated = db.list_analyzed(
                     conn,
                     tag=tag,
@@ -1009,7 +1033,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     published_from=since,
                     published_to=until,
                     sort="published_desc",
-                    limit=2000,
+                    limit=RELEVANCE_CANDIDATE_LIMIT,
                     offset=0,
                 )
                 recommend.annotate_rows(rows, profile)

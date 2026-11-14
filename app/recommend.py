@@ -36,6 +36,10 @@ _P_TAG = 0.20
 _P_CATEGORY = 0.10
 _P_SOURCE = 0.05
 
+# 截止日期按站点墙钟日比较。容器默认 UTC，直接用 date.today() 会在
+# 东八区 00:00–08:00 把「还剩 1 天」算成「已过期」。
+_CST = dt.timezone(dt.timedelta(hours=8))
+
 
 def _parse_time(value: Any) -> dt.datetime | None:
     if not value:
@@ -213,7 +217,7 @@ def recommendations(conn: Any, *, user_id: int | None, limit: int = 10) -> list[
 
 def upcoming_deadlines(conn: Any, *, limit: int = 5, today: dt.date | None = None) -> list[dict[str, Any]]:
     """Project-application deadlines in the near future, soonest first."""
-    base = today or dt.date.today()
+    base = today or dt.datetime.now(_CST).date()
     rows = conn.execute(
         """SELECT e.article_id, e.value_json, e.raw_text AS deadline_raw,
                   a.title, a.source, a.url, a.published_at, a.category,

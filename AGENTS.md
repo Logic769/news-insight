@@ -194,7 +194,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
 | POST/GET | `/v1/auth/login`、`/v1/auth/me`、`/v1/auth/logout`、`/v1/auth/password` | 本地账号登录（数据库会话 Token，`Authorization: Bearer`）、查当前用户、登出、改密；密码策略≥8位且含大小写/数字/特殊字符 |
 | GET/PATCH/POST/DELETE | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏、浏览历史、关注领域与推送偏好（按会话 user_id 隔离） |
-| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员四模块；登录管理员不能禁用/降级自己；服务级 API key 等同超级权限 |
+| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员四模块；登录管理员不能禁用/降级自己；服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`，写入前由爬虫备份配置，接口型源只能改非接口字段 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含 `category IS NULL` 的历史行） |
 | GET | `/v1/sources` | 按抓取站点聚合：`source`（空串=未标注来源）、`source_filter`（筛选回传值，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`、`latest_published_at`（真实时刻） |
@@ -203,9 +203,11 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有分析或清单生成任务持锁时 409，失败 502 |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
-| GET | `/v1/articles?tag=&category=&industry=&limit=&offset=` | 已分析文章列表，可按标签、大类和/或受控行业过滤（AND 组合，`limit` ≤ 200）；`category`/`industry` 可重复或逗号分隔 |
+| GET | `/v1/articles?tag=&category=&industry=&limit=&offset=&sort=` | 已分析文章列表，可按标签、大类和/或受控行业过滤（AND 组合，`limit` ≤ 200）；`category`/`industry` 可重复或逗号分隔；`sort` 支持 `published_desc/asc`、`updated_desc`、`confidence_desc/asc`、`relevance_desc/asc`，相关度排序只在前 2000 条候选内计算，`offset+limit` 超过时 422；每项带 `relevance`（0–100） |
 | GET | `/v1/search?q=&category=&industry=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`industry`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
 | GET | `/v1/industries` | 受控行业词表 + 每个行业文章数（`meta.total`/词表版本），供前端筛选与徽标 |
+| GET | `/v1/recommendations?limit=10` | 首页推荐：登录用户按关注领域/收藏/浏览历史与内容质量混合打分，匿名用户按内容质量与新鲜度；`meta.personalized` 标识是否个性化 |
+| GET | `/v1/todos?limit=5` | 首页近期截止：从项目申报抽取结果的 `deadline` 取未过期项，按剩余天数升序；`meta.total` 是全部未过期项数量 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable`（字符串）；已有分析/清单生成任务持锁时也 409，但 `error.code` 为数字 409 |
@@ -504,7 +506,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_backfill.py` | 回填正文与正文 HTML：demo 模式拒绝访问网络、网络请求期间不持有未提交事务（读**主连接**的 `in_transaction`，不是新连接；必须 `batch>1` **且行数 > batch**，否则只覆盖到「单 chunk 边取边写」而漏掉「事务跨过下一批请求」）、`--limit 1` 下死链不钉死窗口（扫描预算与写入上限解耦）、`limit<0`/`batch<1` 在发请求前被拒绝（SQLite 把 `LIMIT -1` 当成不限）、候选截断前排序确定、已有正文的行不被覆盖、已有正文但缺 HTML 时只补 HTML |
 | `test_industries.py` | 受控行业：词表 10 项与缺失文件、规则引擎标题优先与 other 兜底、LLM 表外 id 丢弃并夹紧置信度、LLMError 降级规则、save_analysis 行业落库、set_industry 不覆盖已有值、backfill-industries 只补空行且负数 limit 拒绝、检索按行业过滤、/v1/industries 与 /v1/articles?industry= |
 
-基线：宿主机全量 `pytest` **281 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **289 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 

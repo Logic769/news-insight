@@ -295,6 +295,19 @@ def test_articles_relevance_sort_returns_scores_in_order(client):
     assert [row["relevance"] for row in asc] == sorted(row["relevance"] for row in asc)
 
 
+def test_articles_relevance_sort_rejects_window_beyond_candidate_limit(client):
+    """相关度排序只排前 2000 条候选；超出窗口必须明确 422，不能返回空页。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+    resp = client.get(
+        "/v1/articles",
+        params={"sort": "relevance_desc", "offset": 1999, "limit": 2},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert "2000" in resp.json()["error"]["message"]
+
+
 def test_recommendations_and_todos_endpoints(client):
     """/v1/recommendations 与 /v1/todos 是首页两块数据的唯一来源。"""
     headers = {"X-API-Key": "secret"}

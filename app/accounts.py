@@ -18,6 +18,15 @@ def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# 数据里的 published_at 是站点墙钟（当前 6 个源全是东八区）。容器默认 UTC，
+# 直接 date.today() 会在东八区 00:00–08:00 把「今天」算成昨天。
+_CST = dt.timezone(dt.timedelta(hours=8))
+
+
+def _local_today() -> dt.date:
+    return dt.datetime.now(_CST).date()
+
+
 def _user_row(row: sqlite3.Row, *, include_secret: bool = False) -> dict[str, Any]:
     item = dict(row)
     if not include_secret:
@@ -538,7 +547,7 @@ def delete_site(conn: sqlite3.Connection, site_id: int) -> bool:
 # ------------------------------------------------------------------ admin stats
 def admin_summary(conn: sqlite3.Connection, *, days: int = 7) -> dict[str, Any]:
     days = max(1, min(90, days))
-    start = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
+    start = (_local_today() - dt.timedelta(days=days - 1)).isoformat()
     total_articles = int(conn.execute("SELECT COUNT(*) FROM analyzed_articles").fetchone()[0])
     total_sources = int(
         conn.execute("SELECT COUNT(DISTINCT source) FROM analyzed_articles").fetchone()[0]
@@ -566,15 +575,19 @@ def admin_summary(conn: sqlite3.Connection, *, days: int = 7) -> dict[str, Any]:
     # 的 runs。只统计前者时，线上实际跑的分析（CLI）会让「成功率」「任务数」看起
     # 来永远是 0/100。runs 没有 status 列，用 errors 是否为 0 归类；未完成的 run
     # （finished_at 为空）不计入成功率分母，避免刚启动就被算成失败。
+    # days 是「最近 N 天」；作业/运行统计必须与 daily 同一窗口，否则看板
+    # 一边显示近 7 天文章、一边把全部历史任务算进成功率。
     job_rows = conn.execute(
-        "SELECT status, COUNT(*) AS count FROM analysis_jobs GROUP BY status"
+        "SELECT status, COUNT(*) AS count FROM analysis_jobs WHERE created_at >= ? GROUP BY status",
+        (start,),
     ).fetchall()
     jobs = {str(row["status"]): int(row["count"]) for row in job_rows}
     run_stats = conn.execute(
         """SELECT
              SUM(CASE WHEN finished_at IS NOT NULL AND errors = 0 THEN 1 ELSE 0 END) AS succeeded,
              SUM(CASE WHEN finished_at IS NOT NULL AND errors > 0 THEN 1 ELSE 0 END) AS failed
-           FROM runs"""
+           FROM runs WHERE started_at >= ?""",
+        (start,),
     ).fetchone()
     run_succeeded = int(run_stats["succeeded"] or 0) if run_stats else 0
     run_failed = int(run_stats["failed"] or 0) if run_stats else 0
