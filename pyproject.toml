@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 # 版本与 CI（.github/workflows/ci.yml）保持一致，避免本地与 CI 结论不同。
 # pyyaml 同时供 tools/yaml_lint.py 与 tests/test_yaml_lint.py 使用，版本与 CI 一致。
-dev = ["pytest>=8.0", "ruff==0.17.3", "mypy==2.4.1", "pyyaml>=6,<7", "types-PyYAML>=6.0,<7"]
+dev = ["pytest>=8.0", "ruff==0.17.5", "mypy==2.4.1", "pyyaml>=6,<7", "types-PyYAML>=6.0,<7"]
 
 # yaml lint job 只装这一组：不再为校验 2 个 YAML 拉 fastapi/uvicorn/httpx/pydantic
 # 这些运行依赖（冷装实测纯 pyyaml 1.9s、这一组 19.4s、dev 组 37s——差额主要是构建本项目本身）。
