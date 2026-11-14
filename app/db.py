@@ -573,14 +573,30 @@ def normalize_day_end(value: str | None) -> str | None:
     return parsed.strftime("%Y-%m-%d 00:00:00")
 
 
+# 未标注来源（source 为空串/NULL）没有天然可用的筛选值：空串在 HTTP 层表示「清空多选」，
+# 会被 _split_multi 丢弃。这里给一个显式 token，前端从 /v1/sources 的 source_filter 拿到它，
+# 筛选时原样回传，库里再映射成「source 为空」。
+UNLABELED_SOURCE = "__unlabeled__"
+
+
 def _source_clause(sources: Sequence[str] | None) -> tuple[list[str], list[Any]]:
     if sources is None:
         return [], []
     if not sources:
         # 空列表 = 「筛完什么都不剩」，与不传（None）不是一回事
         return ["0"], []
-    placeholders = ",".join("?" for _ in sources)
-    return [f"a.source IN ({placeholders})"], list(sources)
+    names = [s for s in sources if s != UNLABELED_SOURCE]
+    clauses: list[str] = []
+    args: list[Any] = []
+    if names:
+        placeholders = ",".join("?" for _ in names)
+        clauses.append(f"a.source IN ({placeholders})")
+        args.extend(names)
+    if len(names) != len(sources):
+        clauses.append("COALESCE(a.source, '') = ''")
+    if len(clauses) == 1:
+        return clauses, args
+    return ["(" + " OR ".join(clauses) + ")"], args
 
 
 # 列表排序：默认最新优先。按 category_confidence 排时用 IS NULL 前缀把缺值的行
@@ -828,8 +844,11 @@ def source_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ).fetchall()
     # 不在这里过滤空 source：/v1/articles 的 total 把它算进去，这里若跳过，
     # sum(count) 会比 total 少，前端「全部来源」与站点计数会对不上。
-    # 空 source 由前端显示成「未标注来源」。
-    return [dict(r) for r in rows]
+    # 空 source 由前端显示成「未标注来源」；它自己需要一个非空筛选值，
+    # 因为空串在 HTTP 层是「清空多选」，无法选中这一组。
+    return [
+        {**dict(r), "source_filter": r["source"] or UNLABELED_SOURCE} for r in rows
+    ]
 
 
 def list_extractions(
@@ -1135,8 +1154,10 @@ def search_candidates(
     # 留下墙钟最老的（生产库 29% 的行两者不在同一天）。
     if sort not in SEARCH_SORTS:
         raise ValueError(f"未知排序: {sort}")
+    # ASC 时 SQLite 把 NULL 排在最前，两列皆空的行会占掉「最早」的名额；加 IS NULL
+    # 前缀把它们压到最后，只影响截断保留哪一批。空白文本键不是 NULL，本前缀不改变其顺序。
     cutoff_order = (
-        f"{_TIME_EXPR} ASC, a.article_id ASC"
+        f"({_TIME_EXPR} IS NULL), {_TIME_EXPR} ASC, a.article_id ASC"
         if sort == "published_asc"
         else f"{_TIME_EXPR} DESC, a.article_id DESC"
     )

@@ -200,7 +200,15 @@ def test_sources_stats_endpoint(client):
     total = client.get("/v1/articles", params={"limit": 1}, headers=headers).json()["meta"]["total"]
     assert sum(r["count"] for r in rows) == total
     for row in rows:
-        assert set(row) == {"source", "count", "avg_confidence", "latest_published_at"}
+        assert set(row) == {
+            "source",
+            "source_filter",
+            "count",
+            "avg_confidence",
+            "latest_published_at",
+        }
+        assert row["source_filter"], "source_filter 必须非空，空串无法作为筛选值"
+        assert row["source_filter"] == (row["source"] or "__unlabeled__")
 
 
 def test_sources_stats_requires_key(client):

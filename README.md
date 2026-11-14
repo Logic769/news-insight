@@ -147,7 +147,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含分类功能上线前的历史行） |
-| GET | `/v1/sources` | 按抓取站点聚合：`source`（空串表示未标注来源，前端显示「未标注来源」）、`count`、`avg_confidence`（平均分类置信度）、`latest_published_at`（按真实时刻取最新发布时间）；前端「发布单位」筛选与统计看板的数据源 |
+| GET | `/v1/sources` | 按抓取站点聚合：`source`（空串表示未标注来源，前端显示「未标注来源」）、`source_filter`（筛选时回传的值：普通来源等于 `source`，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`（平均分类置信度）、`latest_published_at`（按真实时刻取最新发布时间）；前端「发布单位」筛选应使用 `source_filter`，统计看板用 `source` 展示 |
 | GET | `/v1/tags` | 标签词表 + 每个标签的命中数；带 `category=` 时只统计该大类下的命中 |
 | GET | `/v1/tags/stats` | 标签分布与平均置信度 |
 | GET | `/v1/schemas` | 已注册的抽取 schema |
@@ -300,7 +300,7 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 - 检索是字面 + 闭集标签的混合，没有分词也没有同义词扩展，「补贴」与「资助」靠词表里的 `keywords` 打通；
 - 候选集上限 2000 行（`search_candidates(limit=2000)`），命中极多的泛词（如「的」）会被截断，所以 `total` 是**候选集内**命中的行数，不是全库真实命中数；
-  截断前按与 `sort` 一致的时间顺序取候选：`sort=published_asc` 保留**最早**的 2000 行（按真实时刻 `ASC, article_id ASC`），
+  截断前按与 `sort` 一致的时间顺序取候选：`sort=published_asc` 保留**最早**的 2000 行（按真实时刻 `ASC, article_id ASC`，两列皆空的记录排在最后，不占早段名额），
   其余排序（`relevance`/`published_desc`）保留**最新**的 2000 行（按真实时刻 `DESC, article_id DESC`）——
   所以升序查不会丢掉最老的文章，但最新的命中可能搜不到；降序查则相反，极老的命中可能搜不到；
   候选集打满上限时服务端会记一条 WARNING（带 terms / tag_ids 数量），便于判断是不是关键词太泛导致结果不完整；

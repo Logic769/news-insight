@@ -192,6 +192,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含 `category IS NULL` 的历史行） |
+| GET | `/v1/sources` | 按抓取站点聚合：`source`（空串=未标注来源）、`source_filter`（筛选回传值，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`、`latest_published_at`（真实时刻） |
 | GET | `/v1/tags` | 标签词表 + 每个标签命中数；带 `category=` 时只统计该类下的命中 |
 | GET | `/v1/tags/stats` | 标签分布与平均置信度 |
 | POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有批次时 409，失败 502 |

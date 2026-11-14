@@ -630,14 +630,14 @@ def test_search_candidates_keeps_newest_rows_when_truncating() -> None:
     assert again == ids, "同一查询两次必须截到同一集合"
 
 
-def test_search_candidates_sorts_undated_rows_by_sql_null_order() -> None:
-    """两个时间列都空的行按 SQL 的 NULL 序参与排序：NULL 最小，降序沉底、升序置顶。
+def test_search_candidates_puts_undated_rows_last_in_both_directions() -> None:
+    """两个时间列都空的行在升、降序里都排最后。
 
     早先定序写成 COALESCE(published_at, analyzed_at)：没有发布时间的行会被
     analyzed_at（分析时刻，通常就是今天）顶到**最前**，用户按时间浏览时先看到的
-    全是无日期的老行。改成 _TIME_EXPR 后它们不再拿分析时刻冒充发布时间，
-    行为收敛成 SQLite 的默认 NULL 序（生产库当前 0 行两列皆空，带时间过滤时
-    这类行本来就会被排除并计入 undated_excluded）。
+    全是无日期的老行。改成 _TIME_EXPR 后它们不再拿分析时刻冒充发布时间。
+    降序时 SQL 的 NULL 序本来就在末尾；升序则必须加 IS NULL 前缀，否则 NULL 会
+    排最前，截断到 2000 行时挤掉最早的有日期记录。
     """
     conn = _conn()
     _add(conn, "with_date", title="光伏补贴", published_at="2026-11-01 00:00:00")
@@ -652,9 +652,9 @@ def test_search_candidates_sorts_undated_rows_by_sql_null_order() -> None:
     ids = [r["article_id"] for r in rows]
     assert ids == ["with_date", "no_date"], ids
 
-    # 升序时 NULL 最小，无日期行排最前；行为由 SQL 的 NULL 序决定，写死以便察觉变化
+    # 升序也必须把无日期行压到最后，否则它们会占掉「最早」的截断名额
     asc = db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="published_asc", limit=10)
-    assert [r["article_id"] for r in asc] == ["no_date", "with_date"]
+    assert [r["article_id"] for r in asc] == ["with_date", "no_date"]
 
 
 def test_search_candidates_tie_break_is_article_id_desc() -> None:
@@ -926,6 +926,37 @@ def test_source_stats_includes_empty_source_so_counts_add_up() -> None:
     rows = db.source_stats(conn)
     assert sum(r["count"] for r in rows) == 2
     assert {r["source"] for r in rows} == {"site-a", ""}
+    by_source = {r["source"]: r for r in rows}
+    assert by_source["site-a"]["source_filter"] == "site-a"
+    assert by_source[""]["source_filter"] == db.UNLABELED_SOURCE
+
+
+def test_source_filter_unlabeled_token_matches_only_empty_source() -> None:
+    """未标注来源必须能用显式 token 筛到：空串在 HTTP 层表示「清空多选」，会被丢弃。"""
+    conn = _conn()
+    _add_dt(conn, "a1", source="site-a")
+    _add_dt(conn, "a2", source="")
+    _add_dt(conn, "a3", source="site-b")
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        sources=[db.UNLABELED_SOURCE],
+    )
+    got = [item["article_id"] for group in out["groups"] for item in group["items"]]
+    assert got == ["a2"]
+
+    mixed = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        sources=["site-a", db.UNLABELED_SOURCE],
+    )
+    mixed_ids = [item["article_id"] for group in mixed["groups"] for item in group["items"]]
+    assert set(mixed_ids) == {"a1", "a2"}
 
 
 # --------------------------------------------- B1 回归：三处时间口径必须一致
@@ -1019,6 +1050,19 @@ def test_search_candidates_ascending_keeps_oldest_by_real_instant() -> None:
     rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="published_asc", limit=1)
     assert [r["article_id"] for r in rows] == ["A"], (
         "A 的真实时刻 16:00Z 最早；按墙钟截断会留下 B（墙钟 03-01 23:00 早于 A 的 03-02 00:00）"
+    )
+
+
+def test_search_candidates_ascending_keeps_dated_rows_over_undated_when_truncating() -> None:
+    """升序截断时 NULL 时间键不能挤掉最早的有日期行（SQLite 默认把 NULL 排最前）。"""
+    conn = _conn()
+    _add_dt(conn, "undated", published_at=None, published_at_utc=None)
+    _add_dt(conn, "old", published_at="2020-01-01 00:00:00", published_at_utc="2020-01-01 00:00:00")
+    _add_dt(conn, "new", published_at="2026-11-01 00:00:00", published_at_utc="2026-11-01 00:00:00")
+
+    rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="published_asc", limit=2)
+    assert [r["article_id"] for r in rows] == ["old", "new"], (
+        "两列皆空的行必须排在有日期行之后，否则它会占掉「最早」的截断名额"
     )
 
 
