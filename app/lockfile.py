@@ -7,6 +7,7 @@ worker 同时跑 analyze（会重复调用 LLM、重复写库）。线程锁只�
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import threading
@@ -28,7 +29,7 @@ def _lock_fd(fd: int, *, blocking: bool) -> None:
     try:
         fcntl = _get_fcntl()
     except ImportError:  # pragma: no cover - Windows
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         os.lseek(fd, 0, os.SEEK_SET)
         mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
@@ -42,7 +43,7 @@ def _unlock_fd(fd: int) -> None:
     try:
         fcntl = _get_fcntl()
     except ImportError:  # pragma: no cover - Windows
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         os.lseek(fd, 0, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
