@@ -346,6 +346,7 @@ def test_admin_stats_window_boundary_uses_local_midnight(client):
     """窗口首日本地 00:00–08:00 的作业/运行/活跃用户都不能因 UTC 边界被漏计。"""
     _create_user(client, "root", role="admin")
     _create_user(client, "viewer")
+    _create_user(client, "outsider")
     headers = _auth(_token(client, "root"))
     before = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]
 
@@ -363,7 +364,8 @@ def test_admin_stats_window_boundary_uses_local_midnight(client):
     conn = db.connect(settings.db_path)
     try:
         viewer = accounts.get_user_by_username(conn, "viewer")
-        assert viewer is not None
+        outsider = accounts.get_user_by_username(conn, "outsider")
+        assert viewer is not None and outsider is not None
         conn.execute(
             "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
             " VALUES (?, ?, 'live', 1, 1, 0, 0)",
@@ -388,6 +390,11 @@ def test_admin_stats_window_boundary_uses_local_midnight(client):
             "INSERT INTO operation_logs (user_id, username, action, created_at)"
             " VALUES (?, 'viewer', 'auth.login', ?)",
             (int(viewer["id"]), boundary_iso),
+        )
+        conn.execute(
+            "INSERT INTO operation_logs (user_id, username, action, created_at)"
+            " VALUES (?, 'outsider', 'auth.login', ?)",
+            (int(outsider["id"]), outside_local.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
         )
         conn.commit()
     finally:
