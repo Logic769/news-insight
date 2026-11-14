@@ -5,6 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+import app.main as main
 from app.main import ANALYZE_LOCK, create_app
 from app.settings import load_settings
 
@@ -114,6 +115,32 @@ def test_checklist_generation_returns_409_when_another_job_running(client):
         assert "已有分析或清单生成任务在运行" in blocked.json()["error"]["message"]
     finally:
         ANALYZE_LOCK.release()
+
+
+def test_checklist_generation_rechecks_existing_after_acquiring_lock(client, monkeypatch):
+    """锁前读到 None 不代表锁后仍为空：拿到锁后必须再查一次，避免重复调用 LLM。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    original_get_checklist = main.db.get_checklist
+    calls = {"count": 0}
+
+    def stale_first_read(conn, article_id):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None
+        return original_get_checklist(conn, article_id)
+
+    def fail_if_regenerated(*args, **kwargs):
+        raise AssertionError("锁内复查已有清单后不应再调用生成器")
+
+    monkeypatch.setattr(main.db, "get_checklist", stale_first_read)
+    monkeypatch.setattr(main.checklist_service, "build_for_input", fail_if_regenerated)
+
+    resp = client.post("/v1/articles/a1f0c3e2b7d94a51/checklist", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["data"]["article_id"] == "a1f0c3e2b7d94a51"
+    assert calls["count"] >= 2
 
 
 def test_categories_listing_and_filter(client):

@@ -457,6 +457,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not ANALYZE_LOCK.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="已有分析或清单生成任务在运行，请稍后再试")
         try:
+            # 等锁期间可能已有别的请求生成完成；非 force 必须在持锁后复查，避免重复调用 LLM。
+            if not force:
+                conn = connect(s)
+                try:
+                    existing = db.get_checklist(conn, article_id)
+                finally:
+                    conn.close()
+                if existing is not None:
+                    return _checklist_data(row, existing)
             result = checklist_service.build_for_input(s, source)
             items = checklist_service.items_payload(result)
             conn = connect(s)
