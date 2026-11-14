@@ -358,11 +358,13 @@ CREATE TABLE analysis_jobs (
 );
 ```
 
-索引：`idx_tags_tag(article_tags.tag)`、`idx_analysis_jobs_status(analysis_jobs.status, created_at)`、`idx_analyzed_published(analyzed_articles.published_at DESC)`、`idx_analyzed_category(analyzed_articles.category, published_at DESC)`、`idx_analyzed_recency(analyzed_articles(COALESCE(published_at, analyzed_at) DESC, article_id DESC))`、`idx_extractions_schema(extractions.schema_id, field)`。
+索引：`idx_tags_tag(article_tags.tag)`、`idx_analysis_jobs_status(analysis_jobs.status, created_at)`、`idx_analyzed_published(analyzed_articles.published_at DESC)`、`idx_analyzed_category(analyzed_articles.category, published_at DESC)`、`idx_analyzed_recency(analyzed_articles(COALESCE(published_at, analyzed_at) DESC, article_id DESC))`、`idx_analyzed_recency_utc(_TIME_EXPR DESC, article_id DESC)`、`idx_analyzed_source_time(source, _TIME_EXPR DESC)`、`idx_analyzed_day(_DAY_EXPR DESC)`、`idx_analyzed_asc_undated_last((_TIME_EXPR IS NULL), _TIME_EXPR ASC, article_id ASC)`、`idx_extractions_schema(extractions.schema_id, field)`。
 
 `idx_analyzed_category` 建在 `_POST_MIGRATION_SQL` 而不是 `SCHEMA_SQL`：`executescript` 会先于补列执行，旧库那时还没有 `category` 列，索引语句会直接报错。
 
 `idx_analyzed_recency` 是**表达式索引**（SQLite ≥ 3.9，容器 python:3.12-slim 自带 ≥ 3.40），专门支撑 `search_candidates` 与回填候选集的 `ORDER BY COALESCE(published_at, analyzed_at) DESC, article_id DESC`。它的收益远大于「省掉一次排序」：没有索引时 SQLite 必须先算完全部命中行才能排序，于是每行的 `py_norm`（6000 字正文的归一）都会跑一遍，哪怕最后只留 `limit` 行；有索引后按索引顺序取满 `limit` 即停。实测 2 万行全命中、正文 6000 字、`limit=2000`（本机 min-of-2）：**标题命中 3.9s → 0.07s，仅正文命中 11.9s → 0.82s**。两者差一档，因为预筛的 `OR` 在标题命中后短路、根本不归一 6000 字正文——**用户查的行业词/细分词大多只在正文出现，别把 0.07s 当成常态成本**（与 §5 性能表同一条口径）。查询计划从 `SCAN a + TEMP B-TREE FOR ORDER BY` 变成 `SCAN a USING INDEX idx_analyzed_recency`。只测 `ORDER BY` 子句（不带 `py_norm`）会得到 0.01s → 0.002s，严重低估收益——那个计划本来就不用归一被丢弃的行。另注意用「命中数 ≤ limit」的数据测不出差异（那时两种写法都要全扫、都不截断）。
+
+`idx_analyzed_asc_undated_last` 专门支撑 `published_asc` 的截断键（`(_TIME_EXPR IS NULL), _TIME_EXPR ASC, article_id ASC`）：升序时 SQLite 默认把 NULL 排最前，无日期行会占掉「最早 2000 行」的名额，所以查询必须加 `IS NULL` 前缀；前缀让排序表达式与 `idx_analyzed_recency_utc` 不同，没有配套索引时 2 万行全命中会退化为 `SCAN a + TEMP B-TREE FOR ORDER BY`（实测 2.0s → 0.05s，索引扫描可提前 `LIMIT`）。
 
 ### 7.2 注意事项
 

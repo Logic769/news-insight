@@ -339,13 +339,15 @@ def test_init_db_migrates_old_database_without_category_columns(tmp_path):
             for row in conn.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type='index'"
                 " AND name IN ('idx_analyzed_day', 'idx_analyzed_recency_utc',"
-                " 'idx_analyzed_source_time')"
+                " 'idx_analyzed_source_time', 'idx_analyzed_asc_undated_last')"
             )
         }
         assert "idx_analyzed_day" in index_sql, "日期过滤索引必须在旧库迁移时也建出来"
         assert db._DAY_EXPR in index_sql["idx_analyzed_day"], index_sql["idx_analyzed_day"]
         for name in ("idx_analyzed_recency_utc", "idx_analyzed_source_time"):
             assert db._TIME_EXPR in index_sql[name], index_sql[name]
+        assert db._TIME_EXPR in index_sql["idx_analyzed_asc_undated_last"], index_sql["idx_analyzed_asc_undated_last"]
+        assert "IS NULL" in index_sql["idx_analyzed_asc_undated_last"], index_sql["idx_analyzed_asc_undated_last"]
         row = conn.execute(
             "SELECT category, category_confidence, category_engine FROM analyzed_articles WHERE article_id='legacy'"
         ).fetchone()

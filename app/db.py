@@ -157,6 +157,11 @@ CREATE INDEX IF NOT EXISTS idx_analyzed_recency ON analyzed_articles(COALESCE(pu
 -- 时间排序/聚合按 _TIME_EXPR 比较，索引表达式必须与查询里一字不差才可能被用上；
 -- 沿用 recency 那个表达式（不含 utc）会让 WHERE 走全表扫描。
 CREATE INDEX IF NOT EXISTS idx_analyzed_recency_utc ON analyzed_articles({_TIME_EXPR} DESC, article_id DESC);
+-- published_asc 的截断键是 ({_TIME_EXPR} IS NULL), {_TIME_EXPR} ASC, article_id ASC：
+-- 升序时 SQLite 默认把 NULL 排最前（无日期行会占掉「最早 2000 行」的名额），
+-- 加 IS NULL 前缀后排序表达式与 recency_utc 不同，需要一条同序索引，否则 2 万行
+-- 全命中时退化为 SCAN + TEMP B-TREE（实测 2.0s → 0.05s，索引扫描可提前 LIMIT）。
+CREATE INDEX IF NOT EXISTS idx_analyzed_asc_undated_last ON analyzed_articles(({_TIME_EXPR} IS NULL), {_TIME_EXPR} ASC, article_id ASC);
 -- (source, 时间) 组合索引：来源筛选和「发布单位 + 时间范围」同时出现时，
 -- 单列 source 索引仍要把命中行全取出来再排序。
 CREATE INDEX IF NOT EXISTS idx_analyzed_source_time ON analyzed_articles(source, {_TIME_EXPR} DESC);
@@ -1156,6 +1161,8 @@ def search_candidates(
         raise ValueError(f"未知排序: {sort}")
     # ASC 时 SQLite 把 NULL 排在最前，两列皆空的行会占掉「最早」的名额；加 IS NULL
     # 前缀把它们压到最后，只影响截断保留哪一批。空白文本键不是 NULL，本前缀不改变其顺序。
+    # 该顺序由 idx_analyzed_asc_undated_last 支撑（DDL 见 _POST_MIGRATION_SQL），
+    # 否则 2 万行全命中会退化成一整轮临时排序，LIMIT 无法提前停止。
     cutoff_order = (
         f"({_TIME_EXPR} IS NULL), {_TIME_EXPR} ASC, a.article_id ASC"
         if sort == "published_asc"
