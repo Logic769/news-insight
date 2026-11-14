@@ -16,7 +16,9 @@ from app.settings import Settings
 from app.tagging import (
     FALLBACK_CATEGORY,
     classify_article,
+    classify_industry,
     load_categories,
+    load_industries,
     load_vocab,
     tag_article,
     tag_with_rules,
@@ -62,13 +64,18 @@ class _AnalysisResult:
     category: str = ""
     category_confidence: float | None = None
     category_engine: str = ""
+    industry: str = ""
+    industry_confidence: float | None = None
+    industry_engine: str = ""
     hits: list = field(default_factory=list)
     results: list = field(default_factory=list)
     checklist: tuple[str, list] | None = None
     error: str | None = None
 
 
-def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art, categories=()) -> _AnalysisResult:
+def _analyze_one(
+    settings: Settings, llm: LLMClient, tags, schemas, art, categories=(), industries=()
+) -> _AnalysisResult:
     """Run all LLM calls for one article. Must not touch SQLite: workers are stateless.
 
     两级：先给文章定唯一大类，再（且只在该类允许的标签里）打关键词标签。
@@ -76,6 +83,11 @@ def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art, categor
     """
     result = _AnalysisResult(article=art)
     try:
+        if industries:
+            industry_hit = classify_industry(settings, llm, industries, art.title, art.body)
+            result.industry = industry_hit.industry_id
+            result.industry_confidence = industry_hit.confidence if industry_hit.industry_id else None
+            result.industry_engine = industry_hit.engine
         scope = list(tags)
         if categories:
             hit = classify_article(settings, llm, categories, art.title, art.body)
@@ -165,7 +177,11 @@ def _persist_result(conn, result: _AnalysisResult) -> None:
         category=result.category,
         category_confidence=result.category_confidence,
         category_engine=result.category_engine,
+        industry=result.industry,
+        industry_confidence=result.industry_confidence,
+        industry_engine=result.industry_engine,
         body=art.body or None,
+        body_html=art.body_html or None,
         commit=False,
     )
     if result.checklist is not None:
@@ -220,6 +236,7 @@ def analyze_batch(
 
     _, tags = load_vocab(settings.vocab_dir)
     _, categories = load_categories(settings.vocab_dir)
+    _, industries = load_industries(settings.vocab_dir)
     schemas = load_schemas(settings.vocab_dir / "schemas")
     llm = LLMClient(settings)
     client = NewsClient(settings)
@@ -318,11 +335,15 @@ def analyze_batch(
         LOG.info("开始分析 %d 篇，并发=%d", len(pending), workers)
         executor: ThreadPoolExecutor | None = None
         if workers == 1 or len(pending) <= 1:
-            results_iter = (_analyze_one(settings, llm, tags, schemas, art, categories) for art in pending)
+            results_iter = (
+                _analyze_one(settings, llm, tags, schemas, art, categories, industries)
+                for art in pending
+            )
         else:
             executor = ThreadPoolExecutor(max_workers=min(workers, len(pending)))
             analyze_futures = [
-                executor.submit(_analyze_one, settings, llm, tags, schemas, art, categories) for art in pending
+                executor.submit(_analyze_one, settings, llm, tags, schemas, art, categories, industries)
+                for art in pending
             ]
             results_iter = (f.result() for f in as_completed(analyze_futures))
 

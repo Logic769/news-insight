@@ -874,6 +874,27 @@ def test_search_grouped_reports_returned_and_truncated() -> None:
     assert result["sort"] == "relevance"
 
 
+def test_search_items_carry_industry_fields() -> None:
+    """检索结果必须带行业三列，前端才能渲染行业徽标并显示筛选依据。
+
+    search_candidates 用的是显式列清单而不是 SELECT *：漏列时接口仍 200，
+    只是卡片上永远没有行业徽标，属于前端无法兜底的静默缺字段。
+    """
+    conn = _conn()
+    _add_dt(conn, "a1", title="光伏补贴通知", body="光伏项目补贴")
+    conn.execute(
+        "UPDATE analyzed_articles SET industry='new_energy',"
+        " industry_confidence=0.88, industry_engine='llm' WHERE article_id='a1'"
+    )
+    conn.commit()
+
+    result = db.search_grouped(conn, raw_query="光伏", tags=TAGS)
+    item = result["groups"][0]["items"][0]
+    assert item["industry"] == "new_energy"
+    assert item["industry_confidence"] == 0.88
+    assert item["industry_engine"] == "llm"
+
+
 def test_source_stats_groups_by_source_and_uses_real_instant() -> None:
     """来源统计的最新时间要按真实时刻取，不能取墙钟最大值。
 

@@ -64,6 +64,12 @@ class Settings:
     api_key: str = field(default_factory=lambda: _env("INSIGHT_API_KEY"))
     require_auth: bool = field(default_factory=lambda: _env("INSIGHT_REQUIRE_AUTH", "0") == "1")
 
+    # --- local accounts --------------------------------------------------
+    # 首次启动、users 表为空时创建的唯一管理员；密码只从环境变量读取。
+    admin_username: str = field(default_factory=lambda: _env("INSIGHT_ADMIN_USERNAME", "admin"))
+    admin_password: str = field(default_factory=lambda: _env("INSIGHT_ADMIN_PASSWORD"))
+    session_ttl_days: int = field(default_factory=lambda: _env_int_range("INSIGHT_SESSION_TTL_DAYS", 7, 1, 365))
+
     # --- analysis behaviour ---------------------------------------------
     max_tags_per_article: int = field(default_factory=lambda: _env_int("MAX_TAGS_PER_ARTICLE", 5))
     tag_body_chars: int = field(default_factory=lambda: _env_int("TAG_BODY_CHARS", 1200))

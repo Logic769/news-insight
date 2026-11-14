@@ -1,11 +1,13 @@
 """HTTP 面：入站鉴权与错误格式。"""
 
+import json
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
+from app import db
 from app.main import ANALYZE_LOCK, create_app
 from app.settings import load_settings
 
@@ -200,6 +202,23 @@ def test_empty_category_filter_returns_empty_not_everything(client):
     assert tags and {t["article_count"] for t in tags} == {0}
 
 
+def test_articles_category_and_industry_accept_multi(client):
+    """列表端的 category/industry 与检索端一样支持重复/逗号多选。"""
+    headers = {"X-API-Key": "secret"}
+    client.post("/v1/analyze", params={"limit": 4}, headers=headers)
+
+    both = client.get(
+        "/v1/articles", params={"category": "project_application,other"}, headers=headers
+    ).json()
+    assert both["meta"]["total"] >= 2
+    assert {row["category"] for row in both["data"]} <= {"project_application", "other"}
+
+    # industry= 空串必须与 category= 空串同语义：筛不到任何行，而不是命中未分类行
+    assert client.get("/v1/articles", params={"industry": ""}, headers=headers).json()[
+        "meta"
+    ]["total"] == 0
+
+
 def test_analyze_limit_capped(client):
     resp = client.post(
         "/v1/analyze", params={"limit": 500}, headers={"X-API-Key": "secret"}
@@ -256,6 +275,83 @@ def test_articles_time_filter_reports_undated_excluded(client):
     meta = resp.json()["meta"]
     assert "undated_excluded" in meta
     assert meta["undated_excluded"] == 0
+
+
+def test_articles_relevance_sort_returns_scores_in_order(client):
+    """列表按相关度排序时每篇都要带 0-1 的 relevance，升降序一致。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    desc = client.get(
+        "/v1/articles", params={"sort": "relevance_desc", "limit": 4}, headers=headers
+    ).json()["data"]
+    assert desc
+    scores = [row["relevance"] for row in desc]
+    assert all(isinstance(score, float) and 0.0 <= score <= 1.0 for score in scores)
+    assert scores == sorted(scores, reverse=True)
+    assert all(row.get("relevance_reason") for row in desc)
+
+    asc = client.get(
+        "/v1/articles", params={"sort": "relevance_asc", "limit": 4}, headers=headers
+    ).json()["data"]
+    assert [row["relevance"] for row in asc] == sorted(row["relevance"] for row in asc)
+
+
+def test_articles_relevance_sort_rejects_window_beyond_candidate_limit(client):
+    """相关度排序只排前 2000 条候选；超出窗口必须明确 422，不能返回空页。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+    resp = client.get(
+        "/v1/articles",
+        params={"sort": "relevance_desc", "offset": 1999, "limit": 2},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert "2000" in resp.json()["error"]["message"]
+
+
+def test_recommendations_and_todos_endpoints(client):
+    """/v1/recommendations 与 /v1/todos 是首页两块数据的唯一来源。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+
+    rec = client.get("/v1/recommendations", params={"limit": 3}, headers=headers)
+    assert rec.status_code == 200
+    body = rec.json()
+    assert body["meta"] == {"total": len(body["data"]), "limit": 3, "personalized": False}
+    assert len(body["data"]) <= 3
+    assert all("relevance" in row for row in body["data"])
+
+    todos = client.get("/v1/todos", params={"limit": 5}, headers=headers)
+    assert todos.status_code == 200
+    assert isinstance(todos.json()["data"], list)
+    assert todos.json()["meta"]["limit"] == 5
+
+
+def test_todos_meta_total_counts_all_upcoming_deadlines(client):
+    """/v1/todos 的 meta.total 是全部未到期条数，不能被 limit 截断成当页条数。"""
+    headers = {"X-API-Key": "secret"}
+    assert client.post("/v1/analyze", params={"limit": 4}, headers=headers).status_code == 200
+    settings = client.app.state.settings
+    conn = db.connect(settings.db_path)
+    try:
+        rows = conn.execute("SELECT article_id FROM analyzed_articles ORDER BY article_id LIMIT 2").fetchall()
+        assert len(rows) == 2
+        for index, row in enumerate(rows):
+            conn.execute(
+                "INSERT OR REPLACE INTO extractions"
+                " (article_id, schema_id, field, value_json, raw_text, confidence)"
+                " VALUES (?, 'project_application', 'deadline', ?, ?, 0.9)",
+                (row["article_id"], json.dumps(f"2099-01-0{index + 1}"), f"2099-01-0{index + 1}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    resp = client.get("/v1/todos", params={"limit": 1}, headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["data"]) == 1
+    assert body["meta"]["total"] == 2
 
 
 def test_articles_sort_by_confidence_puts_nulls_last(client):

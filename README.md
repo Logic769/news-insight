@@ -139,15 +139,21 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
+| POST | `/v1/auth/login`、`GET /v1/auth/me`、`POST /v1/auth/logout`、`POST /v1/auth/password` | 本地账号：登录发数据库会话 Token（`Authorization: Bearer`）、查当前用户、登出、改密（需原密码，新密码≥8位且含大小写/数字/特殊字符） |
+| GET/PATCH | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏（增删查）、浏览历史（倒序/清空）、关注领域与推送偏好 |
+| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员：用户/站点 CRUD、重置密码、统计看板、操作日志；登录管理员不能禁用/降级自己，服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`（写前由爬虫备份配置，接口型源只能改非接口字段）；`admin/stats` 的每日趋势、任务数与成功率均按近 N 天（本地日）统计 |
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
-| GET | `/v1/articles?tag=project_application&limit=20` | 已分析文章列表，可按标签过滤；也可用 `category=funding_subsidy` 按大类过滤（可与 `tag` 同用，AND） |
-| GET | `/v1/search?q=申报&category=project_application&per_category=20&include_body=false&source=&published_from=&published_to=&sort=relevance` | **关键词检索**：结果按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端直接渲染；详见下节）。`sort` 取 `relevance`/`published_desc`/`published_asc`，`category` 与 `source` 均可重复或逗号分隔 |
+| GET | `/v1/articles?tag=project_application&limit=20&sort=relevance_desc` | 已分析文章列表，可按标签、大类（`category=funding_subsidy`）或受控行业（`industry=new_energy`）过滤（AND 组合）；`category`、`industry` 均可重复或逗号分隔；`sort` 支持 `published_desc/asc`、`updated_desc`、`confidence_desc/asc`、`relevance_desc/asc`（相关度排序只在前 2000 条候选内计算，`offset+limit` 超过时 422），每项含 `relevance`（0–100） |
+| GET | `/v1/search?q=申报&category=project_application&industry=new_energy&per_category=20&include_body=false&source=&published_from=&published_to=&sort=relevance` | **关键词检索**：结果按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端直接渲染；详见下节）。`sort` 取 `relevance`/`published_desc`/`published_asc`，`category`、`industry` 与 `source` 均可重复或逗号分隔 |
+| GET | `/v1/industries` | 受控行业词表（10 个 id/中文名/描述/关键词）+ 每个行业的文章数，供前端行业筛选与徽标 |
+| GET | `/v1/recommendations?limit=10` | 首页 Top10 推荐：登录用户按关注领域/收藏/浏览历史与内容质量混合打分，匿名用户按内容质量与新鲜度；`meta.personalized` 标识是否个性化 |
+| GET | `/v1/todos?limit=5` | 首页近期申报截止：取项目申报抽取结果中未过期的 `deadline`，按剩余天数升序；`meta.total` 为全部未过期项数量 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `article_not_found`；非项目申报或缺少可用要素/正文 409 `checklist_not_applicable`（字符串错误码）；已有分析/清单生成任务持有同一把全局锁时也返回 409，但错误码为数字 `409`，客户端按 `error.code` 类型区分业务不适用与并发冲突 |
-| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.total` 与列表同筛选（`unread_only=true` 时为未读总数），`meta.unread` 为全库未读数（不受 `unread_only` 影响）；同一篇文章只提醒一次 |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.total` 与列表同筛选（`unread_only=true` 时为未读总数），`meta.unread` 为当前登录用户的未读数（未登录只读模式为全库；不受 `unread_only` 影响）；写已读必须登录或使用服务级 API key；同一篇文章只提醒一次 |
 | POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
 | POST | `/v1/notifications/read-all` | 全部标记已读，返回 `{"data": {"updated": N, "unread": 0}}` |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
@@ -254,9 +260,11 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 `NEWS_SOURCE_MODE=demo` 时会直接拒绝（demo 模式不访问网络，而回填必须逐个请求上游详情接口）；候选按「最新优先 + `article_id` 兜底」取；每批先把正文全部取回，再开写事务统一写库，网络请求期间不持有未提交事务。参数约束：`--batch` 必须 ≥ 1，`--limit` 不能为负（SQLite 把 `LIMIT -1` 当不限，不拦会回填整库），`--limit 0` 等于空跑（不发请求、不写库）。
 
-回填只处理 `body IS NULL OR body = ''` 的行，可重复执行；单篇失败不中断整批，返回
-`{"filled", "failed", "skipped", "remaining"}`。`limit` 限制的是**写入篇数**，扫描预算为
+回填只处理 `body IS NULL OR body = ''` **或** `body_html IS NULL OR body_html = ''` 的行（已有一侧时只补另一侧，不覆盖已有内容），可重复执行；单篇失败不中断整批，返回
+`{"filled", "html_filled", "failed", "skipped", "remaining"}`。`limit` 限制的是**写入篇数**，扫描预算为
 `5×limit`（`_SCAN_FACTOR`），所以少量死链不会钉死小 `--limit` 的窗口。
+
+行业分类是闭集单选，历史行可用 `python -m app backfill-industries --limit 500` 单独补齐（只写 `industry` 三列，不重跑标签/抽取/清单），可重复执行。`/v1/industries` 的 `article_count` 来自该列统计。
 
 但它**不是无限**的：连续 `5×limit` 篇都不可回填时会退回「每轮重试同一批」的行为
 （实测 `--limit 1` 时，4 篇连续死链仍能摸到更早的文章，5 篇就摸不到）。遇到这种情况调大
@@ -315,7 +323,7 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 ### 鉴权
 
-设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/openapi.json` 外都要求 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。注意 `NEWS_API_KEY` 是**出站**凭证（访问爬虫），与本服务入站鉴权无关。
+入站支持两种凭据：用户登录后的数据库会话 `Authorization: Bearer <token>`（`/v1/auth/login` 获取，按 users/sessions 校验、可撤销、过期失效），或服务级 `X-API-Key: <INSIGHT_API_KEY>`。设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/openapi.json` 外都要求其中一种；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。无鉴权部署下匿名只能读 `/v1/notifications`，写已读必须登录或服务 key。注意 `NEWS_API_KEY` 是**出站**凭证（访问爬虫），与本服务入站鉴权无关。
 
 `/v1/analyze` 是同步兼容接口，`limit` 上限 50；分析作业**全局串行**，同步接口遇到已有批次会立刻返回 409，异步作业遇到分析锁被占用会直接标 `failed`（不会并行烧 token），排队作业总数超过 `ANALYZE_MAX_PENDING_JOBS` 时 `POST /v1/jobs` 返回 429。长批次请用 `POST /v1/jobs` + 轮询；单篇内部仍是「打标 → 抽取 → 清单」三次串行 LLM 调用，整体吞吐由 `ANALYZE_CONCURRENCY`（默认 100）决定。
 
@@ -347,6 +355,7 @@ python -m app backfill-bodies --limit 500 --batch 50
     `COALESCE(category,'') IN ('')` 只命中「分类功能上线前」的历史行；若只在 Python 侧过滤掉空串，
     剩下的空列表又会被当成「筛完没结果」直接返回空集。两条路都会让用户只是清空了筛选框却看不到结果；
   - `/v1/tags?category=`：词表照旧返回，计数按该类统计（空串下计数全 0）；
+- `industry` 的空串语义：`/v1/articles?industry=` 按空集处理返回 0 行（不再命中未分类行业，也无法用空串筛「未分类」）；`/v1/search?industry=` 归一为「不传」。
 - `categories.json` 里少了兜底类 `other` 时不会启动失败，但会记一条 WARNING：模型答出表外大类就没有去处，那篇文章的二级打标与抽取都会被跳过。
 
 ### 加标签
@@ -392,11 +401,11 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 | 表 | 内容 |
 | --- | --- |
-| `analyzed_articles` | 已分析文章元数据（`article_id` 主键，与上游对齐），含一级分类 `category` 与 `category_confidence`/`category_engine`（`NULL` = 分类功能上线前分析的历史行，与 `other` 不是一回事）；`body` 存正文副本供检索（`NULL` = 落库时上游未提供，需 `backfill-bodies` 回填） |
+| `analyzed_articles` | 已分析文章元数据（`article_id` 主键，与上游对齐），含一级分类 `category` 与 `category_confidence`/`category_engine`（`NULL` = 分类功能上线前分析的历史行，与 `other` 不是一回事）、受控行业 `industry`/`industry_confidence`/`industry_engine`；`body` 存正文副本供检索，`body_html` 存清洗后的正文 HTML 供详情页富文本渲染（两者都可能为 `NULL`，需 `backfill-bodies` 回填，已有一侧不会互相覆盖） |
 | `article_tags` | `(article_id, tag)` 主键，含置信度、原文依据、引擎 |
 | `extractions` | `(article_id, schema_id, field)` 主键，含值、原文片段、置信度、是否定位成功 |
 | `article_checklists` | `article_id` 主键，清单项 JSON（`text`/`basis`/`source_text`）、生成引擎与时间 |
-| `notifications` | 站内消息提醒：`article_id` 唯一（同一篇只提醒一次），`kind`、标题快照、消息、`created_at`（带 Z 的 UTC）、`read_at` |
+| `notifications` | 站内消息提醒：`article_id` 唯一（同一篇只提醒一次），`kind`、标题快照、消息、`created_at`（带 Z 的 UTC）；个人已读状态在 `notification_reads`（`notification_id + user_id` 主键） |
 | `runs` | 每次批处理的统计 |
 | `analysis_jobs` | 异步分析作业状态与结果（`queued`/`running`/`succeeded`/`failed`） |
 
