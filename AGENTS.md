@@ -130,7 +130,7 @@ news-insight/
 | `prune()` | `app/prune.py` | 删除超过保留期的分析结果，可选 VACUUM |
 | `create_app()` | `app/main.py` | 构建 FastAPI 应用、鉴权中间件与 `/v1` 路由 |
 | `resolve_query()` / `score_article()` | `app/search.py` | 把用户输入映射到闭集标签 + 字面词，并按「标签置信度 × 覆盖度 + 标题/正文命中」打分 |
-| `search_grouped()` | `app/db.py` | 检索入口：候选集 → 打分 → 按 6 大类（含 `other` 兜底）分桶，类内降序，返回前端直接渲染的结构 |
+| `search_grouped()` | `app/db.py` | 检索入口：候选集 → 打分 → 按 6 大类（含 `other` 兜底）分桶，类内按所选 `sort` 排序（默认相关度降序），返回前端直接渲染的结构 |
 | `search_candidates()` | `app/db.py` | 候选集：`py_norm` 归一后的 `instr` 预筛，按「最新优先 + `article_id` 兜底」定序后 `LIMIT`，保证截断集合确定 |
 | `backfill_bodies()` | `app/backfill.py` | 给历史行补 `body`（逐篇取上游详情），可重复执行、单篇失败不中断 |
 | `save_analysis()` | `app/db.py` | 幂等替换单篇分析结果（SAVEPOINT + 可选批量提交） |
@@ -198,7 +198,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
 | GET | `/v1/articles?tag=&category=&limit=&offset=` | 已分析文章列表，可按标签和/或大类过滤（AND 组合，`limit` ≤ 200） |
-| GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按相关度降序（排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance|published_desc|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
+| GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
 | GET | `/v1/schemas` | 已注册的抽取 schema 列表 |
@@ -589,7 +589,7 @@ docker compose up -d --force-recreate && curl -f http://127.0.0.1:8020/health
 - `create_app(settings: Settings | None = None) -> FastAPI`：测试可注入独立设置；
 - `POST /v1/jobs` 的 body schema（`type`/`limit`/`force`/`concurrency`）属于对外契约，新增字段必须保持向后兼容；
 - 数据库字段与 `runs`/`analysis_jobs` 状态语义保持向后兼容，新增字段需要迁移策略；`analyzed_articles.category` 为 `NULL` 表示「分类上线前分析的历史行」，不得用 `other` 代替——两者在统计与过滤上语义不同。
-- `db.search_grouped(conn, *, raw_query, tags, category_order=(), categories=None, sources=None, published_from=None, published_to=None, per_category=20, include_body=False, sort="relevance") -> dict`：检索入口。返回 `{"query", "matched_tags", "terms", "groups": [{"category", "count", "items"}], "total", "returned", "truncated", "undated_excluded", "sort"}`。四个统计键的语义：`total` = 候选集（上限 `_CANDIDATE_LIMIT`=2000 行）内的命中数，`truncated=true` 时它只是下界；`returned` = 实际渲染条数（每类被 `per_category` 截断后），与 `total` 的差额即"还有更多没显示"；`undated_excluded` = 带日期过滤时"命中关键词与分类/来源条件、但两个时间列都判不出日期"而被排除的篇数（不带日期过滤时恒为 0，是 `COUNT(*)` 因而不受候选集截断影响，统计条件是 SQL 预筛命中，未过 `search.has_signal`）；**空查询（`q` 归一后为空）走早退分支，返回同样的键集合**，前端不必为它单独兜默认值。`count` 是漏斗后的全量命中数，`items` 被 `per_category` 截断。**返回顺序即最终展示顺序**（类按 `category_order`，类内按 `score` 降序、同分按 `published_at` 降序、再同分按 `article_id` 兜底），改动排序等于改动前端可见行为；
+- `db.search_grouped(conn, *, raw_query, tags, category_order=(), categories=None, sources=None, published_from=None, published_to=None, per_category=20, include_body=False, sort="relevance") -> dict`：检索入口。返回 `{"query", "matched_tags", "terms", "groups": [{"category", "count", "items"}], "total", "returned", "truncated", "undated_excluded", "sort"}`。四个统计键的语义：`total` = 候选集（上限 `_CANDIDATE_LIMIT`=2000 行）内的命中数，`truncated=true` 时它只是下界；`returned` = 实际渲染条数（每类被 `per_category` 截断后），与 `total` 的差额即"还有更多没显示"；`undated_excluded` = 带日期过滤时"命中关键词与分类/来源条件、但两个时间列都判不出日期"而被排除的篇数（不带日期过滤时恒为 0，是 `COUNT(*)` 因而不受候选集截断影响，统计条件是 SQL 预筛命中，未过 `search.has_signal`）；**空查询（`q` 归一后为空）走早退分支，返回同样的键集合**，前端不必为它单独兜默认值。`count` 是漏斗后的全量命中数，`items` 被 `per_category` 截断。**返回顺序即最终展示顺序**（类按 `category_order`；类内顺序由 `sort` 决定：`relevance` 按 `score` 降序、`published_desc`/`published_asc` 按真实时刻 `_TIME_EXPR` 升/降序，两种模式都以相关度 `score` 为第一同分键、`article_id` 为最终兜底），改动排序等于改动前端可见行为；
 - `search.resolve_query(raw: str, tags: list[TagDef]) -> Query` / `search.score_article(query, *, title, body, tag_confidences) -> Relevance` / `search._masked_hits(text, terms) -> tuple[int, float, list[str]]`：纯函数，无 I/O，可直接单测。纯函数，行为细节（标记数组记账、重叠只计一次、`+1` 步进的用意）见 §5 排序契约中的命中计数条目，此处只固定契约：按 `terms` 顺序（`resolve_query` 已按权重降序输出）逐个计数，同一处文本只计一次；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；
 - `db._ensure_norm_func(conn)`：把 `search._norm` 注册为 SQL 函数 `py_norm`，预筛与打分共用同一份归一实现。新增涉及 `instr` 预筛的查询时必须先调用它，否则报 `no such function: py_norm`。权重常量在 `app/search.py` 顶部，改动须保持 `W_TAG + W_TITLE + W_BODY == 1.0`（否则 `score` 不再落在 `[0,1]`）并补用例；
 - `db.set_body(conn, *, article_id, body, commit=True)`：只 UPDATE `body` 一列，不碰 `analyzed_at` 与标签，供回填使用；正文写入走 `COALESCE(NULLIF(excluded.body, ''), body)`，本次没拿到就保留旧值；

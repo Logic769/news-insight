@@ -1010,13 +1010,21 @@ def _signal_clauses(
     抽出来是为了让 search_candidates（取候选）与 search_grouped 的
     undated_excluded 统计用同一份条件——两处各写一遍，将来改了一处就会出现
     「统计说排除了 N 篇，实际筛掉的却是另一批」。
+
+    标签必须带正置信度才算信号：search.score_article 对 confidence<=0 的标签直接
+    `continue`，has_signal 随后也会把这类行判为「无关系」。SQL 侧不跟着卡，
+    零置信度标签的行会占掉候选集名额、并被算进 undated_excluded——报出「有 N 篇
+    只因日期不可判定被排除」，而它们本来就不会出现在结果里。
     """
     clauses: list[str] = []
     args: list[Any] = []
     signal: list[str] = []
     if tag_ids:
         placeholders = ",".join("?" for _ in tag_ids)
-        signal.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag IN (" + placeholders + "))")
+        signal.append(
+            "a.article_id IN (SELECT article_id FROM article_tags"
+            " WHERE tag IN (" + placeholders + ") AND confidence > 0)"
+        )
         args.extend(tag_ids)
     # term 与 title/body 都过同一个 _norm：空白（含 \u2003 这类从网页复制的窄空格）
     # 与非 ASCII 大小写（ÖBB / müller）都必须在预筛阶段就被折掉，否则 SQL 阶段丢行，

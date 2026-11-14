@@ -1150,6 +1150,36 @@ def test_search_undated_excluded_only_counts_rows_matching_the_keyword() -> None
     assert out["undated_excluded"] == 1, "无关的无日期行不能算进来"
 
 
+def test_search_undated_excluded_ignores_zero_confidence_tags() -> None:
+    """零置信度标签不是检索信号，不能算进「因无日期被排除」。
+
+    score_article 对 confidence<=0 的标签直接跳过，has_signal 随后也把该行判为
+    「无关系」：这类文章即使有日期也不会出现在结果里。SQL 侧若不跟着卡，用户会
+    被告知「另有 N 篇无日期被排除」，按提示去核对却一篇都对不上。
+    """
+    conn = _conn()
+    _add_dt(conn, "dated", title="项目申报通知", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "zero-conf", title="关于人才落户的通知", published_at=None, published_at_utc=None)
+    _add_dt(conn, "positive-conf", title="关于人才落户的通知", published_at=None, published_at_utc=None)
+    for aid, conf in (("zero-conf", 0.0), ("positive-conf", 0.9)):
+        conn.execute(
+            "INSERT INTO article_tags (article_id, tag, confidence, evidence, engine)"
+            " VALUES (?,?,?,?,?)",
+            (aid, "project_application", conf, "", "rules"),
+        )
+    conn.commit()
+
+    out = db.search_grouped(
+        conn,
+        raw_query="申报",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_from="2026-11-01",
+    )
+    assert out["total"] == 1
+    assert out["undated_excluded"] == 1, "只数正置信度标签那篇，零置信度不算"
+
+
 def test_search_time_filter_excludes_rows_with_whitespace_only_date() -> None:
     """日期只由空白组成的历史行既不能出现在结果里，也不能悄悄消失。
 
