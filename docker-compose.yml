@@ -18,7 +18,7 @@ services:
       NEWS_TIMEOUT: ${NEWS_TIMEOUT:-15}
       # 详情补正文的并发（每篇一次 GET /v1/articles/{id}）
       NEWS_DETAIL_CONCURRENCY: ${NEWS_DETAIL_CONCURRENCY:-16}
-      # 分析并发：每篇 3 次串行 LLM 调用，线程数按 10000 篇/2 小时设计
+      # 分析并发：每篇最多 6 次串行 LLM 调用，线程数按 10000 篇/2 小时设计
       ANALYZE_CONCURRENCY: ${ANALYZE_CONCURRENCY:-100}
       # 主线程每 N 篇提交一次 SQLite，避免每篇一次 fsync
       ANALYZE_WRITE_BATCH: ${ANALYZE_WRITE_BATCH:-50}
@@ -44,6 +44,8 @@ services:
       TAG_BODY_CHARS: ${TAG_BODY_CHARS:-1200}
       EXTRACT_BODY_CHARS: ${EXTRACT_BODY_CHARS:-6000}
       DATA_DIR: /app/data
+      # API worker 数：读接口多进程并行，分析批次由跨进程文件锁串行保护
+      INSIGHT_API_WORKERS: ${INSIGHT_API_WORKERS:-8}
     # 默认用命名卷：bind mount 的 ./data 由 docker daemon 以 root:root 创建，
     # 而容器以 uid 10001 运行，Linux 上首次启动会因无法读写 SQLite 而崩溃循环。
     # 想直接看到 insight.db：设 INSIGHT_DATA_DIR=./data，并先 mkdir -p data && sudo chown 10001 data

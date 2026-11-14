@@ -254,6 +254,8 @@ def score_article(
     title: str,
     body: str | None,
     tag_confidences: dict[str, float],
+    title_norm: str | None = None,
+    body_norm: str | None = None,
 ) -> Relevance:
     """Blend tag confidence with literal hit counts into one [0, 1] score.
 
@@ -261,8 +263,10 @@ def score_article(
     than ranking them last -- "no relation" is not "weak relation".
     """
     rel = Relevance()
-    title_n = _norm(title)
-    body_n = _norm(body or "")
+    # 调用方（检索层）可以传入数据库里持久化的归一文本，省掉每行重复归一；
+    # 直接调用本函数的测试/其他调用方仍按原路径现场归一。
+    title_n = title_norm if title_norm is not None else _norm(title)
+    body_n = body_norm if body_norm is not None else _norm(body or "")
 
     if query.tag_matches:
         hits: list[tuple[str, float]] = []

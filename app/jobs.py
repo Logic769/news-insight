@@ -12,6 +12,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from app import db
+from app.lockfile import ProcessFileLock
 from app.pipeline import analyze_batch
 from app.prune import prune
 from app.settings import Settings
@@ -24,7 +25,8 @@ class JobQueueFull(RuntimeError):
 
 
 # 同步 /v1/analyze 与后台 job 共享：同一时刻只允许一个分析批次，避免重复烧 token。
-ANALYZE_LOCK = threading.Lock()
+# 使用文件锁而不是纯 threading.Lock：API 多 worker 时，锁必须跨进程生效。
+ANALYZE_LOCK = ProcessFileLock()
 
 
 class JobManager:
@@ -35,13 +37,22 @@ class JobManager:
 
     def start(self) -> None:
         """Mark jobs interrupted by a previous process as failed, not silently stuck."""
-        conn = db.connect(self.settings.db_path)
+        # 多 worker 下每个进程都会启动；只有拿到分析锁的进程才能确认没有
+        # 其他 worker 正在跑批次，此时标记 stale 才安全。拿不到锁就跳过，
+        # 避免滚动重启/崩溃重生时把别人正在运行的 job 误标为 failed。
+        if not ANALYZE_LOCK.acquire(blocking=False):
+            LOG.info("已有分析批次在运行，跳过中断任务标记")
+            return
         try:
-            count = db.mark_stale_jobs_failed(conn)
-            if count:
-                LOG.warning("标记 %d 个中断的旧分析任务为 failed", count)
+            conn = db.connect(self.settings.db_path)
+            try:
+                count = db.mark_stale_jobs_failed(conn)
+                if count:
+                    LOG.warning("标记 %d 个中断的旧分析任务为 failed", count)
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            ANALYZE_LOCK.release()
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

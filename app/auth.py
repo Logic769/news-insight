@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -95,16 +96,22 @@ def bootstrap_admin(settings: Settings) -> dict[str, Any] | None:
     try:
         if accounts.count_users(conn) > 0:
             return None
-        user = create_user(
-            conn,
-            username=settings.admin_username,
-            password=settings.admin_password,
-            display_name="系统管理员",
-            department="信息中心",
-            role="admin",
-            must_change_password=True,
-        )
-        return user
+        try:
+            return create_user(
+                conn,
+                username=settings.admin_username,
+                password=settings.admin_password,
+                display_name="系统管理员",
+                department="信息中心",
+                role="admin",
+                must_change_password=True,
+            )
+        except sqlite3.IntegrityError:
+            # 8 个 worker 同时首启时，另一进程可能已抢先创建同名管理员；
+            # 只要 users 表已有记录就视为初始化成功，不把并发冲突抛成启动错误。
+            if accounts.count_users(conn) > 0:
+                return None
+            raise
     finally:
         conn.close()
 

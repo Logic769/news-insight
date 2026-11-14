@@ -23,18 +23,22 @@ from typing import Any
 from app import db
 
 # Weights for the profile-free score.  They sum to 1.0.
-_W_CONFIDENCE = 0.45
-_W_FRESHNESS = 0.25
-_W_COMPLETENESS = 0.15
+# 语义相关性占 20%：它是文章本身对申报/政策场景的价值，与用户画像无关，
+# 因此匿名用户也能受益；分类置信度仍保留较大权重，避免打分模型单点主导。
+_W_CONFIDENCE = 0.35
+_W_FRESHNESS = 0.20
+_W_COMPLETENESS = 0.10
 _W_TAG = 0.15
+_W_SEMANTIC = 0.20
 
 # Profile-aware blend.  Content quality still anchors the score so a stale
 # article cannot win only because it shares an industry.
-_P_CONTENT = 0.35
-_P_INDUSTRY = 0.30
-_P_TAG = 0.20
+_P_CONTENT = 0.25
+_P_INDUSTRY = 0.25
+_P_TAG = 0.15
 _P_CATEGORY = 0.10
 _P_SOURCE = 0.05
+_P_SEMANTIC = 0.20
 
 # 截止日期按站点墙钟日比较。容器默认 UTC，直接用 date.today() 会在
 # 东八区 00:00–08:00 把「还剩 1 天」算成「已过期」。
@@ -72,11 +76,13 @@ def _tag_strength(tags: list[dict[str, Any]]) -> float:
 def content_score(row: dict[str, Any], *, now: dt.datetime | None = None) -> float:
     confidence = float(row.get("category_confidence") or 0.0)
     completeness = min(1.0, max(0.0, float(row.get("content_length") or 0) / 2000.0))
+    semantic = max(0.0, min(1.0, float(row.get("relevance_score") or 0.0)))
     score = (
         _W_CONFIDENCE * confidence
         + _W_FRESHNESS * _freshness(row, now=now)
         + _W_COMPLETENESS * completeness
         + _W_TAG * _tag_strength(row.get("tags") or [])
+        + _W_SEMANTIC * semantic
     )
     return max(0.0, min(1.0, score))
 
@@ -169,12 +175,14 @@ def score_row(
     industry_hit = 1.0 if industry and industry in profile.industries else 0.0
     category_hit = 1.0 if category and category in profile.categories else 0.0
     source_hit = 1.0 if source and source in profile.sources else 0.0
+    semantic = max(0.0, min(1.0, float(row.get("relevance_score") or 0.0)))
     score = (
         _P_CONTENT * base
         + _P_INDUSTRY * industry_hit
         + _P_TAG * tag_hit
         + _P_CATEGORY * category_hit
         + _P_SOURCE * source_hit
+        + _P_SEMANTIC * semantic
     )
     reasons: list[str] = []
     if industry_hit:
@@ -183,6 +191,8 @@ def score_row(
         reasons.append("与收藏/浏览主题相近")
     if category_hit:
         reasons.append("常看分类")
+    if semantic >= 0.7:
+        reasons.append("语义相关度高")
     if not reasons:
         reasons.append("内容质量综合评分")
     return max(0.0, min(1.0, score)), "、".join(reasons[:2])
@@ -194,7 +204,9 @@ def annotate_rows(
     for row in rows:
         score, reason = score_row(row, profile, now=now)
         row["relevance"] = round(score, 4)
-        row["relevance_reason"] = reason
+        # relevance_reason 属于文章级语义评分（relevance_score）；画像排序理由
+        # 单独放 profile_reason，避免同一字段被两套分数互相覆盖。
+        row["profile_reason"] = reason
     return rows
 
 

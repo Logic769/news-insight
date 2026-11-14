@@ -20,6 +20,7 @@ def _row(**overrides):
         "industry": "next_gen_it",
         "category": "project_application",
         "source": "most_kjjh",
+        "relevance_score": 0.8,
     }
     row.update(overrides)
     return row
@@ -43,6 +44,22 @@ def test_content_score_prefers_fresh_confident_rows():
     assert 0.0 <= stale <= fresh <= 1.0
 
 
+def test_semantic_relevance_boosts_content_and_profile_scores():
+    """语义相关性必须真正参与两套排序：匿名内容分与登录画像分。"""
+    now = dt.datetime(2026, 3, 10, tzinfo=dt.timezone.utc)
+    high = recommend.content_score(_row(relevance_score=0.95), now=now)
+    low = recommend.content_score(_row(relevance_score=0.05), now=now)
+    assert high > low
+
+    profile = recommend.Profile(
+        industries={"next_gen_it"}, categories=set(), sources=set(), tag_weights={}
+    )
+    high_row, high_reason = recommend.score_row(_row(relevance_score=0.95), profile, now=now)
+    low_row, _ = recommend.score_row(_row(relevance_score=0.05), profile, now=now)
+    assert high_row > low_row
+    assert "语义相关度高" in high_reason
+
+
 def test_profile_boosts_matching_industry():
     now = dt.datetime(2026, 3, 10, tzinfo=dt.timezone.utc)
     profile = recommend.Profile(
@@ -55,6 +72,13 @@ def test_profile_boosts_matching_industry():
     unmatched, _ = recommend.score_row(_row(industry="other"), profile, now=now)
     assert matched > unmatched
     assert "行业" in reason
+
+
+def test_annotate_rows_keeps_semantic_reason_and_adds_profile_reason():
+    row = _row(relevance_reason="LLM：信息具体可行动")
+    recommend.annotate_rows([row], None)
+    assert row["relevance_reason"] == "LLM：信息具体可行动"
+    assert row["profile_reason"]
 
 
 def test_upcoming_deadlines_filters_expired_and_sorts():

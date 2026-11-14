@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -447,3 +448,19 @@ def test_notifications_are_isolated_per_user(client):
     second = client.get("/v1/notifications", headers=_auth(token2)).json()
     assert second["meta"]["unread"] == 1
     assert second["data"][0]["read"] is False
+
+
+def test_bootstrap_admin_tolerates_duplicate_created_by_another_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("INSIGHT_ADMIN_PASSWORD", PASSWORD)
+    settings = load_settings()
+    db.init_db(settings.db_path)
+
+    counts = iter([0, 1])
+    monkeypatch.setattr(auth.accounts, "count_users", lambda conn: next(counts))
+
+    def duplicate(*args, **kwargs):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+
+    monkeypatch.setattr(auth, "create_user", duplicate)
+    assert auth.bootstrap_admin(settings) is None

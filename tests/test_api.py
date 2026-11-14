@@ -289,7 +289,7 @@ def test_articles_relevance_sort_returns_scores_in_order(client):
     scores = [row["relevance"] for row in desc]
     assert all(isinstance(score, float) and 0.0 <= score <= 1.0 for score in scores)
     assert scores == sorted(scores, reverse=True)
-    assert all(row.get("relevance_reason") for row in desc)
+    assert all(row.get("profile_reason") for row in desc)
 
     asc = client.get(
         "/v1/articles", params={"sort": "relevance_asc", "limit": 4}, headers=headers

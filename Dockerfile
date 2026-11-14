@@ -25,4 +25,6 @@ EXPOSE 8020
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8020/health',timeout=3).status==200 else 1)"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8020"]
+# 读接口是 CPU/IO 混合型，多 worker 才能把并发 p95 压到 3 秒内；
+# 分析批次本身由跨进程文件锁保护，多个 worker 不会重复跑 analyze。
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8020 --workers ${INSIGHT_API_WORKERS:-1}"]

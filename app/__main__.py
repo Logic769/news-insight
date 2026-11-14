@@ -10,6 +10,7 @@ import sys
 from app import db
 from app.backfill import BackfillUsageError, backfill_bodies
 from app.backfill_industries import backfill_industries
+from app.backfill_relevance import backfill_relevance
 from app.pipeline import analyze_batch
 from app.prune import prune
 from app.settings import load_settings
@@ -37,6 +38,10 @@ def main() -> int:
     p_bi = sub.add_parser("backfill-industries", help="为已分析文章补受控行业分类（可重复运行）")
     p_bi.add_argument("--limit", type=int, default=500)
     p_bi.add_argument("--workers", type=int, default=None)
+
+    p_br = sub.add_parser("backfill-relevance", help="为已分析文章补语义相关性评分（可重复运行）")
+    p_br.add_argument("--limit", type=int, default=500)
+    p_br.add_argument("--workers", type=int, default=None)
 
     sub.add_parser("init", help="初始化数据库")
     sub.add_parser("health", help="打印当前配置")
@@ -71,6 +76,10 @@ def main() -> int:
         return 0
     if args.cmd == "backfill-industries":
         result = backfill_industries(settings, limit=args.limit, workers=args.workers)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.cmd == "backfill-relevance":
+        result = backfill_relevance(settings, limit=args.limit, workers=args.workers)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.cmd == "prune":

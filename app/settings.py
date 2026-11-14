@@ -74,7 +74,9 @@ class Settings:
     max_tags_per_article: int = field(default_factory=lambda: _env_int("MAX_TAGS_PER_ARTICLE", 5))
     tag_body_chars: int = field(default_factory=lambda: _env_int("TAG_BODY_CHARS", 1200))
     extract_body_chars: int = field(default_factory=lambda: _env_int("EXTRACT_BODY_CHARS", 6000))
-    # 单进程内并发分析的文章数；每篇内部仍串行调用 3 次 LLM。
+    # 语义相关性评分送给 LLM 的正文上限；独立于抽取/打标的截断长度。
+    relevance_body_chars: int = field(default_factory=lambda: _env_int("RELEVANCE_BODY_CHARS", 4000))
+    # 单进程内并发分析的文章数；每篇内部串行调用最多 6 次 LLM。
     analyze_concurrency: int = field(default_factory=lambda: _env_int_range("ANALYZE_CONCURRENCY", 100, 1, 200))
     # 结果按批提交（主线程唯一写者），减少 SQLite 事务次数。
     analyze_write_batch: int = field(default_factory=lambda: _env_int_range("ANALYZE_WRITE_BATCH", 50, 1, 500))

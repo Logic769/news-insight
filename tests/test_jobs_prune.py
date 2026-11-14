@@ -89,6 +89,41 @@ def test_job_fails_fast_when_analyze_lock_is_held(settings):
         manager.shutdown()
 
 
+def test_start_does_not_mark_stale_when_analyze_lock_is_held(settings):
+    db.init_db(settings.db_path)
+    conn = db.connect(settings.db_path)
+    try:
+        db.create_analysis_job(
+            conn, job_id="queued-start", payload={"limit": 1, "force": False, "concurrency": None}
+        )
+    finally:
+        conn.close()
+
+    assert ANALYZE_LOCK.acquire(blocking=False)
+    try:
+        manager = JobManager(settings)
+        manager.start()
+        manager.shutdown()
+        conn = db.connect(settings.db_path)
+        try:
+            current = db.get_analysis_job(conn, "queued-start")
+        finally:
+            conn.close()
+        assert current is not None and current["status"] == "queued"
+    finally:
+        ANALYZE_LOCK.release()
+
+    manager = JobManager(settings)
+    manager.start()
+    manager.shutdown()
+    conn = db.connect(settings.db_path)
+    try:
+        current = db.get_analysis_job(conn, "queued-start")
+    finally:
+        conn.close()
+    assert current is not None and current["status"] == "failed"
+
+
 def test_mark_stale_jobs_failed_and_active_job_reuse(settings):
     db.init_db(settings.db_path)
     conn = db.connect(settings.db_path)
