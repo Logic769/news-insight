@@ -86,6 +86,7 @@ news-insight/
 │   ├── tagging.py             # 一级分类（单选）+ 类内闭集多标签打标（LLM + 规则降级）
 │   ├── extraction.py          # schema 驱动事实抽取（日期归一 + 原文定位校验）
 │   ├── checklist.py           # 申报准备清单（派生视图，LLM + 规则降级）
+│   ├── checklist_service.py   # 清单输入适配与生成服务（API 与 pipeline 共用）
 │   ├── pipeline.py            # 单批次编排：拉取 → 并发分析 → 主线程批量落库
 │   ├── jobs.py                # 进程内异步作业 JobManager + ANALYZE_LOCK
 │   ├── prune.py               # 保留期清理（默认 90 天）
@@ -125,13 +126,14 @@ news-insight/
 | `tag_article()` | `app/tagging.py` | 返回 `(hits, engine)`；有 LLM 走模型，失败或无凭证降级规则引擎 |
 | `load_schemas()` / `extract_article()` | `app/extraction.py` | 按 `trigger_tags` 路由 schema；日期归一与原文定位校验 |
 | `build_checklist()` | `app/checklist.py` | 由已抽取事实生成准备清单；LLM 失败降级规则引擎 |
+| `checklist_input_from_detail()` / `build_for_input()` | `app/checklist_service.py` | 从文章详情构造清单输入（要求项目申报标签、抽取块与正文）；API 与 pipeline 共用的生成入口 |
 | `analyze_batch()` | `app/pipeline.py` | 单批次全流程编排，返回本次统计 |
 | `JobManager` | `app/jobs.py` | 异步作业提交/执行/状态落库；单 worker 串行 |
 | `prune()` | `app/prune.py` | 删除超过保留期的分析结果，可选 VACUUM |
 | `create_app()` | `app/main.py` | 构建 FastAPI 应用、鉴权中间件与 `/v1` 路由 |
 | `resolve_query()` / `score_article()` | `app/search.py` | 把用户输入映射到闭集标签 + 字面词，并按「标签置信度 × 覆盖度 + 标题/正文命中」打分 |
-| `search_grouped()` | `app/db.py` | 检索入口：候选集 → 打分 → 按 5 大类分桶，类内降序，返回前端直接渲染的结构 |
-| `search_candidates()` | `app/db.py` | 候选集：`py_norm` 归一后的 `instr` 预筛，按「最新优先 + `article_id` 兜底」定序后 `LIMIT`，保证截断集合确定 |
+| `search_grouped()` | `app/db.py` | 检索入口：候选集 → 打分 → 按 6 大类（含 `other` 兜底）分桶，类内按所选 `sort` 排序（默认相关度降序），返回前端直接渲染的结构 |
+| `search_candidates()` | `app/db.py` | 候选集：`py_norm` 归一后的 `instr` 预筛，截断前按与 `sort` 一致的时间序（`published_asc` 最早优先，其余最新优先，`article_id` 兜底）定序后 `LIMIT`，保证截断集合确定 |
 | `backfill_bodies()` | `app/backfill.py` | 给历史行补 `body`（逐篇取上游详情），可重复执行、单篇失败不中断 |
 | `save_analysis()` | `app/db.py` | 幂等替换单篇分析结果（SAVEPOINT + 可选批量提交） |
 | `prune_old_data()` | `app/db.py` | 子表 → 主表 → runs → 已完成 analysis_jobs 的硬删除 |
@@ -165,7 +167,7 @@ analyze_batch()
         └── db.record_run_finish()               # runs 统计（scanned/analyzed/skipped/errors/detail）
         │
         ▼
-insight.db（analyzed_articles / article_tags / extractions / article_checklists / runs / analysis_jobs）
+insight.db（analyzed_articles / article_tags / extractions / article_checklists / notifications / runs / analysis_jobs）
         │  analyzed_articles.body 随分析结果落库（检索用），历史行靠 backfill-bodies 回填
         │
         ▼
@@ -192,15 +194,20 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含 `category IS NULL` 的历史行） |
+| GET | `/v1/sources` | 按抓取站点聚合：`source`（空串=未标注来源）、`source_filter`（筛选回传值，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`、`latest_published_at`（真实时刻） |
 | GET | `/v1/tags` | 标签词表 + 每个标签命中数；带 `category=` 时只统计该类下的命中 |
 | GET | `/v1/tags/stats` | 标签分布与平均置信度 |
-| POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有批次时 409，失败 502 |
+| POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有分析或清单生成任务持锁时 409，失败 502 |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
 | GET | `/v1/articles?tag=&category=&limit=&offset=` | 已分析文章列表，可按标签和/或大类过滤（AND 组合，`limit` ≤ 200） |
-| GET | `/v1/search?q=&category=&per_category=&include_body=` | 关键词检索：按 5 大类分组、类内按相关度降序（排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category` 可重复，`per_category` 1–100 |
+| GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
+| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable`（字符串）；已有分析/清单生成任务持锁时也 409，但 `error.code` 为数字 409 |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）；`meta.total` 与列表同筛选，`meta.unread` 为全库未读数，同一篇只提醒一次 |
+| POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
+| POST | `/v1/notifications/read-all` | 全部标记已读，返回更新条数与 `unread: 0` |
 | GET | `/v1/schemas` | 已注册的抽取 schema 列表 |
 | GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询 |
 | GET | `/v1/runs` | 运行记录（模式、扫描/分析/跳过/错误数） |
@@ -221,7 +228,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
   - 分数相同按 `published_at` 降序、再按 `article_id` 兜底，顺序不依赖 SQLite 返回顺序（只按时间兜底时，同分同时间的几篇会退回 rowid 顺序，查询计划一变就抖）；
   - 类顺序固定为 `categories.json` 的声明顺序，声明外的分类（如历史行 `category IS NULL`）排在最后；
   - 字面匹配用 `instr()` 而非 `LIKE`：关键词是用户自由输入，`%`/`_` 在 `LIKE` 里是通配符，搜「50%」会命中全库；`category=` 同 `/v1/articles` 一样不做闭集校验，未知类返回 200 空集；空串（`?category=`）在 `/v1/search` 里显式归一成「不传」（`cleaned or None`）—— 透传会让 SQL 变成 `COALESCE(category,'') IN ('')` 只命中历史 NULL 行，而过滤后剩下的空列表又会被 `search_candidates` 当成「筛完没结果」返回空集；`/v1/articles` 用的是 `if category is not None` 判空串语义，两者有意不同；
-  - 候选集上限 `_CANDIDATE_LIMIT = 2000`（`search_candidates` 的默认值），泛词会被截断，`total` 是**候选集内**命中的行数，不是全库真实命中数；截断前按 `ORDER BY COALESCE(published_at, analyzed_at) DESC, article_id DESC` 取，**这个顺序不是展示顺序**（`search_grouped` 之后会重排），它只决定「哪些行活过截断」—— 没有 `ORDER BY` 时同一查询两次可能截到不同集合，用户会看到结果忽有忽无；`search_grouped` 用 `limit=_CANDIDATE_LIMIT + 1` 多取一行判断「是否还有更多」，`len(rows) > _CANDIDATE_LIMIT` 才记 WARNING（带 terms / tag_ids 数量）并截断 —— 直接比对 `== limit` 会在库里恰好 2000 行（其实全取完了）时误报；
+  - 候选集上限 `_CANDIDATE_LIMIT = 2000`（`search_candidates` 的默认值），泛词会被截断，`total` 是**候选集内**命中的行数，不是全库真实命中数；截断前按与 `sort` 一致的真实时刻顺序取（`published_asc` 用 `_TIME_EXPR ASC, article_id ASC` 保留**最早**的 2000 行，其余排序用 `_TIME_EXPR DESC, article_id DESC` 保留**最新**的 2000 行），**这个顺序不是展示顺序**（`search_grouped` 之后会重排），它只决定「哪些行活过截断」—— 没有 `ORDER BY` 时同一查询两次可能截到不同集合，用户会看到结果忽有忽无；`search_grouped` 用 `limit=_CANDIDATE_LIMIT + 1` 多取一行判断「是否还有更多」，`len(rows) > _CANDIDATE_LIMIT` 才记 WARNING（带 terms / tag_ids 数量）并截断 —— 直接比对 `== limit` 会在库里恰好 2000 行（其实全取完了）时误报；
   - SQL 预筛与内存打分跑**同一份归一代码**：`_ensure_norm_func()` 把 `search._norm` 注册成 SQL 函数 `py_norm`（`deterministic=True`，每次查询前注册，幂等），预筛写成 `instr(py_norm(a.title), ?) > 0`，与打分侧是同一个函数。**不能各写一套**：SQLite 的 `lower()` 只折 ASCII（`Ärger` 折完还是 `Ärger`），Python 的 `casefold()` 折成 `ärger`，两层不一致时「用户输入与标题字面完全一致」也会返回空集（200 + 空结果，不报错；真实触发词 ÖBB / Ärzte / Müller / École）。空白同理，搜「gpt 模型」而标题写「GPT模型」；
   - 代价是每行每列每个形态一次 Python 回调，且**成本取决于是否「标题」命中**（本机 min-of-3，规模「候选集打满 2000 行 × 正文 6000 字」，不同机器差 2–3×）：标题命中预筛约 0.05s / 全链路约 0.5s（`OR` 首个条件为真，短路掉 body 的 6000 字归一）；**仅正文**命中约 0.55s / 约 2.0s（标题不含，必须算完 body 才为真，成本与不命中同档，且候选打满时每行都要打分）；全不命中约 0.52s / 约 0.5s（候选为空、不打分）；`body IS NULL` 的历史行约 0.003s（回填前仍能按标题/标签命中）。**只有标题命中才便宜，而用户查的行业词/细分词大多只在正文出现——这是最常见路径，别按 0.05s 估**。纯 SQL `instr`（不命中全扫）约 0.04s，即 `py_norm` 带来一个数量级预筛开销，这是「两侧归一必须同源」的代价。逐行归一 + `score_article` 是另一块大头（仅正文命中且候选打满时约 1.5s）。泛词会打满候选集，**超时按秒级设**（最坏约 2–3s，建议 10s）；若将来候选集需放大到十万级，再考虑 FTS5 或物化归一列；
   - `search.WS_CHARS` 覆盖 ASCII 控制空白、`\x85`、`\xa0`、`\u2000`–`\u200a`、`\u2028`、`\u2029`、`\u3000`（共 22 个）。从 Word / 网页复制的关键词常带 `\u2002`/`\u2003`/`\u2009`，漏一个就表现为「看起来一样的两个词搜不到」且不报错；
@@ -333,6 +340,16 @@ CREATE TABLE article_checklists (        -- 派生视图：重新生成不碰事
     generated_at TEXT NOT NULL
 );
 
+CREATE TABLE notifications (             -- 站内提醒：同一篇只提醒一次
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_id  TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    message     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,           -- ISO8601 UTC 带 Z，前端直接 new Date()
+    read_at     TEXT
+);
+
 CREATE TABLE runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at  TEXT NOT NULL,
@@ -357,11 +374,13 @@ CREATE TABLE analysis_jobs (
 );
 ```
 
-索引：`idx_tags_tag(article_tags.tag)`、`idx_analysis_jobs_status(analysis_jobs.status, created_at)`、`idx_analyzed_published(analyzed_articles.published_at DESC)`、`idx_analyzed_category(analyzed_articles.category, published_at DESC)`、`idx_analyzed_recency(analyzed_articles(COALESCE(published_at, analyzed_at) DESC, article_id DESC))`、`idx_extractions_schema(extractions.schema_id, field)`。
+索引：`idx_tags_tag(article_tags.tag)`、`idx_analysis_jobs_status(analysis_jobs.status, created_at)`、`idx_analyzed_published(analyzed_articles.published_at DESC)`、`idx_analyzed_category(analyzed_articles.category, published_at DESC)`、`idx_analyzed_recency(analyzed_articles(COALESCE(published_at, analyzed_at) DESC, article_id DESC))`、`idx_analyzed_recency_utc(_TIME_EXPR DESC, article_id DESC)`、`idx_analyzed_source_time(source, _TIME_EXPR DESC)`、`idx_analyzed_day(_DAY_EXPR DESC)`、`idx_analyzed_asc_undated_last((_TIME_EXPR IS NULL), _TIME_EXPR ASC, article_id ASC)`、`idx_extractions_schema(extractions.schema_id, field)`。
 
 `idx_analyzed_category` 建在 `_POST_MIGRATION_SQL` 而不是 `SCHEMA_SQL`：`executescript` 会先于补列执行，旧库那时还没有 `category` 列，索引语句会直接报错。
 
 `idx_analyzed_recency` 是**表达式索引**（SQLite ≥ 3.9，容器 python:3.12-slim 自带 ≥ 3.40），专门支撑 `search_candidates` 与回填候选集的 `ORDER BY COALESCE(published_at, analyzed_at) DESC, article_id DESC`。它的收益远大于「省掉一次排序」：没有索引时 SQLite 必须先算完全部命中行才能排序，于是每行的 `py_norm`（6000 字正文的归一）都会跑一遍，哪怕最后只留 `limit` 行；有索引后按索引顺序取满 `limit` 即停。实测 2 万行全命中、正文 6000 字、`limit=2000`（本机 min-of-2）：**标题命中 3.9s → 0.07s，仅正文命中 11.9s → 0.82s**。两者差一档，因为预筛的 `OR` 在标题命中后短路、根本不归一 6000 字正文——**用户查的行业词/细分词大多只在正文出现，别把 0.07s 当成常态成本**（与 §5 性能表同一条口径）。查询计划从 `SCAN a + TEMP B-TREE FOR ORDER BY` 变成 `SCAN a USING INDEX idx_analyzed_recency`。只测 `ORDER BY` 子句（不带 `py_norm`）会得到 0.01s → 0.002s，严重低估收益——那个计划本来就不用归一被丢弃的行。另注意用「命中数 ≤ limit」的数据测不出差异（那时两种写法都要全扫、都不截断）。
+
+`idx_analyzed_asc_undated_last` 专门支撑 `published_asc` 的截断键（`(_TIME_EXPR IS NULL), _TIME_EXPR ASC, article_id ASC`）：升序时 SQLite 默认把 NULL 排最前，无日期行会占掉「最早 2000 行」的名额，所以查询必须加 `IS NULL` 前缀；前缀让排序表达式与 `idx_analyzed_recency_utc` 不同，没有配套索引时 2 万行全命中会退化为 `SCAN a + TEMP B-TREE FOR ORDER BY`（实测 2.0s → 0.05s，索引扫描可提前 `LIMIT`）。
 
 ### 7.2 注意事项
 
@@ -446,11 +465,12 @@ docker compose run --rm insight python -m app prune --vacuum
 
 ## 10. 测试策略
 
-### 10.1 现有测试资产（`tests/`，16 个文件）
+### 10.1 现有测试资产（`tests/`，17 个文件）
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=` |
+| `test_notifications.py` | 项目申报公告生成通知、未读/单条已读/全部已读、`--force` 重分析不重复通知、404 |
 | `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
 | `test_tagging.py` | 词表外标签丢弃、去重、max_tags 截断、规则引擎多标签 |
 | `test_extraction_rules.py` | 日期区间取右端、裸开始日期不当截止、中文两位数、闰日、规则引擎不标 verified |
@@ -589,7 +609,7 @@ docker compose up -d --force-recreate && curl -f http://127.0.0.1:8020/health
 - `create_app(settings: Settings | None = None) -> FastAPI`：测试可注入独立设置；
 - `POST /v1/jobs` 的 body schema（`type`/`limit`/`force`/`concurrency`）属于对外契约，新增字段必须保持向后兼容；
 - 数据库字段与 `runs`/`analysis_jobs` 状态语义保持向后兼容，新增字段需要迁移策略；`analyzed_articles.category` 为 `NULL` 表示「分类上线前分析的历史行」，不得用 `other` 代替——两者在统计与过滤上语义不同。
-- `db.search_grouped(conn, *, raw_query, tags, category_order=(), categories=None, per_category=20, include_body=False) -> dict`：检索入口。返回 `{"query", "matched_tags", "terms", "groups": [{"category", "count", "items"}], "total"}`；`count` 是漏斗后的全量命中数，`items` 被 `per_category` 截断。**返回顺序即最终展示顺序**（类按 `category_order`，类内按 `score` 降序、同分按 `published_at` 降序、再同分按 `article_id` 兜底），改动排序等于改动前端可见行为；
+- `db.search_grouped(conn, *, raw_query, tags, category_order=(), categories=None, sources=None, published_from=None, published_to=None, per_category=20, include_body=False, sort="relevance") -> dict`：检索入口。返回 `{"query", "matched_tags", "terms", "groups": [{"category", "count", "items"}], "total", "returned", "truncated", "undated_excluded", "sort"}`。四个统计键的语义：`total` = 候选集（上限 `_CANDIDATE_LIMIT`=2000 行）内的命中数，`truncated=true` 时它只是下界；`returned` = 实际渲染条数（每类被 `per_category` 截断后），与 `total` 的差额即"还有更多没显示"；`undated_excluded` = 带日期过滤时"命中关键词与分类/来源条件、但两个时间列都判不出日期"而被排除的篇数（不带日期过滤时恒为 0，是 `COUNT(*)` 因而不受候选集截断影响，统计条件是 SQL 预筛命中，未过 `search.has_signal`）；**空查询（`q` 归一后为空）走早退分支，返回同样的键集合**，前端不必为它单独兜默认值。`count` 是漏斗后的全量命中数，`items` 被 `per_category` 截断。**返回顺序即最终展示顺序**（类按 `category_order`；类内顺序由 `sort` 决定：`relevance` 按 `score` 降序、`published_desc`/`published_asc` 按真实时刻 `_TIME_EXPR` 升/降序，两种模式都以相关度 `score` 为第一同分键、`article_id` 为最终兜底），改动排序等于改动前端可见行为；
 - `search.resolve_query(raw: str, tags: list[TagDef]) -> Query` / `search.score_article(query, *, title, body, tag_confidences) -> Relevance` / `search._masked_hits(text, terms) -> tuple[int, float, list[str]]`：纯函数，无 I/O，可直接单测。纯函数，行为细节（标记数组记账、重叠只计一次、`+1` 步进的用意）见 §5 排序契约中的命中计数条目，此处只固定契约：按 `terms` 顺序（`resolve_query` 已按权重降序输出）逐个计数，同一处文本只计一次；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；
 - `db._ensure_norm_func(conn)`：把 `search._norm` 注册为 SQL 函数 `py_norm`，预筛与打分共用同一份归一实现。新增涉及 `instr` 预筛的查询时必须先调用它，否则报 `no such function: py_norm`。权重常量在 `app/search.py` 顶部，改动须保持 `W_TAG + W_TITLE + W_BODY == 1.0`（否则 `score` 不再落在 `[0,1]`）并补用例；
 - `db.set_body(conn, *, article_id, body, commit=True)`：只 UPDATE `body` 一列，不碰 `analyzed_at` 与标签，供回填使用；正文写入走 `COALESCE(NULLIF(excluded.body, ''), body)`，本次没拿到就保留旧值；

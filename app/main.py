@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import __version__, db
+from app import __version__, checklist_service, db
 from app.extraction import load_schemas
 from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull
 from app.pipeline import analyze_batch, connect
@@ -29,11 +29,59 @@ LOG = logging.getLogger("news_insight.main")
 _OPEN_PATHS = ("/health", "/docs", "/redoc", "/openapi.json")
 
 
+def _split_multi(values: list[str] | None) -> list[str] | None:
+    """把多值查询参数（?source=、?category=）归一成「去重、去空、支持逗号分隔」的列表。
+
+    三类输入必须区分开，否则前端换个写法就静默查错：
+
+    - ?source=a,b 原先整串被当成一个叫 "a,b" 的站点名，IN (...) 永不命中，
+      静默返回 0 条。前端把多选值 join 起来传是很自然的写法，必须拆开。
+    - ?source=（空串）是「清空多选」残留的空参数，一律当没传：否则用户清空筛选后
+      看到的是「无结果」而不是全部数据。
+    - 空片段（"a,,b"）同样忽略，与前者同一套规则：空值 = 不参与筛选。
+
+    全部片段都为空时返回 None（不筛）。这与库层 sources=[]（筛完什么都不剩，返回
+    空集）是两种语义：[] 只能由代码显式传入，HTTP 层永远不会产生它。
+
+    source 与 category 共用本函数：两者都是前端的多选控件，用户看不出区别，
+    只支持其中一种写法会让「站点多选生效、大类多选静默失效」。
+    """
+    if values is None:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for piece in raw.split(","):
+            name = piece.strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out or None
+
+
 class AnalyzeJobRequest(BaseModel):
     type: Literal["analyze"] = "analyze"
     limit: int = Field(default=100, ge=1, le=10000)
     force: bool = False
     concurrency: int | None = Field(default=None, ge=1, le=200)
+
+
+def _checklist_data(row: dict, checklist: dict) -> dict:
+    """The single wire shape shared by GET and POST /checklist."""
+    return {
+        "data": {
+            "article_id": row["article_id"],
+            "title": row["title"],
+            "url": row["url"],
+            "engine": checklist["engine"],
+            "generated_at": checklist["generated_at"],
+            "items": checklist["items"],
+        }
+    }
+
+
+class ChecklistGenerateRequest(BaseModel):
+    force: bool = False
 
 
 @asynccontextmanager
@@ -138,6 +186,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             conn.close()
 
+    # 路径与上游 news-crawler 的 GET /v1/sources（来源统计）保持一致，
+    # 前端两个服务共用一个 api 层时不必记两套命名。
+    # 不叫 /v1/sources/stats：categories/tags 之所以有「定义 + 统计」两级，
+    # 是因为它们的候选集合写在词汇表文件里；来源没有静态定义，统计就是全部信息。
+    @app.get("/v1/sources")
+    def sources_stats() -> dict:
+        """按抓取站点聚合：条数、平均分类置信度、最新发布时间。
+
+        前端「发布单位」筛选下拉直接吃这个列表，管理端统计看板也用它，
+        所以不额外做分页——站点数量是几十的量级。
+        """
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            rows = db.source_stats(conn)
+        finally:
+            conn.close()
+        return {"data": rows}
+
     @app.get("/v1/tags")
     def tags(category: str | None = Query(default=None)) -> dict:
         s: Settings = app.state.settings
@@ -175,7 +242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict:
         s: Settings = app.state.settings
         if not ANALYZE_LOCK.acquire(blocking=False):
-            raise HTTPException(status_code=409, detail="已有分析任务在运行，请稍后再试")
+            raise HTTPException(status_code=409, detail="已有分析或清单生成任务在运行，请稍后再试")
         try:
             result = analyze_batch(s, limit=limit, force=force)
         except Exception as exc:
@@ -195,16 +262,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def articles(
         tag: str | None = Query(default=None),
         category: str | None = Query(default=None),
+        source: Annotated[list[str] | None, Query(description="只在这些站点里筛选")] = None,
+        published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
+        published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
+        sort: str = Query(default="published_desc", description="排序键"),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
         s: Settings = app.state.settings
+        try:
+            since = db.normalize_day(published_from)
+            until = db.normalize_day_end(published_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if sort not in db.LIST_SORTS:
+            raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
         conn = connect(s)
         try:
-            rows, total = db.list_analyzed(conn, tag=tag, category=category, limit=limit, offset=offset)
+            rows, total, undated = db.list_analyzed(
+                conn,
+                tag=tag,
+                category=category,
+                sources=_split_multi(source),
+                published_from=since,
+                published_to=until,
+                sort=sort,
+                limit=limit,
+                offset=offset,
+            )
         finally:
             conn.close()
-        return {"data": rows, "meta": {"total": total, "limit": limit, "offset": offset}}
+        return {
+            "data": rows,
+            "meta": {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "sort": sort,
+                # 两个时间列都为空的行无法判断是否落在区间内，会被排除；条数单独
+                # 报出来，前端才能解释「为什么 total 比预期少」而不是当成丢数据。
+                "undated_excluded": undated,
+            },
+        }
 
     @app.get("/v1/search")
     def search_articles(
@@ -218,17 +317,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         category: Annotated[
             list[str] | None, Query(description="只在这些大类里检索")
         ] = None,
+        source: Annotated[list[str] | None, Query(description="只在这些站点里检索")] = None,
+        published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
+        published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
+        sort: str = Query(default="relevance", description="类内排序：relevance/published_desc/published_asc"),
         per_category: int = Query(default=20, ge=1, le=100, description="每个大类返回多少条"),
         include_body: bool = Query(default=False, description="是否返回正文（默认不返回，节省带宽）"),
     ) -> dict:
-        """按关键词检索，结果按 5 大类分组、类内按相关度排序。
+        """按关键词检索，结果按 6 大类分组、类内按相关度排序。
 
         排序相关的计算全在这里完成，前端只负责渲染。前端虽然能从 item 里读到标签
         置信度，但拿不到查询覆盖度（那要复算词表匹配），默认也拿不到正文，无法复
         算出同一个分数，所以 `groups[].items[]` 的顺序就是最终顺序。
         """
         s: Settings = app.state.settings
-        cleaned = [c.strip() for c in (category or []) if c.strip()]
+        if sort not in db.SEARCH_SORTS:
+            raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
+        try:
+            since = db.normalize_day(published_from)
+            until = db.normalize_day_end(published_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sources = _split_multi(source)
         _, tags = load_vocab(s.vocab_dir)
         _, categories = load_categories(s.vocab_dir)
         conn = connect(s)
@@ -238,14 +348,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raw_query=q,
                 tags=tags,
                 category_order=tuple(c.id for c in categories),
-                # ?category= 传空串时 FastAPI 给出 [""]，直接透传会让 SQL 变成
-                # COALESCE(category,'') IN ('')，只命中「分类上线前的历史 NULL 行」，
-                # 静默返回一堆与用户意图无关的结果。空串一律当「没传」——注意过滤后
-                # 可能变成空列表，而 search_candidates 把空列表当作「筛选后无结果」，
-                # 所以这里要显式转成 None（不传），否则 ?category= 反而返回空集。
-                categories=cleaned or None,
+                # 与 source 共用 _split_multi：?category= 传空串时 FastAPI 给出 [""]，
+                # 直接透传会让 SQL 变成 COALESCE(category,'') IN ('')，只命中「分类上线
+                # 前的历史 NULL 行」，静默返回一堆与用户意图无关的结果。空串一律当「没传」
+                # ——注意过滤后可能变成空列表，而 search_candidates 把空列表当作「筛选后
+                # 无结果」，所以 _split_multi 收尾返回 None（不传），否则 ?category= 反而
+                # 返回空集。逗号写法（?category=a,b）同样拆开，理由见 _split_multi。
+                categories=_split_multi(category),
+                sources=sources,
+                published_from=since,
+                published_to=until,
                 per_category=per_category,
                 include_body=include_body,
+                sort=sort,
             )
         finally:
             conn.close()
@@ -295,16 +410,120 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     }
                 },
             )
+        return _checklist_data(row, checklist)
+
+    @app.post("/v1/articles/{article_id}/checklist")
+    def generate_article_checklist(article_id: str, payload: ChecklistGenerateRequest | None = None):
+        """按需生成或重新生成申报准备清单。
+
+        默认复用已有清单（幂等）；只有 force=true 才重新调用生成器。生成失败或
+        文章不适用时返回可解释错误，不把「没有清单」伪装成 404 空结果。
+        """
+        s: Settings = app.state.settings
+        force = bool(payload and payload.force)
+        conn = connect(s)
+        try:
+            row = db.get_article(conn, article_id)
+            existing = None if force else db.get_checklist(conn, article_id)
+        finally:
+            conn.close()
+        if row is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "article_not_found",
+                        "status": 404,
+                        "message": f"未找到已分析文章: {article_id}",
+                    }
+                },
+            )
+        if existing is not None:
+            return _checklist_data(row, existing)
+        source = checklist_service.checklist_input_from_detail(row)
+        if source is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "checklist_not_applicable",
+                        "status": 409,
+                        "message": "该文章不是项目申报类，或缺少可用的申报要素/正文，无法生成清单",
+                    }
+                },
+            )
+        # 清单生成会调用 LLM，和批量分析共用同一把非阻塞锁：既防重复烧 token，
+        # 也避免多个并发 force 请求把上游打满。拿不到锁时明确返回 409。
+        if not ANALYZE_LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="已有分析或清单生成任务在运行，请稍后再试")
+        try:
+            # 等锁期间可能已有别的请求生成完成；非 force 必须在持锁后复查，避免重复调用 LLM。
+            if not force:
+                conn = connect(s)
+                try:
+                    existing = db.get_checklist(conn, article_id)
+                finally:
+                    conn.close()
+                if existing is not None:
+                    return _checklist_data(row, existing)
+            result = checklist_service.build_for_input(s, source)
+            items = checklist_service.items_payload(result)
+            conn = connect(s)
+            try:
+                db.save_checklist(conn, article_id=article_id, engine=result.engine, items=items)
+                checklist = db.get_checklist(conn, article_id)
+            finally:
+                conn.close()
+        finally:
+            ANALYZE_LOCK.release()
+        if checklist is None:  # pragma: no cover - save_checklist 成功时不会发生
+            raise HTTPException(status_code=500, detail="清单已生成但读取失败")
+        return _checklist_data(row, checklist)
+
+    @app.get("/v1/notifications")
+    def notifications(
+        limit: int = Query(default=20, ge=1, le=100),
+        unread_only: bool = Query(default=False),
+    ) -> dict:
+        """站内消息提醒：新分析出的项目申报类公告。
+
+        unread 始终是「全库未读数」，不受 unread_only 影响——铃铛角标要的是它，
+        下拉列表才需要只看未读。列表带文章跳转所需的 article_id/url。
+        """
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            items, total, unread = db.list_notifications(
+                conn, limit=limit, unread_only=unread_only
+            )
+        finally:
+            conn.close()
         return {
-            "data": {
-                "article_id": article_id,
-                "title": row["title"],
-                "url": row["url"],
-                "engine": checklist["engine"],
-                "generated_at": checklist["generated_at"],
-                "items": checklist["items"],
-            }
+            "data": items,
+            "meta": {"total": total, "unread": unread, "returned": len(items), "limit": limit},
         }
+
+    @app.post("/v1/notifications/read-all")
+    def notifications_read_all() -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            updated = db.mark_all_notifications_read(conn)
+        finally:
+            conn.close()
+        return {"data": {"updated": updated, "unread": 0}}
+
+    @app.post("/v1/notifications/{notification_id}/read")
+    def notification_read(notification_id: int) -> dict:
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            item = db.mark_notification_read(conn, notification_id)
+        finally:
+            conn.close()
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"未找到通知: {notification_id}")
+        return {"data": item}
 
     @app.get("/v1/schemas")
     def schemas() -> dict:

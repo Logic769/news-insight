@@ -1,4 +1,4 @@
-"""关键词检索层与 /v1/search 的回归用例。
+"""关键词检索层与 /v1/search 的回归用例（分组共 6 大类，含 other 兜底）。
 
 覆盖的重点是「排序的确由后端算出来」这件事，因为前端拿不到标签置信度与
 正文，无法自行重排——后端给错顺序就是错的最终结果。
@@ -630,11 +630,14 @@ def test_search_candidates_keeps_newest_rows_when_truncating() -> None:
     assert again == ids, "同一查询两次必须截到同一集合"
 
 
-def test_search_candidates_order_uses_analyzed_at_when_published_missing() -> None:
-    """published_at 为空的行不能被排到最前或最后，要按 analyzed_at 参与定序。
+def test_search_candidates_puts_undated_rows_last_in_both_directions() -> None:
+    """两个时间列都空的行在升、降序里都排最后。
 
-    老行可能没有 published_at（列表页没给日期）；定序表达式是
-    COALESCE(published_at, analyzed_at)，用它才不会把这些行挤成一堆。
+    早先定序写成 COALESCE(published_at, analyzed_at)：没有发布时间的行会被
+    analyzed_at（分析时刻，通常就是今天）顶到**最前**，用户按时间浏览时先看到的
+    全是无日期的老行。改成 _TIME_EXPR 后它们不再拿分析时刻冒充发布时间。
+    降序时 SQL 的 NULL 序本来就在末尾；升序则必须加 IS NULL 前缀，否则 NULL 会
+    排最前，截断到 2000 行时挤掉最早的有日期记录。
     """
     conn = _conn()
     _add(conn, "with_date", title="光伏补贴", published_at="2026-11-01 00:00:00")
@@ -647,7 +650,11 @@ def test_search_candidates_order_uses_analyzed_at_when_published_missing() -> No
 
     rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], limit=10)
     ids = [r["article_id"] for r in rows]
-    assert ids[0] == "no_date", ids
+    assert ids == ["with_date", "no_date"], ids
+
+    # 升序也必须把无日期行压到最后，否则它们会占掉「最早」的截断名额
+    asc = db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="published_asc", limit=10)
+    assert [r["article_id"] for r in asc] == ["with_date", "no_date"]
 
 
 def test_search_candidates_tie_break_is_article_id_desc() -> None:
@@ -668,3 +675,638 @@ def test_search_candidates_tie_break_is_article_id_desc() -> None:
 
     again = [r["article_id"] for r in db.search_candidates(conn, terms=["光伏"], tag_ids=[], limit=2)]
     assert again == ids, "等值行也必须稳定截断"
+
+# --------------------------------------------- 新增：时间/来源过滤与排序下推
+
+def _add_dt(
+    conn: sqlite3.Connection,
+    article_id: str,
+    *,
+    title: str = "光伏补贴通知",
+    body: str = "",
+    source: str = "svc",
+    published_at: str | None = "2026-11-01 00:00:00",
+    published_at_utc: str | None = None,
+    category: str = "other",
+) -> None:
+    """带 published_at_utc / source 的插入，覆盖混时区与来源筛选。"""
+    conn.execute(
+        "INSERT INTO analyzed_articles"
+        " (article_id, source, url, title, published_at, published_at_utc, content_length,"
+        "  body, category, category_confidence, category_engine,"
+        "  tag_engine, extract_engine, analyzed_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            article_id,
+            source,
+            f"https://example.com/{article_id}",
+            title,
+            published_at,
+            published_at_utc,
+            len(body),
+            body,
+            category,
+            0.9,
+            "rules",
+            "rules",
+            "rules",
+            "2026-11-02 00:00:00",
+        ),
+    )
+    conn.commit()
+
+
+def test_search_candidates_sorts_ascending_when_asked() -> None:
+    """按时间升序查时必须保留最老的一批。
+
+    候选截断方向跟着排序走：仍按「最新优先」截断的话，用户要看最老的几条，
+    截断却把最老的几千行全扔掉，结果集里只剩最新的，答案直接是错的。
+    """
+    conn = _conn()
+    for i in range(20):
+        _add_dt(conn, f"a{i:02d}", published_at=f"2026-11-{i + 1:02d} 00:00:00")
+
+    rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="published_asc", limit=5)
+    ids = [r["article_id"] for r in rows]
+    assert ids == ["a00", "a01", "a02", "a03", "a04"], ids
+
+
+def test_list_analyzed_rejects_unknown_sort() -> None:
+    conn = _conn()
+    _add_dt(conn, "a1")
+    with pytest.raises(ValueError, match="未知排序"):
+        db.list_analyzed(conn, tag=None, limit=10, offset=0, sort="nope")
+
+
+def test_search_grouped_rejects_unknown_sort() -> None:
+    conn = _conn()
+    _add_dt(conn, "a1")
+    with pytest.raises(ValueError, match="未知排序"):
+        db.search_grouped(conn, raw_query="光伏", tags=TAGS, sort="nope")
+
+
+def test_time_filter_uses_utc_column_over_wall_clock() -> None:
+    """时间过滤按真实时刻比较，不是按站点墙钟。
+
+    混时区站点里，墙钟更早的那篇可能其实更新。用 published_at 过滤会把东八区
+    的那篇错判到区间外。
+    """
+    conn = _conn()
+    # 墙钟 2026-11-01 08:00（东八区）= UTC 2026-11-01 00:00；墙钟 2026-10-31 20:00
+    # （UTC+0）= UTC 同刻之前。按墙钟排两者相差 12 小时，按真实时刻只差 0。
+    _add_dt(
+        conn,
+        "cn",
+        published_at="2026-11-01 08:00:00",
+        published_at_utc="2026-11-01 00:00:00",
+    )
+    _add_dt(
+        conn,
+        "utc",
+        published_at="2026-10-31 20:00:00",
+        published_at_utc="2026-10-31 20:00:00",
+    )
+
+    rows, total, _ = db.list_analyzed(
+        conn, tag=None, limit=10, offset=0, published_from="2026-11-01 00:00:00"
+    )
+    assert total == 1
+    assert [r["article_id"] for r in rows] == ["cn"]
+
+
+def test_time_filter_falls_back_to_wall_clock_when_utc_missing() -> None:
+    """历史行没有 published_at_utc 时退回墙钟比较，不能直接判成「不在区间内」。"""
+    conn = _conn()
+    _add_dt(conn, "legacy", published_at="2026-11-05 12:00:00", published_at_utc=None)
+
+    rows, total, undated = db.list_analyzed(
+        conn,
+        tag=None,
+        limit=10,
+        offset=0,
+        published_from="2026-11-01 00:00:00",
+        published_to="2026-11-06 00:00:00",
+    )
+    assert total == 1
+    assert undated == 0
+    assert [r["article_id"] for r in rows] == ["legacy"]
+
+
+def test_time_filter_reports_rows_without_any_date() -> None:
+    """两个时间列都空的行会被排除，条数必须单独报出来而不是静默消失。"""
+    conn = _conn()
+    _add_dt(conn, "dated", published_at="2026-11-05 12:00:00", published_at_utc="2026-11-05 04:00:00")
+    _add_dt(conn, "undated", published_at=None, published_at_utc=None)
+
+    rows, total, undated = db.list_analyzed(
+        conn, tag=None, limit=10, offset=0, published_from="2026-11-01 00:00:00"
+    )
+    assert total == 1
+    assert undated == 1, "无日期行必须计入 undated_excluded"
+    assert [r["article_id"] for r in rows] == ["dated"]
+
+
+def test_list_analyzed_source_filter_and_empty_list_semantics() -> None:
+    """sources=None 不筛；sources=[] 表示「筛完为空」，两者必须不同。"""
+    conn = _conn()
+    _add_dt(conn, "a1", source="site-a")
+    _add_dt(conn, "b1", source="site-b")
+
+    _, all_total, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0)
+    assert all_total == 2
+    _, one_total, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, sources=["site-a"])
+    assert one_total == 1
+    _, none_total, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, sources=[])
+    assert none_total == 0, "空列表必须是空集，不能退化成不过滤"
+
+
+def test_list_analyzed_confidence_sort_puts_nulls_last_in_both_directions() -> None:
+    conn = _conn()
+    _add_dt(conn, "mid")
+    _add_dt(conn, "high")
+    _add_dt(conn, "null")
+    conn.execute("UPDATE analyzed_articles SET category_confidence=0.4 WHERE article_id='mid'")
+    conn.execute("UPDATE analyzed_articles SET category_confidence=0.9 WHERE article_id='high'")
+    conn.execute("UPDATE analyzed_articles SET category_confidence=NULL WHERE article_id='null'")
+    conn.commit()
+
+    for sort, expected in (
+        ("confidence_desc", ["high", "mid", "null"]),
+        ("confidence_asc", ["mid", "high", "null"]),
+    ):
+        rows, _, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, sort=sort)
+        assert [r["article_id"] for r in rows] == expected, sort
+
+
+def test_normalize_day_rejects_compact_and_unpadded_forms() -> None:
+    """只认 YYYY-MM-DD：紧凑格式与不补零的写法都拒掉，避免同一天多种写法。"""
+    assert db.normalize_day("2026-11-05") == "2026-11-05 00:00:00"
+    assert db.normalize_day("") is None
+    assert db.normalize_day(None) is None
+    for bad in ("20261105", "2026-1-5", "2026/11/05", "11-05-2026"):
+        with pytest.raises(ValueError):
+            db.normalize_day(bad)
+
+
+def test_normalize_day_end_pushes_to_next_midnight() -> None:
+    """终点推到次日 00:00 且用 < 比较：当天 23:59:59 与带毫秒的时间戳都要在区间内。"""
+    assert db.normalize_day_end("2026-11-05") == "2026-11-06 00:00:00"
+    assert db.normalize_day_end("2026-12-31") == "2027-01-01 00:00:00"
+    assert db.normalize_day_end(None) is None
+
+
+def test_search_grouped_reports_returned_and_truncated() -> None:
+    """total 与 returned 不是一回事：后者是每类封顶后的实际条数。"""
+    conn = _conn()
+    for i in range(5):
+        _add_dt(conn, f"a{i}", category="project_application")
+
+    result = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        per_category=2,
+    )
+    assert result["total"] == 5
+    assert result["returned"] == 2, "returned 必须是实际渲染条数"
+    assert result["truncated"] is False
+    assert result["sort"] == "relevance"
+
+
+def test_source_stats_groups_by_source_and_uses_real_instant() -> None:
+    """来源统计的最新时间要按真实时刻取，不能取墙钟最大值。
+
+    这里刻意让两行的墙钟与真实时刻**跨天**：墙钟最晚的那篇（11-03 00:30 东八区）
+    真实时刻是 11-02 16:30，比另一篇（11-02 20:00 UTC）还早。取 MAX(published_at)
+    会给出 11-03，取 MAX(_TIME_EXPR) 才给出 11-02。只写同日数据的话两种写法结果
+    相同，变异能全绿通过。
+    """
+    conn = _conn()
+    _add_dt(
+        conn,
+        "a1",
+        source="site-a",
+        published_at="2026-11-03 00:30:00",
+        published_at_utc="2026-11-02 16:30:00",
+    )
+    _add_dt(
+        conn,
+        "a2",
+        source="site-a",
+        published_at="2026-11-02 12:00:00",
+        published_at_utc="2026-11-02 20:00:00",
+    )
+    _add_dt(
+        conn,
+        "b1",
+        source="site-b",
+        published_at="2026-10-01 00:00:00",
+        published_at_utc="2026-10-01 00:00:00",
+    )
+
+    rows = db.source_stats(conn)
+    by_source = {r["source"]: r for r in rows}
+    assert by_source["site-a"]["count"] == 2
+    assert by_source["site-b"]["count"] == 1
+    assert by_source["site-a"]["latest_published_at"] == "2026-11-02 20:00:00", (
+        "必须取真实时刻最大值；取墙钟会得到 2026-11-03 00:30:00"
+    )
+
+
+def test_source_stats_includes_empty_source_so_counts_add_up() -> None:
+    """/v1/articles 的 total 会把空 source 行算进去，来源统计也必须算。
+
+    否则前端「全部来源」显示的条数比各站点计数之和大，看起来像丢数据。
+    """
+    conn = _conn()
+    _add_dt(conn, "a1", source="site-a")
+    _add_dt(conn, "a2", source="")
+
+    rows = db.source_stats(conn)
+    assert sum(r["count"] for r in rows) == 2
+    assert {r["source"] for r in rows} == {"site-a", ""}
+    by_source = {r["source"]: r for r in rows}
+    assert by_source["site-a"]["source_filter"] == "site-a"
+    assert by_source[""]["source_filter"] == db.UNLABELED_SOURCE
+
+
+def test_source_filter_unlabeled_token_matches_only_empty_source() -> None:
+    """未标注来源必须能用显式 token 筛到：空串在 HTTP 层表示「清空多选」，会被丢弃。"""
+    conn = _conn()
+    _add_dt(conn, "a1", source="site-a")
+    _add_dt(conn, "a2", source="")
+    _add_dt(conn, "a3", source="site-b")
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        sources=[db.UNLABELED_SOURCE],
+    )
+    got = [item["article_id"] for group in out["groups"] for item in group["items"]]
+    assert got == ["a2"]
+
+    mixed = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        sources=["site-a", db.UNLABELED_SOURCE],
+    )
+    mixed_ids = [item["article_id"] for group in mixed["groups"] for item in group["items"]]
+    assert set(mixed_ids) == {"a1", "a2"}
+
+
+# --------------------------------------------- B1 回归：三处时间口径必须一致
+
+def _mixed_tz_rows(conn: sqlite3.Connection) -> None:
+    """两行的墙钟顺序与真实时刻顺序**相反**，且跨天。
+
+    A：墙钟 2026-03-02 00:00（东八区），真实时刻 2026-03-01 16:00Z
+    B：墙钟 2026-03-01 23:00（UTC+0），真实时刻 2026-03-01 23:00Z
+
+    按墙钟排 A 更新，按真实时刻排 B 更新。生产库 472 行里 137 行（29%）属于这种
+    「墙钟与 utc 差一天以上」的情形，所以这不是构造出来的极端样例。
+    """
+    _add_dt(
+        conn,
+        "A",
+        title="光伏补贴申报",
+        published_at="2026-03-02 00:00:00",
+        published_at_utc="2026-03-01 16:00:00",
+    )
+    _add_dt(
+        conn,
+        "B",
+        title="光伏补贴申报",
+        published_at="2026-03-01 23:00:00",
+        published_at_utc="2026-03-01 23:00:00",
+    )
+
+
+def test_list_and_search_agree_on_time_order_when_timezones_mix() -> None:
+    """同一个 sort 值，/v1/articles 与 /v1/search 必须给出相同顺序。
+
+    早先列表按墙钟排、检索按真实时刻排，两个接口对同一批数据给出相反顺序；
+    前端两个页面看起来都「正常」，用户只是觉得排序不太对。
+    """
+    conn = _conn()
+    _mixed_tz_rows(conn)
+
+    rows, _, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, sort="published_desc")
+    listed = [r["article_id"] for r in rows]
+
+    grouped = db.search_grouped(
+        conn, raw_query="光伏", tags=TAGS, category_order=CATEGORY_ORDER, sort="published_desc"
+    )
+    searched = [i["article_id"] for g in grouped["groups"] for i in g["items"]]
+
+    assert listed == ["B", "A"], listed
+    assert searched == ["B", "A"], searched
+
+
+def test_time_filter_window_matches_displayed_wall_clock_day() -> None:
+    """日期筛选按「界面上显示的那一天」判定，不是按 UTC 日。
+
+    A 的墙钟是 2026-03-02 00:00（东八区）、真实时刻是 2026-03-01 16:00Z。
+    筛 03-01 时：按 UTC 日 A 会被选中，但卡片上写着 03-02，用户会以为筛错了；
+    按墙钟日 A 落在 03-02，筛 03-01 只返回 B。生产库 472 行里 137 行属于这种
+    「墙钟日 != UTC 日」的情形，所以这是主路径而不是边角。
+    """
+    conn = _conn()
+    _mixed_tz_rows(conn)
+
+    rows, total, _ = db.list_analyzed(
+        conn,
+        tag=None,
+        limit=10,
+        offset=0,
+        published_from="2026-03-01 00:00:00",
+        published_to="2026-03-02 00:00:00",
+    )
+    assert total == 1
+    assert [r["article_id"] for r in rows] == ["B"]
+
+    # 反过来筛 03-02 必须能取到 A，且只有 A
+    rows, total, _ = db.list_analyzed(
+        conn,
+        tag=None,
+        limit=10,
+        offset=0,
+        published_from="2026-03-02 00:00:00",
+        published_to="2026-03-03 00:00:00",
+    )
+    assert total == 1
+    assert [r["article_id"] for r in rows] == ["A"]
+
+
+def test_search_candidates_ascending_keeps_oldest_by_real_instant() -> None:
+    """升序截断保留的必须是最老的真实时刻，而不是最老的墙钟。"""
+    conn = _conn()
+    _mixed_tz_rows(conn)
+
+    rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="published_asc", limit=1)
+    assert [r["article_id"] for r in rows] == ["A"], (
+        "A 的真实时刻 16:00Z 最早；按墙钟截断会留下 B（墙钟 03-01 23:00 早于 A 的 03-02 00:00）"
+    )
+
+
+def test_search_candidates_ascending_keeps_dated_rows_over_undated_when_truncating() -> None:
+    """升序截断时 NULL 时间键不能挤掉最早的有日期行（SQLite 默认把 NULL 排最前）。"""
+    conn = _conn()
+    _add_dt(conn, "undated", published_at=None, published_at_utc=None)
+    _add_dt(conn, "old", published_at="2020-01-01 00:00:00", published_at_utc="2020-01-01 00:00:00")
+    _add_dt(conn, "new", published_at="2026-11-01 00:00:00", published_at_utc="2026-11-01 00:00:00")
+
+    rows = db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="published_asc", limit=2)
+    assert [r["article_id"] for r in rows] == ["old", "new"], (
+        "两列皆空的行必须排在有日期行之后，否则它会占掉「最早」的截断名额"
+    )
+
+
+def test_list_analyzed_tie_break_is_article_id_desc() -> None:
+    """发布时间完全相同时按 article_id 降序，分页才不会重复/漏行。"""
+    conn = _conn()
+    for aid in ("b3", "b1", "b2"):
+        _add_dt(conn, aid, published_at="2026-11-01 00:00:00", published_at_utc="2026-11-01 00:00:00")
+
+    rows, _, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, sort="published_desc")
+    assert [r["article_id"] for r in rows] == ["b3", "b2", "b1"]
+
+    asc, _, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, sort="published_asc")
+    assert [r["article_id"] for r in asc] == ["b1", "b2", "b3"]
+
+
+def test_normalize_day_end_rejects_max_date() -> None:
+    """9999-12-31 加一天会溢出；日期控件常用它表示「不限」，不能变成 500。"""
+    assert db.normalize_day_end("9999-12-30") == "9999-12-31 00:00:00"
+    with pytest.raises(ValueError, match="日期超出可比较范围"):
+        db.normalize_day_end("9999-12-31")
+
+
+def test_search_candidates_rejects_unknown_sort() -> None:
+    """未知排序必须报错，不能静默按降序截断。"""
+    conn = _conn()
+    _add_dt(conn, "a1")
+    with pytest.raises(ValueError, match="未知排序"):
+        db.search_candidates(conn, terms=["光伏"], tag_ids=[], sort="nope")
+
+def test_search_time_filter_never_returns_blank_date_rows() -> None:
+    """日期是纯空白的历史行不能既出现在结果里、又被算成「已排除」。
+
+    SQLite 的 NULLIF(x, '') 只认空串，'   ' 原样返回，于是 _DAY_EXPR 得到 '   '，
+    '   ' < '2026-11-06' 为真 —— 只靠上下界的话这类行会被上界命中。而
+    list_analyzed 的 undated 统计用的是 trim(...) = ''，同一行会既出现又被报成
+    「未计入日期筛选」，用户看到「共 1 条，其中 1 条无日期未计入」这种自相矛盾的话。
+    """
+    conn = _conn()
+    _add_dt(conn, "dated", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "blank", published_at="   ", published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_to="2026-11-06",
+    )
+    ids = [i["article_id"] for g in out["groups"] for i in g["items"]]
+    assert ids == ["dated"], "空白日期行不能被上界命中"
+    assert out["total"] == 1
+    assert out["undated_excluded"] == 1, "它必须只出现在 excluded 计数里"
+
+
+def test_search_grouped_reports_undated_excluded_only_when_filtering() -> None:
+    """不筛日期时没有东西被排除，计数必须是 0 而不是全表无日期行数。"""
+    conn = _conn()
+    _add_dt(conn, "dated", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "undated", published_at=None, published_at_utc=None)
+
+    plain = db.search_grouped(conn, raw_query="光伏", tags=TAGS, category_order=CATEGORY_ORDER)
+    assert plain["total"] == 2, "不筛日期时无日期行照常返回"
+    assert plain["undated_excluded"] == 0
+
+    filtered = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_from="2026-11-01",
+    )
+    assert filtered["total"] == 1
+    assert filtered["undated_excluded"] == 1
+
+
+def test_search_undated_excluded_respects_category_and_source_filters() -> None:
+    """统计口径必须与筛选用的是同一批条件，否则两个数各说各话。
+
+    只按「全库无日期行」数一遍的话，用户筛了项目申报、看来源 A，却被告知
+    「另有 2 篇无日期被排除」——那 2 篇可能既不属于该类也不属于该来源，
+    用户去核对时根本找不到对应文章。
+    """
+    conn = _conn()
+    _add_dt(conn, "hit", category="project_application", source="site-a",
+            published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "same-cat", category="project_application", source="site-a",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "other-cat", category="industry_policy", source="site-a",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "other-src", category="project_application", source="site-b",
+            published_at=None, published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        categories=["project_application"],
+        sources=["site-a"],
+        published_from="2026-11-01",
+    )
+    assert out["undated_excluded"] == 1, "只数同类同源的那篇"
+
+
+def test_search_undated_excluded_only_counts_rows_matching_the_keyword() -> None:
+    """无日期统计必须只数「本来会被这次检索命中」的行。
+
+    只按「全库无日期的行」数一遍的话，用户搜「光伏」却被告知「另有 3 篇无日期
+    被排除」，而那 3 篇讲的是别的事 —— 用户按提示去核对时一篇都对不上。
+    """
+    conn = _conn()
+    _add_dt(conn, "hit", title="光伏补贴申报通知", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "hit-undated", title="光伏补贴申报补充通知",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "noise-undated", title="关于人才落户的通知",
+            published_at=None, published_at_utc=None)
+    _add_dt(conn, "noise-undated-2", title="关于开展安全检查的通知",
+            published_at=None, published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_from="2026-11-01",
+    )
+    assert out["total"] == 1
+    assert out["undated_excluded"] == 1, "无关的无日期行不能算进来"
+
+
+def test_search_undated_excluded_ignores_zero_confidence_tags() -> None:
+    """零置信度标签不是检索信号，不能算进「因无日期被排除」。
+
+    score_article 对 confidence<=0 的标签直接跳过，has_signal 随后也把该行判为
+    「无关系」：这类文章即使有日期也不会出现在结果里。SQL 侧若不跟着卡，用户会
+    被告知「另有 N 篇无日期被排除」，按提示去核对却一篇都对不上。
+    """
+    conn = _conn()
+    _add_dt(conn, "dated", title="项目申报通知", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "zero-conf", title="关于人才落户的通知", published_at=None, published_at_utc=None)
+    _add_dt(conn, "positive-conf", title="关于人才落户的通知", published_at=None, published_at_utc=None)
+    for aid, conf in (("zero-conf", 0.0), ("positive-conf", 0.9)):
+        conn.execute(
+            "INSERT INTO article_tags (article_id, tag, confidence, evidence, engine)"
+            " VALUES (?,?,?,?,?)",
+            (aid, "project_application", conf, "", "rules"),
+        )
+    conn.commit()
+
+    out = db.search_grouped(
+        conn,
+        raw_query="申报",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_from="2026-11-01",
+    )
+    assert out["total"] == 1
+    assert out["undated_excluded"] == 1, "只数正置信度标签那篇，零置信度不算"
+
+
+def test_search_time_filter_excludes_rows_with_whitespace_only_date() -> None:
+    """日期只由空白组成的历史行既不能出现在结果里，也不能悄悄消失。
+
+    内置 trim(x) 只去半角空格，'\t' 原样留下：它既会被上界命中（'\t' < '2026-11-06'），
+    又算不出 undated（trim 后仍是 '\t' 非空），于是这行既不在结果里也不在统计里，
+    用户看到的总数会比实际少且没有任何解释。
+
+    覆盖的码位必须与 search.WS_CHARS 同源：早先手写表只到制表符/全角空格，
+    U+2003（从 Word 复制的日期里最常见）与 U+0085 仍是静默丢行。
+    """
+    conn = _conn()
+    _add_dt(conn, "dated", published_at="2026-11-05 12:00:00")
+    _add_dt(conn, "tab", published_at="\t", published_at_utc=None)
+    _add_dt(conn, "ideographic", published_at="\u3000", published_at_utc=None)
+    _add_dt(conn, "em-space", published_at="\u2003", published_at_utc=None)
+    _add_dt(conn, "nel", published_at="\x85", published_at_utc=None)
+
+    out = db.search_grouped(
+        conn,
+        raw_query="光伏",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        published_to="2026-11-06",
+    )
+    ids = [i["article_id"] for g in out["groups"] for i in g["items"]]
+    assert ids == ["dated"]
+    assert out["undated_excluded"] == 4, "制表符/全角空格/U+2003/U+0085 都要计入未计入统计"
+
+
+def test_search_time_sort_breaks_ties_by_relevance() -> None:
+    """同一时刻的多篇仍按相关度次序：时间相同不等于顺序可以随便。
+
+    发布时间精度到秒，同一天发的几十篇里大多数这一列完全相同，只剩相关度能
+    区分。这里刻意让「高分那篇的 article_id」在两种排序下都与期望顺序相反：
+    如果删掉相关度这一级键、直接落到 article_id 兜底，结果必然反序——只写
+    同向数据的话，删键也照样绿，守卫等于没有。
+    """
+    for sort, high in (("published_desc", "aaa-high"), ("published_asc", "zzz-high")):
+        conn = _conn()
+        low = "zzz-low" if high == "aaa-high" else "aaa-low"
+        for aid in (high, low):
+            _add_dt(
+                conn,
+                aid,
+                category="project_application",
+                published_at="2026-11-01 00:00:00",
+                published_at_utc="2026-11-01 00:00:00",
+            )
+        for aid, conf in ((high, 0.95), (low, 0.3)):
+            conn.execute(
+                "INSERT INTO article_tags (article_id, tag, confidence, evidence, engine)"
+                " VALUES (?,?,?,?,?)",
+                (aid, "new_energy", conf, "", "rules"),
+            )
+        conn.commit()
+
+        out = db.search_grouped(
+            conn, raw_query="光伏", tags=TAGS, category_order=CATEGORY_ORDER, sort=sort
+        )
+        ids = [i["article_id"] for g in out["groups"] for i in g["items"]]
+        assert ids == [high, low], (sort, ids)
+
+
+def test_search_grouped_empty_query_keeps_response_shape() -> None:
+    """空查询的返回不能缺键：前端为缺键兜默认值，那套默认值迟早跟真实返回漂移。
+
+    必须传真正的空串走 search_grouped 的早退分支。传"库里没有的词"是**测不到**的：
+    resolve_query 对任何非空文本都会塞一个 terms 条目，is_empty 为 False，代码走的是
+    正常路径，四键断言天然成立（这个用例曾经就是这么写的，删掉早退分支仍然全绿）。
+    """
+    conn = _conn()
+    _add_dt(conn, "a1")
+
+    out = db.search_grouped(
+        conn,
+        raw_query="",
+        tags=TAGS,
+        category_order=CATEGORY_ORDER,
+        sort="published_asc",
+    )
+    assert out["groups"] == [] and out["total"] == 0
+    assert out["sort"] == "published_asc"
+    assert out["returned"] == 0
+    assert out["truncated"] is False
+    assert out["undated_excluded"] == 0
+
