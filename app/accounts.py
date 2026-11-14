@@ -551,11 +551,14 @@ def admin_summary(conn: sqlite3.Connection, *, days: int = 7) -> dict[str, Any]:
     start = start_date.isoformat()
     # 文章发布时间是站点墙钟（按本地日比较），作业/运行/日志时间戳是 UTC ISO；
     # 两者不能共用一个字符串边界，否则本地窗口首日 00:00–08:00 的记录会被漏掉。
-    start_utc = (
-        dt.datetime.combine(start_date, dt.time.min, tzinfo=_CST)
-        .astimezone(dt.timezone.utc)
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_utc_dt = dt.datetime.combine(start_date, dt.time.min, tzinfo=_CST).astimezone(
+        dt.timezone.utc
     )
+    # operation_logs 用 ISO「T…Z」，runs/analysis_jobs 用「YYYY-MM-DD HH:MM:SS」；
+    # 同一时刻必须按各自的存储格式生成边界，字符串比较才不会在日期相同时按第 11 位
+    # （空格 0x20 < T 0x54）把窗口内的记录判到窗口外。
+    start_utc = start_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_utc_space = start_utc_dt.strftime("%Y-%m-%d %H:%M:%S")
     total_articles = int(conn.execute("SELECT COUNT(*) FROM analyzed_articles").fetchone()[0])
     total_sources = int(
         conn.execute("SELECT COUNT(DISTINCT source) FROM analyzed_articles").fetchone()[0]
@@ -587,7 +590,7 @@ def admin_summary(conn: sqlite3.Connection, *, days: int = 7) -> dict[str, Any]:
     # 一边显示近 7 天文章、一边把全部历史任务算进成功率。
     job_rows = conn.execute(
         "SELECT status, COUNT(*) AS count FROM analysis_jobs WHERE created_at >= ? GROUP BY status",
-        (start_utc,),
+        (start_utc_space,),
     ).fetchall()
     jobs = {str(row["status"]): int(row["count"]) for row in job_rows}
     run_stats = conn.execute(
@@ -595,7 +598,7 @@ def admin_summary(conn: sqlite3.Connection, *, days: int = 7) -> dict[str, Any]:
              SUM(CASE WHEN finished_at IS NOT NULL AND errors = 0 THEN 1 ELSE 0 END) AS succeeded,
              SUM(CASE WHEN finished_at IS NOT NULL AND errors > 0 THEN 1 ELSE 0 END) AS failed
            FROM runs WHERE started_at >= ?""",
-        (start_utc,),
+        (start_utc_space,),
     ).fetchone()
     run_succeeded = int(run_stats["succeeded"] or 0) if run_stats else 0
     run_failed = int(run_stats["failed"] or 0) if run_stats else 0

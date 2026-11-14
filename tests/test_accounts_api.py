@@ -343,37 +343,60 @@ def test_admin_stats_merges_cli_runs_and_counts_errors(client):
 
 
 def test_admin_stats_window_boundary_uses_local_midnight(client):
-    """窗口首日本地 00:00–08:00 的运行不能因为 UTC 字符串比较被漏计。"""
+    """窗口首日本地 00:00–08:00 的作业/运行/活跃用户都不能因 UTC 边界被漏计。"""
     _create_user(client, "root", role="admin")
+    _create_user(client, "viewer")
     headers = _auth(_token(client, "root"))
-    before = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]["jobs"]
+    before = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]
 
     today = accounts._local_today()
     first_day = today - dt.timedelta(days=6)
-    boundary = (
-        dt.datetime.combine(first_day, dt.time.min, tzinfo=accounts._CST)
-        .astimezone(dt.timezone.utc)
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    # runs / analysis_jobs 生产格式是空格无 Z；operation_logs 是 ISO「T…Z」，两套都要守。
+    boundary_local = dt.datetime.combine(first_day, dt.time(hour=1), tzinfo=accounts._CST)
+    outside_local = dt.datetime.combine(
+        first_day - dt.timedelta(days=1), dt.time(hour=23), tzinfo=accounts._CST
     )
+    boundary_space = boundary_local.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    outside_space = outside_local.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    boundary_iso = boundary_local.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     settings = client.app.state.settings
     conn = db.connect(settings.db_path)
     try:
+        viewer = accounts.get_user_by_username(conn, "viewer")
+        assert viewer is not None
         conn.execute(
             "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
             " VALUES (?, ?, 'live', 1, 1, 0, 0)",
-            (boundary, boundary),
+            (boundary_space, boundary_space),
+        )
+        conn.execute(
+            "INSERT INTO runs (started_at, finished_at, mode, scanned, analyzed, skipped, errors)"
+            " VALUES (?, ?, 'live', 1, 0, 0, 5)",
+            (outside_space, outside_space),
         )
         conn.execute(
             "INSERT INTO analysis_jobs (id, status, payload, created_at, finished_at)"
             " VALUES ('boundary-job', 'succeeded', '{}', ?, ?)",
-            (boundary, boundary),
+            (boundary_space, boundary_space),
+        )
+        conn.execute(
+            "INSERT INTO analysis_jobs (id, status, payload, created_at, finished_at)"
+            " VALUES ('outside-job', 'failed', '{}', ?, ?)",
+            (outside_space, outside_space),
+        )
+        conn.execute(
+            "INSERT INTO operation_logs (user_id, username, action, created_at)"
+            " VALUES (?, 'viewer', 'auth.login', ?)",
+            (int(viewer["id"]), boundary_iso),
         )
         conn.commit()
     finally:
         conn.close()
 
-    after = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]["jobs"]
-    assert after["succeeded"] == before.get("succeeded", 0) + 2
+    after = client.get("/v1/admin/stats?days=7", headers=headers).json()["data"]
+    assert after["jobs"]["succeeded"] == before["jobs"].get("succeeded", 0) + 2
+    assert after["jobs"]["failed"] == before["jobs"].get("failed", 0)
+    assert after["totals"]["active_users"] == before["totals"]["active_users"] + 1
 
 
 def test_admin_sites_proxy_passes_upstream_422(client, monkeypatch):
