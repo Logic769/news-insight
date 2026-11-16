@@ -143,15 +143,19 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
 | POST | `/v1/auth/login`、`GET /v1/auth/me`、`POST /v1/auth/logout`、`POST /v1/auth/password` | 本地账号：登录发数据库会话 Token（`Authorization: Bearer`）、查当前用户、登出、改密（需原密码，新密码≥8位且含大小写/数字/特殊字符） |
 | GET/PATCH | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏（增删查）、浏览历史（倒序/清空）、关注领域与推送偏好 |
+| GET/POST/DELETE | `/v1/me/search-history`、`/v1/me/search-history/{id}`、`/v1/me/search-history/{id}/click` | 搜索历史：倒序列表（`limit`≤200、`offset`）、手工补录一次、删除单条、清空；`{id}/click` 把点击的文章回填到该条记录，供个性化画像加权。**`GET /v1/search` 会自动留痕**（登录用户，10 分钟内同词只更新时间与结果数），响应 `meta.search_history_id` 就是这次记录，前端点结果时带上它即可闭环归因 |
 | GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员：用户/站点 CRUD、重置密码、统计看板、操作日志；登录管理员不能禁用/降级自己，服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`（写前由爬虫备份配置，接口型源只能改非接口字段）；`admin/stats` 的每日趋势、任务数与成功率均按近 N 天（本地日）统计 |
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
+| GET | `/v1/search?q=&category=&industry=&source=&published_from=&published_to=&sort=&per_category=&include_body=&min_relevance=` | 关键词检索：结果按 6 大类分组、类内按所选 `sort` 排序（**排序全部在后端算完**，前端只渲染）；`q` 必填 1–100 字；登录用户的这次检索会被自动记入搜索历史，响应 `meta.search_history_id` 供点击归因 |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
+| GET | `/v1/articles?...&include_highlights=true` | `include_highlights` 默认 `false`：只有 ≥80 分的文章才附 `highlights`（要素摘要），列表默认不带该字段以节省带宽 |
 | GET | `/v1/articles?tag=project_application&limit=20&sort=relevance_desc` | 已分析文章列表，可按标签、大类（`category=funding_subsidy`）、受控行业（`industry=new_energy`）或语义相关性阈值（`min_relevance=0.5`，0–1）过滤（AND 组合）；`category`、`industry` 均可重复或逗号分隔；`sort` 支持 `published_desc/asc`、`updated_desc`、`confidence_desc/asc`、`relevance_score_desc/asc`（文章级语义评分，NULL 最后）与 `relevance_desc/asc`（用户画像相关度，只在前 2000 条候选内计算，`offset+limit` 超过时 422）；每项含 `relevance`（0–1，画像分）、`profile_reason`（画像排序理由）与 `relevance_score`（0–1，语义分）、`relevance_reason`（语义评分依据） |
 | GET | `/v1/search?q=申报&category=project_application&industry=new_energy&per_category=20&include_body=false&source=&published_from=&published_to=&sort=relevance&min_relevance=0.5` | **关键词检索**：结果按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端直接渲染；详见下节）。`sort` 取 `relevance`/`published_desc`/`published_asc`；`category`、`industry` 与 `source` 均可重复或逗号分隔；`min_relevance`（0–1）按文章级语义评分过滤，每项同时带 `relevance`（查询相关度）与 `relevance_score`（语义评分） |
 | GET | `/v1/industries` | 受控行业词表（10 个 id/中文名/描述/关键词）+ 每个行业的文章数，供前端行业筛选与徽标 |
 | GET | `/v1/recommendations?limit=10` | 首页 Top10 推荐：登录用户按关注领域/收藏/浏览历史、内容质量与文章语义相关性混合打分，匿名用户按内容质量、新鲜度与语义相关性打分；`meta.personalized` 标识是否个性化 |
 | GET | `/v1/todos?limit=5` | 首页近期申报截止：取项目申报抽取结果中未过期的 `deadline`，按剩余天数升序；`meta.total` 为全部未过期项数量 |
+| — | 项目申报 schema 字段类型 | `focus_areas` 是**数组**（专项扶持的行业领域/技术方向，逐项列出），在 `/v1/extractions` 与文章详情里以 JSON 文本返回；`deadline_raw` 是未归一化的原文表述，规范化日期在 `deadline`；`funding_amount` 是字符串，可能带「不超过 500 万元」这类限定语 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `article_not_found`；非项目申报或缺少可用要素/正文 409 `checklist_not_applicable`（字符串错误码）；已有分析/清单生成任务持有同一把全局锁时也返回 409，但错误码为数字 `409`，客户端按 `error.code` 类型区分业务不适用与并发冲突 |

@@ -17,7 +17,9 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
-from dataclasses import dataclass
+import re
+import sqlite3
+from dataclasses import dataclass, field
 from typing import Any
 
 from app import db
@@ -39,10 +41,88 @@ _P_TAG = 0.15
 _P_CATEGORY = 0.10
 _P_SOURCE = 0.05
 _P_SEMANTIC = 0.20
+# 搜索是比「浏览过什么」更直接的意图信号；作为额外加分项，不挤占内容质量权重。
+_P_SEARCH = 0.10
 
 # 截止日期按站点墙钟日比较。容器默认 UTC，直接用 date.today() 会在
 # 东八区 00:00–08:00 把「还剩 1 天」算成「已过期」。
 _CST = dt.timezone(dt.timedelta(hours=8))
+
+# 搜索词命中标题用的停用词表（casefold 后比较）。
+#
+# 生产库 481 篇文章的标题里「通知」出现 36.6%、「项目」23.1%、「申报」15.4%——
+# 这几个词几乎出现在每一篇公告标题里，用户搜过一次「申报通知」之后，画像就把
+# 它当成强信号，于是「匹配历史搜索」这个理由会挂到几乎所有文章上，排序退化成
+# 按新鲜度排、理由却写着「匹配历史搜索」，属于「看起来个性化、其实没个性化」。
+#
+# 只挡「在标题里没有区分度、但单看像主题词」的通用政务/申报用语；具体的领域词
+# （新能源、专精特新、数字化改造…）一律放行——那才是画像真正想要的信号。
+_SEARCH_STOPWORDS = frozenset(
+    {
+        "通知", "公告", "公示", "通告", "通报", "发布", "印发", "关于", "有关",
+        "项目", "申报", "申请", "申报通知", "项目申报", "工作", "工作通知",
+        "有关工作", "要求", "事项", "事宜", "意见", "办法", "规定", "文件",
+        "名单", "结果", "情况", "信息", "相关", "开展", "组织", "实施",
+        "单位", "部门", "政府", "省市", "时间", "截止",
+        "政策", "监督", "审核", "评审", "推荐", "报送",
+        # 年份要连「年」一起挡：只放 "2026" 挡不住标题里实际写的 "2026年"。
+        "2024", "2025", "2026", "2027", "2024年", "2025年", "2026年", "2027年",
+        # 下面这些是「补齐子串形态」，不是新增泛词：政务标题里高频，且常以组合形式出现
+        # （"申报工作"、"有关事项"、"以下简称"），等值匹配的单表挡不住。
+        "年度", "申报工作", "有关事项", "以下简称", "通知如下", "现将",
+    }
+)
+
+# 在整串之外还要拆出的通用子串。
+#
+# 停用词表是等值匹配，而中文查询没有空格——用户打「2026年度专精特新申报通知」时，
+# build_profile 只产出一条整串，整串在标题里永远匹配不到（实测命中 False），这条
+# 搜索就等于没发生。所以在整串之外，再按这些短语把它切一刀，让有区分度的部分
+# （这里是「专精特新」）露出来。
+#
+# 只按「够长、够通用」的短语切，不按 2 字滑窗：滑窗会把「专精」「精特」「特新」
+# 一类的碎片全部塞进画像，那是噪声不是信号。
+_QUERY_SPLIT_PATTERNS = (
+    "申报工作", "有关事项", "以下简称", "通知如下",
+    "申报通知", "项目申报", "工作通知", "有关工作",
+    "通知", "公告", "公示", "印发", "关于", "申报", "项目", "年度",
+)
+
+# 单字与两位数字没有区分度：搜「3」不该让全库带 3 的标题都算命中历史搜索。
+_MIN_SEARCH_TERM_LEN = 2
+
+
+def _usable_search_term(term: str) -> bool:
+    """这个词是否值得进画像：长度够、且不是通用政务用语。
+
+    长度用 casefold 之后的字符数判断；中文没有词边界，只能按字数和停用词表挡，
+    这是刻意的取舍——宁可少收一个信号，也不要让「通知」这种词把排序带偏。
+    """
+    if not (_MIN_SEARCH_TERM_LEN <= len(term) <= 40):
+        return False
+    return term not in _SEARCH_STOPWORDS
+
+
+def _query_fragments(raw_query: str) -> list[str]:
+    """把无空格的中文长查询切成有区分度的片段。
+
+    只按 _QUERY_SPLIT_PATTERNS 里的通用短语切，返回**除整串之外**的片段：
+    「2026年度专精特新申报通知」→ ["专精特新"]。切不出东西时返回空列表
+    （「新能源汽车」这种情况），调用方据此决定是否保留整串。
+    """
+    pattern = "|".join(re.escape(item) for item in _QUERY_SPLIT_PATTERNS)
+    whole = raw_query.casefold()
+    fragments: list[str] = []
+    for fragment in re.split(pattern, raw_query):
+        fragment = fragment.strip()
+        if not (_MIN_SEARCH_TERM_LEN <= len(fragment) <= 40):
+            continue
+        if fragment.casefold() == whole or fragment.casefold() in {
+            item.casefold() for item in fragments
+        }:
+            continue
+        fragments.append(fragment)
+    return fragments
 
 
 def _parse_time(value: Any) -> dt.datetime | None:
@@ -93,10 +173,17 @@ class Profile:
     categories: set[str]
     sources: set[str]
     tag_weights: dict[str, float]
+    search_terms: dict[str, float] = field(default_factory=dict)
 
     @property
     def has_signal(self) -> bool:
-        return bool(self.industries or self.categories or self.sources or self.tag_weights)
+        return bool(
+            self.industries
+            or self.categories
+            or self.sources
+            or self.tag_weights
+            or self.search_terms
+        )
 
 
 def build_profile(conn: Any, user_id: int) -> Profile:
@@ -139,14 +226,80 @@ def build_profile(conn: Any, user_id: int) -> Profile:
                     row["confidence"] or 0.0
                 )
 
+    # 搜索历史是显式意图：查询词本身进 search_terms，点击过的文章再按 2x
+    # 权重补标签/分类/行业/来源。旧库尚未建表时跳过，不让画像拖垮首页。
+    search_terms: dict[str, float] = {}
+    clicked_ids: list[str] = []
+    try:
+        history_rows = conn.execute(
+            "SELECT query, clicked_article_id FROM user_search_history"
+            " WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 100",
+            (user_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        history_rows = []
+    for row in history_rows:
+        raw_query = str(row["query"] or "").strip()
+        if raw_query:
+            # 中文查询没有空格，整串保留；同时拆出用空格/标点分隔的短词。
+            fragments = _query_fragments(raw_query)
+            # 只剔除「无空格、且被切开了」的整串。
+            #
+            # 中文长查询「2026年度专精特新申报通知」原样出现在标题里的概率接近零，
+            # 留着它只是一个永远命不中的键；但带空格的查询（「新能源 申报」）整串
+            # 本来就是用户显式分隔的形态，语义完整，必须保留——那是既有行为。
+            whole_is_redundant = len(fragments) > 0 and not re.search(r"\s", raw_query.strip())
+            parts = [raw_query, *re.split(r"[\s,，;；、|/]+", raw_query)]
+            for part in parts:
+                term = part.strip().casefold()
+                if whole_is_redundant and term == raw_query.casefold():
+                    continue
+                if _usable_search_term(term):
+                    search_terms[term] = search_terms.get(term, 0.0) + 1.0
+            # 无空格的中文长串再切一次，让有区分度的部分露出来（实测
+            # 「2026年度专精特新申报通知」整串命中 False，「专精特新」命中 True）。
+            # 片段照样过 _usable_search_term，通用词被滤掉。
+            for fragment in fragments:
+                term = fragment.strip().casefold()
+                if _usable_search_term(term):
+                    search_terms[term] = search_terms.get(term, 0.0) + 1.0
+        clicked = str(row["clicked_article_id"] or "").strip()
+        if clicked:
+            clicked_ids.append(clicked)
+    if clicked_ids:
+        for start in range(0, len(clicked_ids), 500):
+            chunk = clicked_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT a.category, a.industry, a.source, t.tag, t.confidence"
+                " FROM analyzed_articles a"
+                " LEFT JOIN article_tags t ON t.article_id = a.article_id"
+                " WHERE a.article_id IN (" + placeholders + ")",
+                chunk,
+            ):
+                if row["category"]:
+                    categories.add(str(row["category"]))
+                if row["industry"]:
+                    industries.add(str(row["industry"]))
+                if row["source"]:
+                    sources.add(str(row["source"]))
+                if row["tag"]:
+                    tag = str(row["tag"])
+                    tag_weights[tag] = tag_weights.get(tag, 0.0) + 2.0 * float(
+                        row["confidence"] or 0.0
+                    )
     if tag_weights:
         peak = max(tag_weights.values()) or 1.0
         tag_weights = {tag: value / peak for tag, value in tag_weights.items()}
+    if search_terms:
+        peak = max(search_terms.values()) or 1.0
+        search_terms = {term: value / peak for term, value in search_terms.items()}
     return Profile(
         industries=industries or set(),
         categories=categories or set(),
         sources=sources or set(),
         tag_weights=tag_weights,
+        search_terms=search_terms,
     )
 
 
@@ -176,6 +329,15 @@ def score_row(
     category_hit = 1.0 if category and category in profile.categories else 0.0
     source_hit = 1.0 if source and source in profile.sources else 0.0
     semantic = max(0.0, min(1.0, float(row.get("relevance_score") or 0.0)))
+    title = str(row.get("title") or "").casefold()
+    search_hit = 0.0
+    for term, weight in profile.search_terms.items():
+        # 画像里已经滤过停用词，这里再判一次是因为 search_terms 可能由
+        # 老库/直接构造的 Profile 传进来（测试与历史数据都走过这条路）。
+        if not _usable_search_term(term):
+            continue
+        if term in title:
+            search_hit = max(search_hit, min(1.0, weight))
     score = (
         _P_CONTENT * base
         + _P_INDUSTRY * industry_hit
@@ -183,10 +345,13 @@ def score_row(
         + _P_CATEGORY * category_hit
         + _P_SOURCE * source_hit
         + _P_SEMANTIC * semantic
+        + _P_SEARCH * search_hit
     )
     reasons: list[str] = []
     if industry_hit:
         reasons.append("匹配关注行业")
+    if search_hit > 0:
+        reasons.append("匹配历史搜索")
     if tag_hit >= 0.5:
         reasons.append("与收藏/浏览主题相近")
     if category_hit:

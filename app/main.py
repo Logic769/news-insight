@@ -74,6 +74,104 @@ def _split_multi(
     return out or (None if empty_returns_none else [])
 
 
+# 留痕写连接自己的锁等待上限（毫秒）。
+#
+# 检索路径上不允许排队：db.connect 的 busy_timeout 是 30000ms，8 worker 抢写锁时
+# 一次检索最坏能挂 30 秒。留痕是可丢的附加信息，宁可快速失败也不要占住请求。
+_RECORD_SEARCH_BUSY_TIMEOUT_MS = 200
+
+
+def _record_search_quietly(
+    settings: Settings, *, user_id: int, query: str, result_count: int
+) -> int | None:
+    """在独立连接上记录搜索留痕，任何失败都不影响已经算好的检索结果。
+
+    三条硬要求：
+
+    1. **检索不能因为留痕失败而失败**。留痕是附加信息，最坏情况是历史里少一条。
+    2. **只读部署要能跑**。库文件只读挂载或 PRAGMA query_only 时，写操作必然报
+       "attempt to write a readonly database"；这是部署形态的既定差异，不是错误，
+       所以降级成 DEBUG 而不是 ERROR。
+    3. **检索不能被留痕拖慢**。这点换了连接也解决不了：写仍然是写，排队等待的
+       时间照样算在响应时间里（实测外部持写锁 2s 时，请求延迟就从 0.046s 变成
+       2.10s）。所以这里把 busy_timeout 压到 200ms —— 抢不到锁就放弃这一次留痕，
+       把「排队 30 秒」换成「最多多等 0.2 秒」。
+
+       为什么不放到响应之后（BackgroundTasks）：meta.search_history_id 是这次留痕
+       记录的 id，前端点结果时要用它回填 clicked_article_id 做归因。改成后台执行后
+       响应里只能给 null，归因链路直接断掉。0.2s 的上界是这两者之间能接受的折中；
+       真要彻底移出请求路径，得把契约改成「先返回 null，再由前端补一次
+       POST /v1/me/search-history」，那是另一个决定，不在本次范围。
+
+    其余异常是真问题（磁盘满、schema 缺列），保留 warning 并带异常类型。
+
+    注意 fail-fast 的代价：高并发写锁争用下会丢部分留痕记录。这是刻意的取舍，
+    历史列表少两条比检索 p99 涨 30 秒好。
+    """
+    conn: sqlite3.Connection | None = None
+    try:
+        # db.connect 也必须在 try 里：db.py:351 会 mkdir 父目录、:363 会
+        # PRAGMA journal_mode=WAL（写操作）。库只读且原本不是 WAL 时，这两步都会抛
+        # "attempt to write a readonly database" —— 放在 try 外面就等于只读部署下
+        # 每次检索都 500，而「只读部署能跑」正是这个函数存在的理由之一。
+        conn = db.connect(settings.db_path)
+        conn.execute(f"PRAGMA busy_timeout={_RECORD_SEARCH_BUSY_TIMEOUT_MS}")
+        return accounts.record_search(
+            conn, user_id=user_id, query=query, result_count=result_count
+        )
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "readonly" in message or "read-only" in message:
+            LOG.debug("只读数据库，跳过搜索留痕：%s", exc)
+        elif "locked" in message or "busy" in message:
+            # 拿不到写锁：这一次留痕直接放弃，不重试（重试会把延迟又还回去）。
+            LOG.debug("写锁繁忙，跳过本次搜索留痕：%s", exc)
+        else:
+            LOG.warning("记录搜索历史失败（%s）：%s", type(exc).__name__, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - 留痕失败绝不能冒泡成 500
+        LOG.warning("记录搜索历史失败（%s）：%s", type(exc).__name__, exc)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# 写端点的锁等待上限（毫秒）。理由同 _RECORD_SEARCH_BUSY_TIMEOUT_MS：8 个 worker
+# 抢同一把 SQLite 写锁，默认 busy_timeout=30000 会让请求干等 30 秒再收到一个语义
+# 错误的 500。写端点拿不到锁就该快速失败并明确告诉客户端「稍后重试」。
+_WRITE_BUSY_TIMEOUT_MS = 3000
+
+
+def _write_conn(settings: Settings) -> sqlite3.Connection:
+    """写端点专用连接：把 busy_timeout 从 30s 压到 3s，失败快、语义清楚。"""
+    conn = db.connect(settings.db_path)
+    conn.execute(f"PRAGMA busy_timeout={_WRITE_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def _write_failure(exc: sqlite3.OperationalError) -> HTTPException | None:
+    """把写端点的 OperationalError 映射成有意义的 HTTP 状态。
+
+    返回 None 表示「这不是可预期的部署/并发问题」，调用方应原样抛出（500）。
+    只读部署返回 503 而不是 500：服务本身是健康的，是这个实例不接受写入。
+    """
+    message = str(exc).lower()
+    if "readonly" in message or "read-only" in message:
+        return HTTPException(
+            status_code=503,
+            detail="当前实例以只读方式运行，暂不支持写入",
+            headers={"Retry-After": "60"},
+        )
+    if "locked" in message or "busy" in message:
+        return HTTPException(
+            status_code=503,
+            detail="数据库繁忙，请稍后重试",
+            headers={"Retry-After": "1"},
+        )
+    return None
+
+
 class AnalyzeJobRequest(BaseModel):
     type: Literal["analyze"] = "analyze"
     limit: int = Field(default=100, ge=1, le=10000)
@@ -119,6 +217,15 @@ class FavoriteRequest(BaseModel):
 
 
 class HistoryRequest(BaseModel):
+    article_id: str = Field(min_length=1, max_length=128)
+
+
+class SearchHistoryRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=100, pattern=r"\S")
+    result_count: int = Field(default=0, ge=0, le=100000)
+
+
+class SearchHistoryClickRequest(BaseModel):
     article_id: str = Field(min_length=1, max_length=128)
 
 
@@ -350,7 +457,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/auth/login")
     def login(payload: LoginRequest, request: Request) -> dict:
         s: Settings = app.state.settings
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             user = accounts.get_user_by_username(conn, payload.username.strip())
             if user is None:
@@ -428,7 +535,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s: Settings = app.state.settings
         token = getattr(request.state, "token", "")
         if token:
-            auth.revoke_token(s, token)
+            try:
+                auth.revoke_token(s, token)
+            except sqlite3.OperationalError as exc:
+                mapped = _write_failure(exc)
+                if mapped is None:
+                    raise
+                raise mapped from exc
         return {"data": {"logged_out": True}}
 
     @app.post("/v1/auth/password")
@@ -440,7 +553,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         policy_error = auth.password_policy_error(payload.new_password)
         if policy_error:
             raise HTTPException(status_code=400, detail=policy_error)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             fresh = accounts.get_user(conn, int(user["id"]), include_secret=True)
             if fresh is None:
@@ -478,7 +591,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_profile(payload: ProfileUpdateRequest, request: Request) -> dict:
         s: Settings = app.state.settings
         user = _current_user(request)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             updated = accounts.update_user(
                 conn,
@@ -518,7 +631,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def add_my_favorite(payload: FavoriteRequest, request: Request) -> dict:
         s: Settings = app.state.settings
         user = _current_user(request)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             if db.get_article(conn, payload.article_id) is None:
                 raise HTTPException(status_code=404, detail="未找到该文章")
@@ -535,7 +648,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def delete_my_favorite(article_id: str, request: Request) -> dict:
         s: Settings = app.state.settings
         user = _current_user(request)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             removed = accounts.remove_favorite(
                 conn, user_id=int(user["id"]), article_id=article_id
@@ -570,7 +683,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def record_my_history(payload: HistoryRequest, request: Request) -> dict:
         s: Settings = app.state.settings
         user = _current_user(request)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             if db.get_article(conn, payload.article_id) is None:
                 raise HTTPException(status_code=404, detail="未找到该文章")
@@ -585,9 +698,97 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def clear_my_history(request: Request) -> dict:
         s: Settings = app.state.settings
         user = _current_user(request)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             cleared = accounts.clear_history(conn, user_id=int(user["id"]))
+        finally:
+            conn.close()
+        return {"data": {"cleared": cleared}}
+
+    @app.get("/v1/me/search-history")
+    def my_search_history(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = connect(s)
+        try:
+            items, total = accounts.list_search_history(
+                conn, user_id=int(user["id"]), limit=limit, offset=offset
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {"total": total, "returned": len(items), "limit": limit, "offset": offset},
+        }
+
+    @app.post("/v1/me/search-history")
+    def record_my_search(payload: SearchHistoryRequest, request: Request) -> dict:
+        """显式记录一次搜索（前端离线/补录用）；/v1/search 也会自动记录。
+
+        写锁/只读的错误映射统一由 create_app 里的 OperationalError 处理器负责
+        （503 + Retry-After），这里不再逐个路由复制 try/except。连接自己把
+        busy_timeout 压到 _WRITE_BUSY_TIMEOUT_MS，拿不到锁最多等 3 秒而不是 30 秒。
+        """
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            history_id = accounts.record_search(
+                conn,
+                user_id=int(user["id"]),
+                query=payload.query,
+                result_count=payload.result_count,
+            )
+        finally:
+            conn.close()
+        return {"data": {"id": history_id, "recorded": True}}
+
+    @app.post("/v1/me/search-history/{history_id}/click")
+    def click_search_result(
+        history_id: int, payload: SearchHistoryClickRequest, request: Request
+    ) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            if db.get_article(conn, payload.article_id) is None:
+                raise HTTPException(status_code=404, detail="未找到该文章")
+            updated = accounts.mark_search_click(
+                conn,
+                user_id=int(user["id"]),
+                history_id=history_id,
+                article_id=payload.article_id,
+            )
+        finally:
+            conn.close()
+        if not updated:
+            raise HTTPException(status_code=404, detail="未找到该搜索记录")
+        return {"data": {"id": history_id, "article_id": payload.article_id, "clicked": True}}
+
+    @app.delete("/v1/me/search-history/{history_id}")
+    def delete_my_search_history(history_id: int, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            removed = accounts.delete_search_history(
+                conn, user_id=int(user["id"]), history_id=history_id
+            )
+        finally:
+            conn.close()
+        return {"data": {"id": history_id, "removed": removed}}
+
+    @app.delete("/v1/me/search-history")
+    def clear_my_search_history(request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            cleared = accounts.clear_search_history(conn, user_id=int(user["id"]))
         finally:
             conn.close()
         return {"data": {"cleared": cleared}}
@@ -609,7 +810,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user = _current_user(request)
         if not (0 <= int(payload.digest_time[:2]) <= 23 and 0 <= int(payload.digest_time[3:]) <= 59):
             raise HTTPException(status_code=400, detail="推送时间格式不正确")
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             prefs = accounts.save_preferences(
                 conn,
@@ -662,7 +863,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             policy_error = auth.password_policy_error(password)
             if policy_error:
                 raise HTTPException(status_code=400, detail=policy_error)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             user = auth.create_user(
                 conn,
@@ -691,7 +892,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if admin is not None and int(admin["id"]) == user_id:
             if payload.status == "disabled" or payload.role == "user":
                 raise HTTPException(status_code=400, detail="不能禁用或降级当前登录的管理员")
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             updated = accounts.update_user(
                 conn,
@@ -715,7 +916,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def admin_reset_password(user_id: int, request: Request) -> dict:
         _require_admin(request)
         s: Settings = app.state.settings
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             user = accounts.get_user(conn, user_id)
             if user is None:
@@ -767,7 +968,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
         finally:
             client.close()
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             _audit(request, conn, "admin.site_create", target=payload.name)
             conn.commit()
@@ -787,7 +988,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
         finally:
             client.close()
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             _audit(request, conn, "admin.site_update", target=name)
             conn.commit()
@@ -806,7 +1007,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
         finally:
             client.close()
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             _audit(request, conn, "admin.site_delete", target=name)
             conn.commit()
@@ -970,6 +1171,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="已有分析或清单生成任务在运行，请稍后再试")
         try:
             result = analyze_batch(s, limit=limit, force=force)
+        except sqlite3.OperationalError as exc:
+            # 只读/繁忙是部署与并发语义，不是「分析失败」：502 会让客户端以为上游
+            # 挂了并重试整批。放在通用分支之前，才能被映射成 503 + Retry-After。
+            mapped = _write_failure(exc)
+            if mapped is None:
+                LOG.exception("分析失败")
+                raise HTTPException(
+                    status_code=502, detail=f"分析失败，内部错误: {type(exc).__name__}"
+                ) from exc
+            LOG.warning("分析因数据库状态失败：%s", exc)
+            raise mapped from exc
         except Exception as exc:
             # 不要把上游/LLM 响应体回传给调用方（可能含内部地址与提示词）
             LOG.exception("分析失败")
@@ -1000,6 +1212,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sort: str = Query(default="published_desc", description="排序键，支持 relevance_desc/asc（个性化）与 relevance_score_desc/asc（语义）"),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
+        include_highlights: bool = Query(
+            default=False, description="高相关文章附带要素摘要（≥80 分才返回）"
+        ),
     ) -> dict:
         s: Settings = app.state.settings
         try:
@@ -1064,6 +1279,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     offset=offset,
                 )
                 recommend.annotate_rows(rows, profile)
+            if include_highlights:
+                db.attach_highlights(conn, rows)
         finally:
             conn.close()
         return {
@@ -1117,6 +1334,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/search")
     def search_articles(
+        request: Request,
         # pattern 要求至少一个非空白字符：q="" 会因 min_length 变成 422，但 q=" "
         # 能绕过它，进 resolve_query 后被 strip 成空、返回 200 空 groups —— 同一件事
         # 两种响应码，前端得写两条分支。这里让纯空白也在参数校验阶段被拒。
@@ -1156,6 +1374,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _, tags = load_vocab(s.vocab_dir)
         _, categories = load_categories(s.vocab_dir)
         conn = connect(s)
+        history_id: int | None = None
         try:
             result = db.search_grouped(
                 conn,
@@ -1180,7 +1399,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         finally:
             conn.close()
-        return {"data": result}
+        # 登录用户的检索自动留痕：前端不用额外发一次请求，点击归因
+        # 只需拿返回的 search_history_id 回填 clicked_article_id。
+        #
+        # 留痕必须换一条独立连接，不能接着用上面那条。原来的写法在检索连接上
+        # 直接写：一次 GET 会从「读」升级成「读+写事务」，8 个 worker 抢同一把
+        # SQLite 写锁时最坏排到 busy_timeout（30s）；只读部署（库文件只读挂载）
+        # 更是每次都抛 "attempt to write a readonly database"，被日志吞掉后
+        # 变成一条没人看的 ERROR 噪声。
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            history_id = _record_search_quietly(
+                s, user_id=int(user["id"]), query=q, result_count=int(result.get("total") or 0)
+            )
+        return {"data": result, "meta": {"search_history_id": history_id}}
 
     @app.get("/v1/articles/{article_id}")
     def article_detail(article_id: str, request: Request) -> dict:
@@ -1248,7 +1480,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """
         s: Settings = app.state.settings
         force = bool(payload and payload.force)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             row = db.get_article(conn, article_id)
             existing = None if force else db.get_checklist(conn, article_id)
@@ -1286,7 +1518,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             # 等锁期间可能已有别的请求生成完成；非 force 必须在持锁后复查，避免重复调用 LLM。
             if not force:
-                conn = connect(s)
+                conn = _write_conn(s)
                 try:
                     existing = db.get_checklist(conn, article_id)
                 finally:
@@ -1295,7 +1527,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     return _checklist_data(row, existing)
             result = checklist_service.build_for_input(s, source)
             items = checklist_service.items_payload(result)
-            conn = connect(s)
+            conn = _write_conn(s)
             try:
                 db.save_checklist(conn, article_id=article_id, engine=result.engine, items=items)
                 checklist = db.get_checklist(conn, article_id)
@@ -1339,7 +1571,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/notifications/read-all")
     def notifications_read_all(request: Request) -> dict:
         s: Settings = app.state.settings
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             user = _notification_reader(request, write=True)
             updated = db.mark_all_notifications_read(
@@ -1352,7 +1584,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/notifications/{notification_id}/read")
     def notification_read(notification_id: int, request: Request) -> dict:
         s: Settings = app.state.settings
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             user = _notification_reader(request, write=True)
             item = db.mark_notification_read(
@@ -1456,11 +1688,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
+    @app.exception_handler(sqlite3.OperationalError)
+    async def sqlite_op_error_handler(request: Request, exc: sqlite3.OperationalError):
+        """兜底映射：任何漏掉显式处理的写端点也不该把「库忙/库只读」变成 500。
+
+        逐路由复制 try/except 一定会漏（新增端点、被 accounts/db 内部再次抛出的
+        路径）。这里按错误性质统一给 503 + Retry-After：客户端能区分「等一会儿
+        重试」和「服务挂了」，日志里也留了完整类型与消息。
+        """
+        mapped = _write_failure(exc)
+        if mapped is None:
+            LOG.error("数据库操作失败：%s", exc, exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": 500, "message": "数据库操作失败"}},
+            )
+        return JSONResponse(
+            status_code=mapped.status_code,
+            content={"error": {"code": mapped.status_code, "message": mapped.detail}},
+            headers=getattr(mapped, "headers", None),
+        )
+
     @app.exception_handler(HTTPException)
     async def http_exc_handler(request, exc: HTTPException):
+        # headers 必须透传：503 + Retry-After 里，Retry-After 只存在于 exc.headers，
+        # 不带给客户端的话「稍后重试」这个语义就丢了，客户端只能硬撞。
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"code": exc.status_code, "message": exc.detail}},
+            headers=getattr(exc, "headers", None),
         )
 
     return app

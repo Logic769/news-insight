@@ -166,6 +166,18 @@ CREATE TABLE IF NOT EXISTS browse_history (
     PRIMARY KEY (user_id, article_id)
 );
 
+-- 搜索历史单独成表：它记录的是「用户意图」而不是「看过哪篇」。
+-- clicked_article_id 让「搜索→点击」形成归因闭环，个性化推荐据此加权。
+CREATE TABLE IF NOT EXISTS user_search_history (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id            INTEGER NOT NULL,
+    query              TEXT NOT NULL,
+    result_count       INTEGER NOT NULL DEFAULT 0,
+    clicked_article_id TEXT,
+    clicked_at         TEXT,
+    created_at         TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_preferences (
     user_id         INTEGER PRIMARY KEY,
     industries_json TEXT NOT NULL DEFAULT '[]',
@@ -219,6 +231,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_notification_reads_user ON notification_reads(user_id, notification_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_history_user ON browse_history(user_id, viewed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_search_history_user ON user_search_history(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_operation_logs_created ON operation_logs(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_operation_logs_action ON operation_logs(action, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sites_enabled ON sites(enabled, name);
@@ -334,6 +347,12 @@ def _ensure_norm_func(conn: sqlite3.Connection) -> None:
     conn.create_function(_NORM_FUNC, 1, lambda value: search_mod._norm(value or ""), deterministic=True)
 
 
+def is_readonly_error(exc: sqlite3.OperationalError) -> bool:
+    """只读库造成的写入失败（部署形态差异，不是错误）。"""
+    message = str(exc).lower()
+    return "readonly" in message or "read-only" in message
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30.0)
@@ -347,22 +366,100 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA mmap_size=268435456")
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     if str(mode).lower() != "wal":
-        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            # 切 WAL 是一次写操作：库文件只读、或库正被别的连接持写锁时都会失败。
+            #
+            # 原来这里让异常直接冒泡，后果是所有走 db.connect 的路径都挂掉——不只是
+            # 写，连 /v1/auth 中间件和 GET /v1/search 都变成 500。只读部署（把
+            # insight.db 只读挂载）本来是合法形态，不该因为「切不了 WAL」就整个不可用。
+            #
+            # 退回原有 journal 模式继续用：只读场景下 DELETE 模式完全够用；真正的
+            # 写操作会在执行时给出它自己的错误，那时再按各自语义处理（见
+            # main._record_search_quietly 与写端点的 503）。锁争用同理——让调用方
+            # 决定是重试还是降级，而不是在建立连接这一步就统一判死。
+            message = str(exc).lower()
+            if is_readonly_error(exc):
+                LOG.debug("数据库只读，跳过 WAL 切换：%s", exc)
+            elif "locked" in message or "busy" in message:
+                LOG.debug("数据库繁忙，跳过 WAL 切换：%s", exc)
+            else:
+                LOG.warning("切换 WAL 失败（%s）：%s", type(exc).__name__, exc)
     return conn
 
 
 def init_db(db_path: Path) -> None:
     # sqlite3 的上下文管理器只 commit/rollback、不 close，必须用 closing 兜住句柄
     with closing(connect(db_path)) as conn:
-        conn.executescript(SCHEMA_SQL)
-        # 8 个 uvicorn worker 会同时首次启动：必须先拿 SQLite 写锁，再读列名并
-        # ALTER，否则多个进程同时读到旧 schema，后到的进程会 duplicate column。
-        _migrate_columns(conn)
-        # 回填按块独立加写锁：大库首次启动时不能把全表扫描塞进 ALTER 的写锁，
-        # 否则其他 worker 会在 busy_timeout 内等不到锁。
-        _backfill_norms(conn)
-        conn.executescript(_POST_MIGRATION_SQL)
-        conn.commit()
+        try:
+            conn.executescript(SCHEMA_SQL)
+            # 8 个 uvicorn worker 会同时首次启动：必须先拿 SQLite 写锁，再读列名并
+            # ALTER，否则多个进程同时读到旧 schema，后到的进程会 duplicate column。
+            _migrate_columns(conn)
+            # 回填按块独立加写锁：大库首次启动时不能把全表扫描塞进 ALTER 的写锁，
+            # 否则其他 worker 会在 busy_timeout 内等不到锁。
+            _backfill_norms(conn)
+            conn.executescript(_POST_MIGRATION_SQL)
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # init_db 在 lifespan 里，异常冒泡会让整个服务起不来。只读部署是合法形态
+            # （库文件只读挂载）：schema 齐全时 DDL 全是空操作，实测
+            # CREATE TABLE IF NOT EXISTS 与 ADD COLUMN 探测在只读库上都不抛；会抛的是
+            # 「文件只读且 schema 落后」（ALTER 要写）或回填要写。
+            #
+            # 这里不能无条件放行：schema 落后又迁移不了时，检索会在请求期才炸
+            # `no such column: a.title_norm`，而 /health 一直是 200，故障被推迟到最难
+            # 排查的地方。只有确认列齐全才降级为「只读服务」，否则启动即失败并说清修法。
+            if not is_readonly_error(exc):
+                raise
+            missing = _missing_schema(conn)
+            if missing:
+                LOG.error(
+                    "数据库只读且 schema 落后，缺少 %s：无法提供服务。"
+                    "请先以可写方式启动一次完成迁移，再切回只读挂载。",
+                    ", ".join(missing),
+                )
+                raise RuntimeError(
+                    "只读数据库 schema 落后，缺少: " + ", ".join(missing)
+                ) from exc
+            LOG.debug("数据库只读，跳过 schema 初始化：%s", exc)
+            return
+
+
+def _missing_columns(conn: sqlite3.Connection) -> list[str]:
+    """现有 schema 还缺哪些 _ADDED_COLUMNS 里的列。
+
+    只读库上 ALTER 必然失败，所以「跳过迁移继续只读服务」必须先证明 schema 齐全，
+    否则检索会在请求期才炸 `no such column`（健康检查却是绿的）。
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(analyzed_articles)")}
+    return [column for column, _ in _ADDED_COLUMNS if column not in existing]
+
+
+# 建表语句里的表名：`CREATE TABLE IF NOT EXISTS xxx (`。只从 SCHEMA_SQL 取，不另立一份
+# 清单——否则新增表时这里会忘记同步，校验就成了假的安全感。
+_SCHEMA_TABLES: tuple[str, ...] = tuple(
+    re.findall(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)", SCHEMA_SQL, re.IGNORECASE)
+)
+
+
+def _missing_schema(conn: sqlite3.Connection) -> list[str]:
+    """只读库上还缺哪些表 / 列。
+
+    只检查列是不够的：缺表时 `CREATE TABLE IF NOT EXISTS` 同样要写，只读下会抛，
+    而旧实现只看 analyzed_articles 的列就直接放行——随后查询 `sites` 报
+    `no such table`，和缺列一样把故障推迟到请求期。
+    """
+    missing: list[str] = []
+    existing_tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    missing.extend(f"表 {table}" for table in _SCHEMA_TABLES if table not in existing_tables)
+    if "analyzed_articles" in existing_tables:
+        missing.extend(f"列 {column}" for column in _missing_columns(conn))
+    return missing
 
 
 def _migrate_columns(conn: sqlite3.Connection) -> None:
@@ -983,6 +1080,83 @@ def list_analyzed(
     for item in out:
         item["tags"] = tags_by_id.get(item["article_id"], [])
     return out, int(total), int(undated)
+
+
+
+# 高相关卡片摘要只挑申报决策最需要的字段，避免把整份抽取结果塞进列表。
+_HIGHLIGHT_FIELDS = (
+    ("program_name", "项目名称"),
+    ("deadline", "申报截止"),
+    ("funding_amount", "资助额度"),
+    ("eligible_applicants", "申报对象"),
+    ("focus_areas", "重点领域"),
+    ("application_channel", "申报渠道"),
+    ("contact", "联系方式"),
+    ("materials", "所需材料"),
+)
+
+
+def _highlight_text(value: Any) -> str:
+    """把抽取值压成一行可读文本；列表用顿号、对象用 JSON，禁止把 None 当内容。"""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "、".join(_highlight_text(item) for item in value if _highlight_text(item))
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value).strip()
+
+
+def attach_highlights(
+    conn: sqlite3.Connection, rows: list[dict[str, Any]], *, min_score: float = 0.8
+) -> None:
+    """给列表行挂「高相关要素摘要」，只对 relevance_score ≥ min_score 的文章生效。
+
+    分类卡片需要一眼看到截止时间/额度等决策要素，但列表接口不能返回整份
+    extractions（体积大且低相关时没有意义）。这里按文章批量取一次抽取结果，
+    高相关行才填 highlights；低相关行返回空数组，前端无需再判断阈值。
+    """
+    for item in rows:
+        item["highlights"] = []
+    eligible = [
+        str(item.get("article_id") or "")
+        for item in rows
+        if float(item.get("relevance_score") or 0.0) >= min_score
+    ]
+    if not eligible:
+        return
+    wanted = set(eligible)
+    values: dict[str, dict[str, Any]] = {article_id: {} for article_id in eligible}
+    for chunk_start in range(0, len(eligible), 500):
+        chunk = eligible[chunk_start : chunk_start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            "SELECT article_id, field, value_json FROM extractions"
+            " WHERE article_id IN (" + placeholders + ")",
+            chunk,
+        ):
+            article_id = str(row["article_id"])
+            if article_id not in wanted:
+                continue
+            field = str(row["field"])
+            if field in values[article_id]:
+                continue
+            try:
+                parsed = json.loads(row["value_json"])
+            except (TypeError, ValueError):
+                continue
+            text = _highlight_text(parsed)
+            if text:
+                values[article_id][field] = text
+    for item in rows:
+        article_id = str(item.get("article_id") or "")
+        if article_id not in values:
+            continue
+        item["highlights"] = [
+            {"key": key, "label": label, "value": values[article_id][key]}
+            for key, label in _HIGHLIGHT_FIELDS
+            if key in values[article_id]
+        ][:6]
 
 
 def get_article(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | None:

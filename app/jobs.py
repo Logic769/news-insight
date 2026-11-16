@@ -7,6 +7,7 @@ pipeline itself fans out LLM calls, while persistence stays on one thread.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +28,11 @@ class JobQueueFull(RuntimeError):
 # 同步 /v1/analyze 与后台 job 共享：同一时刻只允许一个分析批次，避免重复烧 token。
 # 使用文件锁而不是纯 threading.Lock：API 多 worker 时，锁必须跨进程生效。
 ANALYZE_LOCK = ProcessFileLock()
+
+# 提交作业只是几行 INSERT/UPDATE，等 30 秒写锁没有意义：拿不到锁就该立刻告诉
+# 客户端稍后重试（main 的 OperationalError 处理器把它映射成 503 + Retry-After）。
+# 真正跑批次的连接仍走 db.connect 的 30s——长任务抢不到锁时等待更合理。
+_SUBMIT_BUSY_TIMEOUT_MS = 3000
 
 
 class JobManager:
@@ -49,6 +55,15 @@ class JobManager:
                 count = db.mark_stale_jobs_failed(conn)
                 if count:
                     LOG.warning("标记 %d 个中断的旧分析任务为 failed", count)
+            except sqlite3.OperationalError as exc:
+                # 只读部署下这里是一次 UPDATE，必然失败。它的作用只是把上次进程
+                # 崩溃留下的 running 任务标成 failed；库都只读了，本来就跑不了新的
+                # 分析任务，跳过不影响可用性。冒泡出去会让 lifespan 直接失败，
+                # 整个服务（含只读检索）起不来。
+                if db.is_readonly_error(exc):
+                    LOG.debug("数据库只读，跳过中断任务标记：%s", exc)
+                else:
+                    raise
             finally:
                 conn.close()
         finally:
@@ -61,6 +76,7 @@ class JobManager:
         payload = {"limit": limit, "force": force, "concurrency": concurrency}
         with self._submit_lock:
             conn = db.connect(self.settings.db_path)
+            conn.execute(f"PRAGMA busy_timeout={_SUBMIT_BUSY_TIMEOUT_MS}")
             try:
                 existing = db.find_active_job(conn, payload)
                 if existing is not None:

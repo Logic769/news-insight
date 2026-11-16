@@ -149,6 +149,10 @@ def revoke_token(settings: Settings, token: str) -> None:
         return
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     conn = db.connect(settings.db_path)
+    # 登出也是一次写。库只读或写锁被占时，db.connect 的 30s busy_timeout 会让
+    # 「退出登录」这种小操作干等半分钟再给 500；压到 3s 让它快速失败，由
+    # main.auth_logout 映射成 503 + Retry-After。
+    conn.execute("PRAGMA busy_timeout=3000")
     try:
         accounts.revoke_session(conn, token_hash)
     finally:

@@ -196,6 +196,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
 | POST/GET | `/v1/auth/login`、`/v1/auth/me`、`/v1/auth/logout`、`/v1/auth/password` | 本地账号登录（数据库会话 Token，`Authorization: Bearer`）、查当前用户、登出、改密；密码策略≥8位且含大小写/数字/特殊字符 |
 | GET/PATCH/POST/DELETE | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏、浏览历史、关注领域与推送偏好（按会话 user_id 隔离） |
+| GET/POST/DELETE | `/v1/me/search-history`、`/v1/me/search-history/{id}`、`/v1/me/search-history/{id}/click` | 搜索历史：倒序列表（`limit`≤200）、补录、删除单条、清空、点击归因回填。`GET /v1/search` 对登录用户自动留痕，并把这条记录的 id 放在 `meta.search_history_id`；留痕走**独立连接**且失败不影响检索（见「关键语义」） |
 | GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员四模块；登录管理员不能禁用/降级自己；服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`，写入前由爬虫备份配置，接口型源只能改非接口字段；`admin/stats` 的每日趋势、任务数与成功率均按近 N 天（本地日）统计 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含 `category IS NULL` 的历史行） |
@@ -205,6 +206,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有分析或清单生成任务持锁时 409，失败 502 |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
+| GET | `/v1/articles?...&include_highlights=false` | `include_highlights=true` 时给高相关文章附带 `highlights`（要素摘要，只对 ≥80 分的文章返回，默认不返回以免列表传输无谓摘要）。其余见下 |
 | GET | `/v1/articles?tag=&category=&industry=&min_relevance=&limit=&offset=&sort=` | 已分析文章列表，可按标签、大类、受控行业和/或文章级语义评分阈值过滤（AND 组合，`limit` ≤ 200）；`category`/`industry` 可重复或逗号分隔；`min_relevance` 取 0–1（只对已评分行生效，0 也排除 NULL）；`sort` 支持 `published_desc/asc`、`updated_desc`、`confidence_desc/asc`、`relevance_score_desc/asc`（语义评分，NULL 最后）与 `relevance_desc/asc`（用户画像分，只在前 2000 条候选内计算，`offset+limit` 超过时 422）；每项带 `relevance`（0–1，画像分）、`profile_reason`（画像排序理由）与 `relevance_score`（0–1，语义分）、`relevance_reason`（语义评分依据） |
 | GET | `/v1/search?q=&category=&industry=&source=&published_from=&published_to=&sort=&per_category=&include_body=&min_relevance=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`industry`/`source` 可重复也可逗号分隔，`min_relevance`（0–1，只对已评分行生效，0 也排除 NULL）按文章级语义评分过滤（以 `relevance_score` 字段返回），`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
 | GET | `/v1/industries` | 受控行业词表 + 每个行业文章数（`meta.total`/词表版本），供前端筛选与徽标 |
@@ -229,6 +231,8 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 - **`due_before` 语义**：按文章级过滤——先找出 `deadline` 不晚于该日期的文章，再返回这些文章的抽取记录。**未指定 `field` 时只返回 `deadline` 行**（避免同一篇文章的 materials/contact 等行重复返回）；指定 `field` 时返回该字段行，但同样只限截止日期不晚于该日期的文章。
 - **`/health`**：不回显 `news_base_url`，避免未鉴权端点泄漏内网地址。
 - **`category` 与 `tag`**：`category` 是**单选**一级分类，`tag` 是该类白名单内的多标签；两个过滤条件 AND 组合。`category IS NULL` 表示分类功能上线前分析的历史行，`?category=other` 筛不到它们，需要 `analyze --force` 重跑。
+- **搜索留痕（`user_search_history`）的写入约束**：`GET /v1/search` 对登录用户自动记录一次搜索，这条写操作**必须走独立连接**（`main._record_search_quietly`），不能接在检索连接上。原因有二：一是同连接写会把一次读请求升级成读写事务，8 worker 抢同一把 SQLite 写锁时最坏排到 `busy_timeout`（30s）；二是只读部署（库文件只读挂载 / `PRAGMA query_only`）下写必然失败，原来被 `LOG.exception` 吞成 ERROR 噪声。现在只读部署降级为 DEBUG，其余异常（磁盘满、缺列、锁超时）保留 warning 并带异常类型；**任何情况下留痕失败都不影响检索结果**。
+- **`user_search_history` 的 10 分钟去重靠写锁，不靠唯一索引**：`accounts.record_search` 用 `BEGIN IMMEDIATE` 把「窗口内已有就 UPDATE、没有就 INSERT」和后面的保留期/条数清理包成一个写事务。原来是裸 SELECT-then-INSERT，两个并发同词搜索会各插一条，去重失效且两条挂不同 id 让点击归因记到用户没看到的那条。**不能改成 UNIQUE 索引兜底**：去重窗口是滑动的，唯一键只能是 `(user_id, query, 精确到秒的 created_at)`，本就不会撞；要的是「判断与写入不可分割」。调用方已开事务时（`conn.in_transaction`）不再 BEGIN，避免嵌套事务报错。
 - **`/v1/search` 的排序契约**：搜索界面由前端实现，本服务只提供检索层与 API。**排序必须在后端算完** —— 前端虽能从 `items[]` 读到标签置信度，但拿不到查询覆盖度（要复算词表匹配）、默认也拿不到正文，无法复算出同一个分数，所以 `groups[].items[]` 的顺序就是最终顺序，改动排序逻辑等于改动前端可见行为。
   - 口径：`score = 0.70×标签项 + 0.20×标题命中 + 0.10×正文命中`，三项均落在 `[0,1]`，总分天然有界（权重和 = 1.0，改权重时必须保持这个性质，否则 `score` 不再能直接当百分比用）；
   - 标签项 = 命中标签的 `confidence` × 查询覆盖度（取最大、不累加；`confidence` 先夹到 `[0,1]`，历史脏数据不能让总分突破上界）。覆盖度 = 命中片段占用户输入的长度比，整词 1.0、4 字查询里命中 2 字记 0.5；一个标签可能同时命中多个候选形态（「人才」和「人才计划」都命中「人才计划」），**必须遍历完该标签全部候选再取最大值** —— 命中第一个就停会让完整标签词只拿到前缀分（实测 0.5），结果还会随 `keywords` 排列顺序变化。它是**长度惩罚，不做语义消歧** —— 「人才申报」里 `talent_application`(人才) 与 `project_application`(申报) 同为 0.5，区分两类的实际是标签置信度与标题命中。**这条曾写错过**：最初 docstring 与用例断言前者 1.0，实测 `0.5 == 1.0` 断言失败，结论是代码对、说明错；
@@ -254,6 +258,8 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 ## 6. 标签词表与抽取 schema
 
 ### 6.0 一级分类 `app/vocab/categories.json`
+
+`project_application` 抽取 schema 的 9 个字段里有三个字段类型容易被误读：`deadline_raw` 是原文表述（不规范日期）、`focus_areas` 是**数组**（专项扶持的行业领域/技术方向，逐项列出）、`funding_amount` 是字符串（含「不超过 500 万元」这类限定语，不转数字）。数组字段在 `/v1/extractions` 里按 JSON 文本返回，消费方需要自行解析。
 
 六个大类（**单选**）：`project_application` 项目申报、`industry_policy` 行业政策、`talent_application` 人才申报、`enterprise_certification` 企业资质申报、`funding_subsidy` 资金补贴、`other` 兜底。
 

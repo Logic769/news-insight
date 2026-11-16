@@ -356,6 +356,143 @@ def clear_history(conn: sqlite3.Connection, *, user_id: int) -> int:
     return int(cur.rowcount)
 
 
+
+# ------------------------------------------------------------ search history
+SEARCH_HISTORY_LIMIT = 200
+SEARCH_HISTORY_RETENTION_DAYS = 180
+
+
+def record_search(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    query: str,
+    result_count: int = 0,
+) -> int:
+    """记录一次搜索；10 分钟内同一关键词只更新时间/结果数，避免输入抖动刷屏。"""
+    text = " ".join(query.split()).strip()
+    if not text:
+        raise ValueError("搜索关键词不能为空")
+    now = dt.datetime.now(dt.timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent_cutoff = (now - dt.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 「窗口内已有就更新、没有就插入」必须和后面的清理在同一个写事务里完成。
+    #
+    # 原来是裸 SELECT 再 INSERT：两个并发的同词搜索会同时读到「窗口内没有」，各插
+    # 一条，10 分钟去重直接失效——历史列表出现两项一模一样的词，而且两条挂着不同
+    # 的 id，点击归因会记到用户没看到的那一条上。
+    #
+    # 不用 UNIQUE 索引兜底：去重窗口是滑动的，唯一键只能是 (user_id, query, 精确到
+    # 秒的 created_at)，而那本来就不会撞。真正要的是「判断与写入不可分割」，也就是
+    # 一把写锁。BEGIN IMMEDIATE 让后到者一定看得到先到者已提交的行，于是走 UPDATE
+    # 分支——id 与已挂上的 clicked_article_id 都保住。
+    #
+    # 调用方可能已经开了事务（显式记录端点在同连接上做了别的写），此时不能再 BEGIN。
+    #
+    # 已有外层事务时用 SAVEPOINT 而不是 commit：原来这里无论 ownership 都调
+    # conn.commit()，等于替调用方提交了它还没准备好提交的写入，而 except 分支只在
+    # owns_txn 时才 rollback —— 一进一出不对称，调用方之后的 rollback 撤不回自己的
+    # 业务写（实测 in_transaction 由 True 变 False）。SAVEPOINT 只回退本函数的写入，
+    # 进出都不改变外层事务的状态。
+    owns_txn = not conn.in_transaction
+    savepoint = "record_search_sp" if not owns_txn else None
+    if owns_txn:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        row = conn.execute(
+            "SELECT id FROM user_search_history"
+            " WHERE user_id = ? AND query = ? AND created_at >= ?"
+            " ORDER BY id DESC LIMIT 1",
+            (user_id, text, recent_cutoff),
+        ).fetchone()
+        if row is not None:
+            history_id = int(row["id"])
+            conn.execute(
+                "UPDATE user_search_history SET result_count = ?, created_at = ? WHERE id = ?",
+                (max(0, int(result_count)), now_iso, history_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO user_search_history (user_id, query, result_count, created_at)"
+                " VALUES (?,?,?,?)",
+                (user_id, text, max(0, int(result_count)), now_iso),
+            )
+            history_id = int(cur.lastrowid or 0)
+        # 保留期按自然时间；条数上限按最近记录。两条清理都只影响当前用户。
+        expiry = (now - dt.timedelta(days=SEARCH_HISTORY_RETENTION_DAYS)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        conn.execute(
+            "DELETE FROM user_search_history WHERE user_id = ? AND created_at < ?",
+            (user_id, expiry),
+        )
+        conn.execute(
+            """DELETE FROM user_search_history WHERE user_id = ? AND id NOT IN (
+                   SELECT id FROM user_search_history WHERE user_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?
+               )""",
+            (user_id, user_id, SEARCH_HISTORY_LIMIT),
+        )
+        if owns_txn:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE {savepoint}")
+    except BaseException:
+        # 拿不到写锁时把「已开始的事务」还回去，别让调用方的 next commit 带上一半写入。
+        if owns_txn:
+            conn.rollback()
+        elif savepoint is not None:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+            conn.execute(f"RELEASE {savepoint}")
+        raise
+    return history_id
+
+
+def list_search_history(
+    conn: sqlite3.Connection, *, user_id: int, limit: int = 50, offset: int = 0
+) -> tuple[list[dict[str, Any]], int]:
+    total = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM user_search_history WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+    )
+    rows = conn.execute(
+        "SELECT id, query, result_count, clicked_article_id, clicked_at, created_at"
+        " FROM user_search_history WHERE user_id = ?"
+        " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (user_id, limit, offset),
+    ).fetchall()
+    return [dict(row) for row in rows], total
+
+
+def mark_search_click(
+    conn: sqlite3.Connection, *, user_id: int, history_id: int, article_id: str
+) -> bool:
+    cur = conn.execute(
+        "UPDATE user_search_history SET clicked_article_id = ?, clicked_at = ?"
+        " WHERE id = ? AND user_id = ?",
+        (article_id, _now_iso(), history_id, user_id),
+    )
+    conn.commit()
+    return int(cur.rowcount) > 0
+
+
+def delete_search_history(conn: sqlite3.Connection, *, user_id: int, history_id: int) -> bool:
+    cur = conn.execute(
+        "DELETE FROM user_search_history WHERE id = ? AND user_id = ?",
+        (history_id, user_id),
+    )
+    conn.commit()
+    return int(cur.rowcount) > 0
+
+
+def clear_search_history(conn: sqlite3.Connection, *, user_id: int) -> int:
+    cur = conn.execute("DELETE FROM user_search_history WHERE user_id = ?", (user_id,))
+    conn.commit()
+    return int(cur.rowcount)
+
 # ------------------------------------------------------------------ preferences
 def _preference_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)

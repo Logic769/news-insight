@@ -198,6 +198,55 @@ def test_prune_deletes_finished_analysis_jobs(settings):
         conn.close()
 
 
+def test_submit_uses_short_busy_timeout(settings, monkeypatch):
+    """提交作业的连接必须把 busy_timeout 压到 3s。
+
+    排队只是几行 INSERT/UPDATE，等满 db.connect 的 30s 写锁没有意义：前端会挂在
+    一个本该立刻返回 503 的请求上。这里直接读提交连接的 PRAGMA，不靠 HTTP 层间接证明。
+    """
+    from app import jobs as jobs_mod
+
+    db.init_db(settings.db_path)
+    seen: dict[str, int] = {}
+
+    def _capture(conn, payload):
+        seen["busy"] = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        raise JobQueueFull("这里只需要连接参数")
+
+    monkeypatch.setattr(db, "find_active_job", _capture)
+    manager = JobManager(settings)
+    try:
+        with pytest.raises(JobQueueFull):
+            manager.submit(limit=1, force=False)
+    finally:
+        manager.shutdown()
+    assert seen["busy"] == jobs_mod._SUBMIT_BUSY_TIMEOUT_MS == 3000
+
+
+def test_prune_skips_quietly_on_readonly_database(settings):
+    """只读库上清理必须降级为 skipped，而不是每个请求都刷 ERROR + 栈。
+
+    清理是维护动作：库只读时它本来就做不了任何事，把它当错误会淹没真正的故障。
+    """
+    import os
+    import stat
+
+    db.init_db(settings.db_path)
+    conn = db.connect(settings.db_path)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.commit()
+    conn.close()
+
+    os.chmod(settings.db_path, stat.S_IREAD)
+    try:
+        result = prune(settings, days=90)
+    finally:
+        os.chmod(settings.db_path, stat.S_IWRITE | stat.S_IREAD)
+    assert result["skipped"] is True
+    assert result["reason"] == "数据库只读，跳过清理"
+    assert result["retention_days"] == 90
+
+
 def test_retention_zero_means_keep_forever(settings):
     result = prune(settings, days=0)
     assert result["skipped"] is True
