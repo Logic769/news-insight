@@ -80,6 +80,36 @@ def test_notifications_mark_read_and_read_all(client):
     assert missing.status_code == 404
 
 
+def test_anonymous_notification_writes_are_rejected_when_auth_disabled(tmp_path, monkeypatch):
+    """无鉴权部署下匿名只能读通知，不能写已读（否则是跨站可触发的 CSRF）。"""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NEWS_SOURCE_MODE", "demo")
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.delenv("INSIGHT_API_KEY", raising=False)
+    monkeypatch.setenv("INSIGHT_REQUIRE_AUTH", "0")
+    app = create_app(load_settings())
+    with TestClient(app) as anonymous:
+        settings = app.state.settings
+        conn = db.connect(settings.db_path)
+        try:
+            db.create_notification(
+                conn,
+                article_id="anon-1",
+                kind="project_application",
+                title="新增项目申报公告",
+                message="匿名通知",
+            )
+        finally:
+            conn.close()
+
+        listing = anonymous.get("/v1/notifications")
+        assert listing.status_code == 200
+        assert listing.json()["meta"]["unread"] == 1
+        assert anonymous.post("/v1/notifications/read-all").status_code == 401
+        assert anonymous.post("/v1/notifications/1/read").status_code == 401
+        assert anonymous.get("/v1/notifications").json()["meta"]["unread"] == 1
+
+
 def test_force_reanalysis_does_not_duplicate_notifications(client):
     client.post("/v1/analyze", params={"limit": 4}, headers=HEADERS)
     first = client.get("/v1/notifications", headers=HEADERS).json()["meta"]["total"]

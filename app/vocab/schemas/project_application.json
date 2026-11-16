@@ -42,6 +42,11 @@
       "description": "资助金额或支持额度"
     },
     {
+      "name": "focus_areas",
+      "type": "array",
+      "description": "专项扶持的行业领域、技术方向或产业发展方向，逐项列出"
+    },
+    {
       "name": "application_channel",
       "type": "string",
       "description": "申报渠道、系统名称或网址"

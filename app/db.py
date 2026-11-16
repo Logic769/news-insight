@@ -45,9 +45,18 @@ CREATE TABLE IF NOT EXISTS analyzed_articles (
     published_at_utc TEXT,
     content_length  INTEGER NOT NULL DEFAULT 0,
     body            TEXT,               -- 正文纯文本；关键词检索用。NULL = 落库时上游未提供（历史行），不改写为空串
+    body_html       TEXT,               -- 清洗后的正文 HTML；只有详情接口返回，列表不返回
+    title_norm      TEXT,               -- search._norm(title) 的持久化副本，检索预筛避免逐行归一标题
+    body_norm       TEXT,               -- search._norm(body) 的持久化副本；NULL = 正文缺失或尚未回填
     category        TEXT,               -- 一级分类（单选），categories.json 的 id；NULL = 分类功能上线前分析的历史行
     category_confidence REAL,
     category_engine TEXT,               -- llm / rules / none
+    industry        TEXT,               -- 行业领域（单选），industries.json 的 id；NULL = 行业功能上线前分析的历史行
+    industry_confidence REAL,
+    industry_engine TEXT,               -- llm / rules / none
+    relevance_score REAL,               -- 文章级语义相关性 0-1；NULL = 语义评分功能上线前分析的历史行
+    relevance_engine TEXT,              -- llm / rules
+    relevance_reason TEXT,              -- 评分依据（LLM 摘要或规则命中说明）
     tag_engine      TEXT,
     extract_engine  TEXT,
     analyzed_at     TEXT NOT NULL
@@ -106,6 +115,100 @@ CREATE TABLE IF NOT EXISTS notifications (
     read_at     TEXT
 );
 
+-- 本地账号：密码只存 PBKDF2-HMAC-SHA256 派生值，会话只存 token 的 SHA-256。
+-- role 目前只有 admin / user 两档；status 只允许 active / disabled。
+CREATE TABLE IF NOT EXISTS users (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    username           TEXT NOT NULL UNIQUE,
+    password_hash      TEXT NOT NULL,
+    password_salt      TEXT NOT NULL,
+    password_iterations INTEGER NOT NULL DEFAULT 120000,
+    display_name       TEXT NOT NULL DEFAULT '',
+    department         TEXT NOT NULL DEFAULT '',
+    role               TEXT NOT NULL DEFAULT 'user',
+    status             TEXT NOT NULL DEFAULT 'active',
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    failed_attempts    INTEGER NOT NULL DEFAULT 0,
+    locked_until       TEXT,
+    last_login_at      TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    revoked_at  TEXT
+);
+
+-- 通知已读按用户记录；notifications.read_at 是旧版全局已读，保留给无账号的
+-- 服务调用与历史数据，新接口一律以本表为准。
+CREATE TABLE IF NOT EXISTS notification_reads (
+    notification_id INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    read_at         TEXT NOT NULL,
+    PRIMARY KEY (notification_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS favorites (
+    user_id    INTEGER NOT NULL,
+    article_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, article_id)
+);
+
+CREATE TABLE IF NOT EXISTS browse_history (
+    user_id    INTEGER NOT NULL,
+    article_id TEXT NOT NULL,
+    viewed_at  TEXT NOT NULL,
+    PRIMARY KEY (user_id, article_id)
+);
+
+-- 搜索历史单独成表：它记录的是「用户意图」而不是「看过哪篇」。
+-- clicked_article_id 让「搜索→点击」形成归因闭环，个性化推荐据此加权。
+CREATE TABLE IF NOT EXISTS user_search_history (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id            INTEGER NOT NULL,
+    query              TEXT NOT NULL,
+    result_count       INTEGER NOT NULL DEFAULT 0,
+    clicked_article_id TEXT,
+    clicked_at         TEXT,
+    created_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id         INTEGER PRIMARY KEY,
+    industries_json TEXT NOT NULL DEFAULT '[]',
+    push_enabled    INTEGER NOT NULL DEFAULT 1,
+    digest_time     TEXT NOT NULL DEFAULT '09:00',
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS operation_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER,
+    username   TEXT NOT NULL DEFAULT '',
+    action     TEXT NOT NULL,
+    target     TEXT NOT NULL DEFAULT '',
+    detail     TEXT NOT NULL DEFAULT '',
+    ip         TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sites (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    list_url   TEXT NOT NULL,
+    category   TEXT NOT NULL DEFAULT '',
+    region     TEXT NOT NULL DEFAULT '',
+    timezone   TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- 异步分析作业：API 提交后立即返回，后台线程执行；状态落库，进程重启后能看出中断。
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     id          TEXT PRIMARY KEY,
@@ -124,6 +227,14 @@ CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at
 CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(read_at, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_analyzed_published ON analyzed_articles(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_extractions_schema ON extractions(schema_id, field);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_notification_reads_user ON notification_reads(user_id, notification_id);
+CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_history_user ON browse_history(user_id, viewed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_search_history_user ON user_search_history(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operation_logs_created ON operation_logs(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_operation_logs_action ON operation_logs(action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sites_enabled ON sites(enabled, name);
 """
 
 # --- 两套时间口径：定义必须在使用它们的 DDL 之前 ---------------------------
@@ -183,6 +294,9 @@ CREATE INDEX IF NOT EXISTS idx_analyzed_source_time ON analyzed_articles(source,
 -- 日期筛选按展示用的墙钟日（_DAY_EXPR）比较，与上面的真实时刻不是同一个表达式，
 -- 需要单独的索引，否则带日期过滤的分页要把整表取出来再过筛。
 CREATE INDEX IF NOT EXISTS idx_analyzed_day ON analyzed_articles({_DAY_EXPR} DESC);
+-- 语义相关性排序：表达式必须与 _LIST_ORDERS 的 relevance_score_* 一字不差。
+CREATE INDEX IF NOT EXISTS idx_analyzed_relevance_desc ON analyzed_articles((relevance_score IS NULL), relevance_score DESC, article_id DESC);
+CREATE INDEX IF NOT EXISTS idx_analyzed_relevance_asc ON analyzed_articles((relevance_score IS NULL), relevance_score ASC, article_id ASC);
 """
 
 # init_db 只有 CREATE TABLE IF NOT EXISTS，升级前建好的库不会自动长出新列。
@@ -190,9 +304,18 @@ CREATE INDEX IF NOT EXISTS idx_analyzed_day ON analyzed_articles({_DAY_EXPR} DES
 _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     # (列, 列定义) —— 都落在 analyzed_articles 上
     ("body", "TEXT"),
+    ("body_html", "TEXT"),
     ("category", "TEXT"),
     ("category_confidence", "REAL"),
     ("category_engine", "TEXT"),
+    ("industry", "TEXT"),
+    ("industry_confidence", "REAL"),
+    ("industry_engine", "TEXT"),
+    ("relevance_score", "REAL"),
+    ("relevance_engine", "TEXT"),
+    ("relevance_reason", "TEXT"),
+    ("title_norm", "TEXT"),
+    ("body_norm", "TEXT"),
 )
 
 
@@ -224,6 +347,12 @@ def _ensure_norm_func(conn: sqlite3.Connection) -> None:
     conn.create_function(_NORM_FUNC, 1, lambda value: search_mod._norm(value or ""), deterministic=True)
 
 
+def is_readonly_error(exc: sqlite3.OperationalError) -> bool:
+    """只读库造成的写入失败（部署形态差异，不是错误）。"""
+    message = str(exc).lower()
+    return "readonly" in message or "read-only" in message
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30.0)
@@ -231,19 +360,106 @@ def connect(db_path: Path) -> sqlite3.Connection:
     # 先设 busy_timeout，再只在非 WAL 时切模式：每次连接都执行 journal_mode=WAL
     # 在并发读写下会多拿一次写锁，且对已是 WAL 的库没有收益。
     conn.execute("PRAGMA busy_timeout=30000")
+    # Windows Docker 的 bind mount 上 SQLite 每次新连接都要走 9p/virtiofs 读取；
+    # mmap 把文件映射进进程地址空间，检索型查询（正文归一列）实测快 4 倍以上。
+    # 容量按库文件上限设置，超出部分 SQLite 会自动退回普通读。
+    conn.execute("PRAGMA mmap_size=268435456")
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     if str(mode).lower() != "wal":
-        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            # 切 WAL 是一次写操作：库文件只读、或库正被别的连接持写锁时都会失败。
+            #
+            # 原来这里让异常直接冒泡，后果是所有走 db.connect 的路径都挂掉——不只是
+            # 写，连 /v1/auth 中间件和 GET /v1/search 都变成 500。只读部署（把
+            # insight.db 只读挂载）本来是合法形态，不该因为「切不了 WAL」就整个不可用。
+            #
+            # 退回原有 journal 模式继续用：只读场景下 DELETE 模式完全够用；真正的
+            # 写操作会在执行时给出它自己的错误，那时再按各自语义处理（见
+            # main._record_search_quietly 与写端点的 503）。锁争用同理——让调用方
+            # 决定是重试还是降级，而不是在建立连接这一步就统一判死。
+            message = str(exc).lower()
+            if is_readonly_error(exc):
+                LOG.debug("数据库只读，跳过 WAL 切换：%s", exc)
+            elif "locked" in message or "busy" in message:
+                LOG.debug("数据库繁忙，跳过 WAL 切换：%s", exc)
+            else:
+                LOG.warning("切换 WAL 失败（%s）：%s", type(exc).__name__, exc)
     return conn
 
 
 def init_db(db_path: Path) -> None:
     # sqlite3 的上下文管理器只 commit/rollback、不 close，必须用 closing 兜住句柄
     with closing(connect(db_path)) as conn:
-        conn.executescript(SCHEMA_SQL)
-        _migrate_columns(conn)
-        conn.executescript(_POST_MIGRATION_SQL)
-        conn.commit()
+        try:
+            conn.executescript(SCHEMA_SQL)
+            # 8 个 uvicorn worker 会同时首次启动：必须先拿 SQLite 写锁，再读列名并
+            # ALTER，否则多个进程同时读到旧 schema，后到的进程会 duplicate column。
+            _migrate_columns(conn)
+            # 回填按块独立加写锁：大库首次启动时不能把全表扫描塞进 ALTER 的写锁，
+            # 否则其他 worker 会在 busy_timeout 内等不到锁。
+            _backfill_norms(conn)
+            conn.executescript(_POST_MIGRATION_SQL)
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # init_db 在 lifespan 里，异常冒泡会让整个服务起不来。只读部署是合法形态
+            # （库文件只读挂载）：schema 齐全时 DDL 全是空操作，实测
+            # CREATE TABLE IF NOT EXISTS 与 ADD COLUMN 探测在只读库上都不抛；会抛的是
+            # 「文件只读且 schema 落后」（ALTER 要写）或回填要写。
+            #
+            # 这里不能无条件放行：schema 落后又迁移不了时，检索会在请求期才炸
+            # `no such column: a.title_norm`，而 /health 一直是 200，故障被推迟到最难
+            # 排查的地方。只有确认列齐全才降级为「只读服务」，否则启动即失败并说清修法。
+            if not is_readonly_error(exc):
+                raise
+            missing = _missing_schema(conn)
+            if missing:
+                LOG.error(
+                    "数据库只读且 schema 落后，缺少 %s：无法提供服务。"
+                    "请先以可写方式启动一次完成迁移，再切回只读挂载。",
+                    ", ".join(missing),
+                )
+                raise RuntimeError(
+                    "只读数据库 schema 落后，缺少: " + ", ".join(missing)
+                ) from exc
+            LOG.debug("数据库只读，跳过 schema 初始化：%s", exc)
+            return
+
+
+def _missing_columns(conn: sqlite3.Connection) -> list[str]:
+    """现有 schema 还缺哪些 _ADDED_COLUMNS 里的列。
+
+    只读库上 ALTER 必然失败，所以「跳过迁移继续只读服务」必须先证明 schema 齐全，
+    否则检索会在请求期才炸 `no such column`（健康检查却是绿的）。
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(analyzed_articles)")}
+    return [column for column, _ in _ADDED_COLUMNS if column not in existing]
+
+
+# 建表语句里的表名：`CREATE TABLE IF NOT EXISTS xxx (`。只从 SCHEMA_SQL 取，不另立一份
+# 清单——否则新增表时这里会忘记同步，校验就成了假的安全感。
+_SCHEMA_TABLES: tuple[str, ...] = tuple(
+    re.findall(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)", SCHEMA_SQL, re.IGNORECASE)
+)
+
+
+def _missing_schema(conn: sqlite3.Connection) -> list[str]:
+    """只读库上还缺哪些表 / 列。
+
+    只检查列是不够的：缺表时 `CREATE TABLE IF NOT EXISTS` 同样要写，只读下会抛，
+    而旧实现只看 analyzed_articles 的列就直接放行——随后查询 `sites` 报
+    `no such table`，和缺列一样把故障推迟到请求期。
+    """
+    missing: list[str] = []
+    existing_tables = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    missing.extend(f"表 {table}" for table in _SCHEMA_TABLES if table not in existing_tables)
+    if "analyzed_articles" in existing_tables:
+        missing.extend(f"列 {column}" for column in _missing_columns(conn))
+    return missing
 
 
 def _migrate_columns(conn: sqlite3.Connection) -> None:
@@ -252,13 +468,71 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
     SQLite has no ALTER TABLE ... IF NOT EXISTS, so the existing column set is
     read first; adding a column that already exists is the only failure mode
     worth avoiding and it is cheapest to avoid by inspection.
+
+    先用 BEGIN IMMEDIATE 拿写锁再看列清单：多 worker 同时首次启动时，没有
+    这把锁会出现「都读到旧 schema，第二个 ALTER 报 duplicate column」。
     """
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(analyzed_articles)")}
-    for column, decl in _ADDED_COLUMNS:
-        if column in existing:
-            continue
-        conn.execute(f"ALTER TABLE analyzed_articles ADD COLUMN {column} {decl}")
-        LOG.info("已为 analyzed_articles 补列: %s", column)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(analyzed_articles)")}
+        for column, decl in _ADDED_COLUMNS:
+            if column in existing:
+                continue
+            conn.execute(f"ALTER TABLE analyzed_articles ADD COLUMN {column} {decl}")
+            LOG.info("已为 analyzed_articles 补列: %s", column)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _backfill_norms(conn: sqlite3.Connection) -> None:
+    """一次性补齐历史行的检索归一列；之后每次启动只做一次廉价探测。"""
+    # 不要先 fetchall：回填完成后探测也要扫 60MB 正文列，8 worker 冷启动会叠加。
+    # 先用 LIMIT 1 早退，有候选时才真正取行。
+    probe = conn.execute(
+        "SELECT 1 FROM analyzed_articles"
+        " WHERE title_norm IS NULL OR (body_norm IS NULL AND body IS NOT NULL AND body <> '')"
+        " LIMIT 1"
+    ).fetchone()
+    if probe is None:
+        return
+    chunk_size = 500
+    filled = 0
+    while True:
+        # 分块重新拿写锁：单块只锁很短时间，其他 worker 不会因为全表回填
+        # 在 busy_timeout=30s 内启动失败。重复扫描由 NULL 条件天然幂等。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT article_id, title, body FROM analyzed_articles"
+                " WHERE title_norm IS NULL"
+                "    OR (body_norm IS NULL AND body IS NOT NULL AND body <> '')"
+                " LIMIT ?",
+                (chunk_size,),
+            ).fetchall()
+            if not rows:
+                conn.commit()
+                return
+            conn.executemany(
+                "UPDATE analyzed_articles SET title_norm = ?, body_norm = ? WHERE article_id = ?",
+                [
+                    (
+                        search_mod._norm(row["title"] or ""),
+                        search_mod._norm(row["body"]) if row["body"] else None,
+                        row["article_id"],
+                    )
+                    for row in rows
+                ],
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        filled += len(rows)
+        if len(rows) < chunk_size:
+            LOG.info("已回填 %d 行检索归一列", filled)
+            return
 
 
 def save_analysis(
@@ -278,7 +552,14 @@ def save_analysis(
     category: str = "",
     category_confidence: float | None = None,
     category_engine: str = "",
+    industry: str = "",
+    industry_confidence: float | None = None,
+    industry_engine: str = "",
+    relevance_score: float | None = None,
+    relevance_engine: str = "",
+    relevance_reason: str = "",
     body: str | None = None,
+    body_html: str | None = None,
     commit: bool = True,
 ) -> None:
     """Replace any previous analysis for this article (idempotent re-runs).
@@ -310,7 +591,14 @@ def save_analysis(
             category=category,
             category_confidence=category_confidence,
             category_engine=category_engine,
+            industry=industry,
+            industry_confidence=industry_confidence,
+            industry_engine=industry_engine,
+            relevance_score=relevance_score,
+            relevance_engine=relevance_engine,
+            relevance_reason=relevance_reason,
             body=body,
+            body_html=body_html,
             now=now,
         )
     except Exception:
@@ -340,16 +628,28 @@ def _replace_analysis(
     category: str,
     category_confidence: float | None,
     category_engine: str,
+    industry: str,
+    industry_confidence: float | None,
+    industry_engine: str,
+    relevance_score: float | None,
+    relevance_engine: str,
+    relevance_reason: str,
     body: str | None,
+    body_html: str | None,
     now: str,
 ) -> None:
+    title_norm = search_mod._norm(title or "")
+    body_norm = search_mod._norm(body) if body else None
     conn.execute(
         """
         INSERT INTO analyzed_articles
             (article_id, source, url, title, published_at, published_at_utc,
-             content_length, body, category, category_confidence, category_engine,
+             content_length, body, body_html, title_norm, body_norm,
+             category, category_confidence, category_engine,
+             industry, industry_confidence, industry_engine,
+             relevance_score, relevance_engine, relevance_reason,
              tag_engine, extract_engine, analyzed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(article_id) DO UPDATE SET
             source=excluded.source, url=excluded.url, title=excluded.title,
             published_at=excluded.published_at, published_at_utc=excluded.published_at_utc,
@@ -357,16 +657,29 @@ def _replace_analysis(
             -- 正文只在本次真的拿到时覆盖：早期行 body 为 NULL，重新分析若上游没返回正文
             -- （详情接口抖动、正文为空），不能被写成 NULL/空串，否则检索会静默丢文章。
             body         = COALESCE(NULLIF(excluded.body, ''), analyzed_articles.body),
+            body_html    = COALESCE(NULLIF(excluded.body_html, ''), analyzed_articles.body_html),
+            title_norm   = excluded.title_norm,
+            body_norm    = COALESCE(NULLIF(excluded.body_norm, ''), analyzed_articles.body_norm),
             -- 空值表示「这次没做分类」（旧版本重跑、categories.json 被移走后退回单级打标），
             -- 不能拿它覆盖库里已有的分类；明确判成 other 时 category='other'，不是空值，会正常写入。
             category            = COALESCE(excluded.category, analyzed_articles.category),
             category_confidence = COALESCE(excluded.category_confidence, analyzed_articles.category_confidence),
             category_engine     = COALESCE(NULLIF(excluded.category_engine, ''), analyzed_articles.category_engine),
+            industry            = COALESCE(excluded.industry, analyzed_articles.industry),
+            industry_confidence = COALESCE(excluded.industry_confidence, analyzed_articles.industry_confidence),
+            industry_engine     = COALESCE(NULLIF(excluded.industry_engine, ''), analyzed_articles.industry_engine),
+            -- 评分失败（None）不能把上一次的有效分数抹掉；0 分是有效值，照常写入。
+            relevance_score     = COALESCE(excluded.relevance_score, analyzed_articles.relevance_score),
+            relevance_engine    = COALESCE(NULLIF(excluded.relevance_engine, ''), analyzed_articles.relevance_engine),
+            relevance_reason    = COALESCE(NULLIF(excluded.relevance_reason, ''), analyzed_articles.relevance_reason),
             tag_engine=excluded.tag_engine,
             extract_engine=excluded.extract_engine, analyzed_at=excluded.analyzed_at
         """,
         (article_id, source, url, title, published_at, published_at_utc,
-         content_length, body, category or None, category_confidence, category_engine,
+         content_length, body, body_html, title_norm, body_norm,
+         category or None, category_confidence, category_engine,
+         industry or None, industry_confidence, industry_engine,
+         relevance_score, relevance_engine or None, relevance_reason or None,
          tag_engine, extract_engine, now),
     )
     conn.execute("DELETE FROM article_tags WHERE article_id = ?", (article_id,))
@@ -642,8 +955,24 @@ _LIST_ORDERS = {
     "published_asc": f"{_TIME_EXPR} ASC, a.article_id ASC",
     "confidence_desc": "(a.category_confidence IS NULL), a.category_confidence DESC, a.article_id DESC",
     "confidence_asc": "(a.category_confidence IS NULL), a.category_confidence ASC, a.article_id ASC",
+    # 文章级语义相关性：与 recommend 的用户画像 relevance_* 是两套不同分数，
+    # 因此排序键单独命名，避免前端把「个性化推荐分」当成语义分。
+    "relevance_score_desc": "(a.relevance_score IS NULL), a.relevance_score DESC, a.article_id DESC",
+    "relevance_score_asc": "(a.relevance_score IS NULL), a.relevance_score ASC, a.article_id ASC",
 }
-LIST_SORTS = tuple(_LIST_ORDERS)
+# relevance_* 由 API 层用 recommend.annotate_rows 在 Python 侧算完再排序；
+# 这里只做校验白名单，不放进 _LIST_ORDERS，避免把没有 SQL 表达式可用的键传进 list_analyzed。
+LIST_SORTS = (*tuple(_LIST_ORDERS), "relevance_desc", "relevance_asc")
+
+# 列表只读卡片字段：正文/正文 HTML/归一化内部列都不返回，一页 20 条能少传几百 KB。
+# 显式列而不是 SELECT *，新增加密/大字段时不会意外泄漏到列表响应。
+_LIST_COLUMNS = (
+    "a.article_id, a.source, a.url, a.title, a.published_at, a.published_at_utc,"
+    " a.content_length, a.category, a.category_confidence, a.category_engine,"
+    " a.industry, a.industry_confidence, a.industry_engine,"
+    " a.relevance_score, a.relevance_engine, a.relevance_reason,"
+    " a.tag_engine, a.extract_engine, a.analyzed_at"
+)
 
 # 检索的类内排序：默认按相关度，另外允许按时间翻。"相关度排序" 是产品默认，
 # 按时间排是给「先看最新的」这类浏览型查询用的，两者都得由后端算完，
@@ -657,10 +986,12 @@ def list_analyzed(
     tag: str | None,
     limit: int,
     offset: int,
-    category: str | None = None,
+    category: str | Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
+    industry: str | Sequence[str] | None = None,
     published_from: str | None = None,
     published_to: str | None = None,
+    min_relevance: float | None = None,
     sort: str = "published_desc",
 ) -> tuple[list[dict[str, Any]], int, int]:
     """分页列表；返回 (rows, total, undated_excluded)。
@@ -673,11 +1004,32 @@ def list_analyzed(
     if tag:
         clauses.append("a.article_id IN (SELECT article_id FROM article_tags WHERE tag = ?)")
         args.append(tag)
+    if min_relevance is not None:
+        clauses.append("a.relevance_score IS NOT NULL AND a.relevance_score >= ?")
+        args.append(float(min_relevance))
+    def _values(value: str | Sequence[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return [value] if isinstance(value, str) else list(value)
+
     # 用 is not None 而不是真值判断：category= 空串是「筛一个不存在的类」，
-    # 应该和未知类名一样返回空集，而不是静默退化成「不过滤」
-    if category is not None:
-        clauses.append("a.category = ?")
-        args.append(category)
+    # 应该和未知类名一样返回空集，而不是静默退化成「不过滤」。空列表同理。
+    categories = _values(category)
+    if categories is not None:
+        if categories:
+            placeholders = ",".join("?" for _ in categories)
+            clauses.append(f"a.category IN ({placeholders})")
+            args.extend(categories)
+        else:
+            clauses.append("0")
+    industries = _values(industry)
+    if industries is not None:
+        if industries:
+            placeholders = ",".join("?" for _ in industries)
+            clauses.append(f"COALESCE(a.industry, '') IN ({placeholders})")
+            args.extend(industries)
+        else:
+            clauses.append("0")
     src_clauses, src_args = _source_clause(sources)
     clauses.extend(src_clauses)
     args.extend(src_args)
@@ -705,23 +1057,106 @@ def list_analyzed(
     if order is None:
         raise ValueError(f"未知排序: {sort}")
     rows = conn.execute(
-        f"""SELECT a.* FROM analyzed_articles a {where}
+        f"""SELECT {_LIST_COLUMNS} FROM analyzed_articles a {where}
             ORDER BY {order}
             LIMIT ? OFFSET ?""",
         [*args, *time_args, limit, offset],
     ).fetchall()
-    out = []
-    for row in rows:
-        item = dict(row)
-        item["tags"] = [
-            {"tag": r["tag"], "confidence": r["confidence"], "engine": r["engine"]}
-            for r in conn.execute(
-                "SELECT tag, confidence, engine FROM article_tags WHERE article_id = ? ORDER BY confidence DESC",
-                (row["article_id"],),
+    out = [dict(row) for row in rows]
+    # 标签一次 IN 批量取，替代每行一次 SELECT（1000 行时能省近千次往返）。
+    ids = [item["article_id"] for item in out]
+    tags_by_id: dict[str, list[dict[str, Any]]] = {aid: [] for aid in ids}
+    for chunk_start in range(0, len(ids), 500):
+        chunk = ids[chunk_start : chunk_start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for tr in conn.execute(
+            "SELECT article_id, tag, confidence, engine FROM article_tags"
+            " WHERE article_id IN (" + placeholders + ") ORDER BY article_id, confidence DESC",
+            chunk,
+        ):
+            tags_by_id[tr["article_id"]].append(
+                {"tag": tr["tag"], "confidence": tr["confidence"], "engine": tr["engine"]}
             )
-        ]
-        out.append(item)
+    for item in out:
+        item["tags"] = tags_by_id.get(item["article_id"], [])
     return out, int(total), int(undated)
+
+
+
+# 高相关卡片摘要只挑申报决策最需要的字段，避免把整份抽取结果塞进列表。
+_HIGHLIGHT_FIELDS = (
+    ("program_name", "项目名称"),
+    ("deadline", "申报截止"),
+    ("funding_amount", "资助额度"),
+    ("eligible_applicants", "申报对象"),
+    ("focus_areas", "重点领域"),
+    ("application_channel", "申报渠道"),
+    ("contact", "联系方式"),
+    ("materials", "所需材料"),
+)
+
+
+def _highlight_text(value: Any) -> str:
+    """把抽取值压成一行可读文本；列表用顿号、对象用 JSON，禁止把 None 当内容。"""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "、".join(_highlight_text(item) for item in value if _highlight_text(item))
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value).strip()
+
+
+def attach_highlights(
+    conn: sqlite3.Connection, rows: list[dict[str, Any]], *, min_score: float = 0.8
+) -> None:
+    """给列表行挂「高相关要素摘要」，只对 relevance_score ≥ min_score 的文章生效。
+
+    分类卡片需要一眼看到截止时间/额度等决策要素，但列表接口不能返回整份
+    extractions（体积大且低相关时没有意义）。这里按文章批量取一次抽取结果，
+    高相关行才填 highlights；低相关行返回空数组，前端无需再判断阈值。
+    """
+    for item in rows:
+        item["highlights"] = []
+    eligible = [
+        str(item.get("article_id") or "")
+        for item in rows
+        if float(item.get("relevance_score") or 0.0) >= min_score
+    ]
+    if not eligible:
+        return
+    wanted = set(eligible)
+    values: dict[str, dict[str, Any]] = {article_id: {} for article_id in eligible}
+    for chunk_start in range(0, len(eligible), 500):
+        chunk = eligible[chunk_start : chunk_start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            "SELECT article_id, field, value_json FROM extractions"
+            " WHERE article_id IN (" + placeholders + ")",
+            chunk,
+        ):
+            article_id = str(row["article_id"])
+            if article_id not in wanted:
+                continue
+            field = str(row["field"])
+            if field in values[article_id]:
+                continue
+            try:
+                parsed = json.loads(row["value_json"])
+            except (TypeError, ValueError):
+                continue
+            text = _highlight_text(parsed)
+            if text:
+                values[article_id][field] = text
+    for item in rows:
+        article_id = str(item.get("article_id") or "")
+        if article_id not in values:
+            continue
+        item["highlights"] = [
+            {"key": key, "label": label, "value": values[article_id][key]}
+            for key, label in _HIGHLIGHT_FIELDS
+            if key in values[article_id]
+        ][:6]
 
 
 def get_article(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | None:
@@ -729,6 +1164,9 @@ def get_article(conn: sqlite3.Connection, article_id: str) -> dict[str, Any] | N
     if row is None:
         return None
     item = dict(row)
+    # 归一化列是检索内部字段，不属于对外契约。
+    item.pop("title_norm", None)
+    item.pop("body_norm", None)
     item["tags"] = [
         {"tag": r["tag"], "confidence": r["confidence"], "evidence": r["evidence"], "engine": r["engine"]}
         for r in conn.execute(
@@ -832,6 +1270,16 @@ def category_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "SELECT category, COUNT(*) AS count, ROUND(AVG(category_confidence), 3) AS avg_confidence "
         "FROM analyzed_articles WHERE category IS NOT NULL AND category <> '' "
         "GROUP BY category ORDER BY count DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def industry_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """One row per controlled industry; unclassified (pre-upgrade) rows are excluded."""
+    rows = conn.execute(
+        "SELECT industry, COUNT(*) AS count, ROUND(AVG(industry_confidence), 3) AS avg_confidence "
+        "FROM analyzed_articles WHERE industry IS NOT NULL AND industry <> '' "
+        "GROUP BY industry ORDER BY count DESC"
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -950,60 +1398,122 @@ def create_notification(
 
 def _notification_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
-    item["read"] = item["read_at"] is not None
+    # 用户维度查询会带 user_read；无账号的服务调用仍回落到全局 read_at。
+    if "user_read" in item:
+        item["read"] = bool(item.pop("user_read"))
+    else:
+        item["read"] = item["read_at"] is not None
     return item
 
 
 def list_notifications(
-    conn: sqlite3.Connection, *, limit: int = 20, unread_only: bool = False
+    conn: sqlite3.Connection,
+    *,
+    user_id: int | None = None,
+    limit: int = 20,
+    unread_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """返回 (通知列表, 总数, 未读数)。
 
-    total 与列表使用同一筛选条件：unread_only=true 时它等于未读总数，
-    而不是全库总量；unread 则始终是全库未读数，供铃铛角标使用。
+    user_id 为空时按旧版全局 read_at 统计（服务账号/无登录场景）；传了用户
+    则读取 notification_reads，每个人各有一份已读状态，互不影响。total 与列表
+    使用同一筛选条件，unread 始终是该用户（或全局）的未读总数。
     """
-    where = "WHERE n.read_at IS NULL" if unread_only else ""
+    if user_id is None:
+        join = ""
+        select_read = "n.read_at"
+        base_args: list[Any] = []
+        where = "WHERE n.read_at IS NULL" if unread_only else ""
+        unread_where = "WHERE read_at IS NULL"
+        unread_args: list[Any] = []
+    else:
+        join = "LEFT JOIN notification_reads r ON r.notification_id = n.id AND r.user_id = ?"
+        select_read = "CASE WHEN r.read_at IS NULL THEN 0 ELSE 1 END AS user_read"
+        base_args = [user_id]
+        where = "WHERE r.read_at IS NULL" if unread_only else ""
+        unread_where = (
+            "WHERE n.id NOT IN (SELECT notification_id FROM notification_reads WHERE user_id = ?)"
+        )
+        unread_args = [user_id]
     rows = conn.execute(
-        f"""SELECT n.id, n.article_id, n.kind, n.title, n.message, n.created_at, n.read_at,
+        f"""SELECT n.id, n.article_id, n.kind, n.title, n.message, n.created_at,
+                   {select_read},
                    a.url, a.source, a.category, a.published_at
             FROM notifications n
+            {join}
             LEFT JOIN analyzed_articles a ON a.article_id = n.article_id
             {where}
             ORDER BY n.created_at DESC, n.id DESC
             LIMIT ?""",
-        (limit,),
+        [*base_args, limit],
     ).fetchall()
     total = int(
-        conn.execute(f"SELECT COUNT(*) FROM notifications n {where}").fetchone()[0]
+        conn.execute(
+            f"SELECT COUNT(*) FROM notifications n {join} {where}", base_args
+        ).fetchone()[0]
     )
     unread = int(
-        conn.execute("SELECT COUNT(*) FROM notifications WHERE read_at IS NULL").fetchone()[0]
+        conn.execute(f"SELECT COUNT(*) FROM notifications n {unread_where}", unread_args).fetchone()[0]
     )
     return [_notification_row(r) for r in rows], total, unread
 
 
-def mark_notification_read(conn: sqlite3.Connection, notification_id: int) -> dict[str, Any] | None:
+def mark_notification_read(
+    conn: sqlite3.Connection, notification_id: int, *, user_id: int | None = None
+) -> dict[str, Any] | None:
     """标记单条已读；重复调用保持首次已读时间不变。不存在返回 None。"""
-    conn.execute(
-        "UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ?",
-        (_now_iso(), notification_id),
-    )
+    exists = conn.execute(
+        "SELECT 1 FROM notifications WHERE id = ?", (notification_id,)
+    ).fetchone()
+    if exists is None:
+        return None
+    if user_id is None:
+        conn.execute(
+            "UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+            (_now_iso(), notification_id),
+        )
+        read_expr = "n.read_at"
+        read_args: list[Any] = []
+        join = ""
+    else:
+        conn.execute(
+            "INSERT INTO notification_reads (notification_id, user_id, read_at) VALUES (?,?,?)"
+            " ON CONFLICT(notification_id, user_id) DO NOTHING",
+            (notification_id, user_id, _now_iso()),
+        )
+        read_expr = "CASE WHEN r.read_at IS NULL THEN 0 ELSE 1 END AS user_read"
+        read_args = [user_id]
+        join = "LEFT JOIN notification_reads r ON r.notification_id = n.id AND r.user_id = ?"
     row = conn.execute(
-        """SELECT n.id, n.article_id, n.kind, n.title, n.message, n.created_at, n.read_at,
-                  a.url, a.source, a.category, a.published_at
+        f"""SELECT n.id, n.article_id, n.kind, n.title, n.message, n.created_at,
+                   {read_expr},
+                   a.url, a.source, a.category, a.published_at
            FROM notifications n
+           {join}
            LEFT JOIN analyzed_articles a ON a.article_id = n.article_id
            WHERE n.id = ?""",
-        (notification_id,),
+        [*read_args, notification_id],
     ).fetchone()
     conn.commit()
     return _notification_row(row) if row is not None else None
 
 
-def mark_all_notifications_read(conn: sqlite3.Connection) -> int:
-    cur = conn.execute(
-        "UPDATE notifications SET read_at = ? WHERE read_at IS NULL", (_now_iso(),)
-    )
+def mark_all_notifications_read(
+    conn: sqlite3.Connection, *, user_id: int | None = None
+) -> int:
+    if user_id is None:
+        cur = conn.execute(
+            "UPDATE notifications SET read_at = ? WHERE read_at IS NULL", (_now_iso(),)
+        )
+    else:
+        cur = conn.execute(
+            """INSERT INTO notification_reads (notification_id, user_id, read_at)
+               SELECT n.id, ?, ? FROM notifications n
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM notification_reads r
+                   WHERE r.notification_id = n.id AND r.user_id = ?)""",
+            (user_id, _now_iso(), user_id),
+        )
     conn.commit()
     return int(cur.rowcount)
 
@@ -1026,9 +1536,33 @@ def prune_old_data(
     """
     cutoff = _retention_cutoff(retention_days)
     article_subquery = "SELECT article_id FROM analyzed_articles WHERE analyzed_at < ?"
-    tables = ("article_tags", "extractions", "article_checklists", "notifications")
+    tables = (
+        "article_tags",
+        "extractions",
+        "article_checklists",
+        "favorites",
+        "browse_history",
+        "notifications",
+    )
     counts: dict[str, int] = {}
     try:
+        # notification_reads 没有 article_id，必须在 notifications 被删前按通知 id 清掉。
+        if dry_run:
+            counts["notification_reads"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM notification_reads WHERE notification_id IN ("
+                    "SELECT id FROM notifications WHERE article_id IN (" + article_subquery + "))",
+                    (cutoff,),
+                ).fetchone()[0]
+            )
+        else:
+            counts["notification_reads"] = int(
+                conn.execute(
+                    "DELETE FROM notification_reads WHERE notification_id IN ("
+                    "SELECT id FROM notifications WHERE article_id IN (" + article_subquery + "))",
+                    (cutoff,),
+                ).rowcount
+            )
         for table in tables:
             if dry_run:
                 counts[table] = int(
@@ -1101,8 +1635,10 @@ def _undated_excluded(
     tag_ids: Sequence[str],
     categories: Sequence[str] | None,
     sources: Sequence[str] | None,
+    industries: Sequence[str] | None,
     published_from: str | None,
     published_to: str | None,
+    min_relevance: float | None = None,
 ) -> int:
     """带日期过滤时被排除的「无日期」命中数；不筛日期时返回 0。
 
@@ -1111,13 +1647,19 @@ def _undated_excluded(
     """
     if not (published_from or published_to):
         return 0
-    clauses, args = _signal_clauses(conn, terms, tag_ids)
+    clauses, args = _signal_clauses(conn, terms, tag_ids, min_relevance)
     if categories is not None:
         if not categories:
             return 0
         placeholders = ",".join("?" for _ in categories)
         clauses.append("COALESCE(a.category, '') IN (" + placeholders + ")")
         args.extend(categories)
+    if industries is not None:
+        if not industries:
+            return 0
+        placeholders = ",".join("?" for _ in industries)
+        clauses.append("COALESCE(a.industry, '') IN (" + placeholders + ")")
+        args.extend(industries)
     src_clauses, src_args = _source_clause(sources)
     clauses.extend(src_clauses)
     args.extend(src_args)
@@ -1133,6 +1675,7 @@ def _signal_clauses(
     conn: sqlite3.Connection,
     terms: Sequence[str],
     tag_ids: Sequence[str],
+    min_relevance: float | None = None,
 ) -> tuple[list[str], list[Any]]:
     """检索命中的信号条件：命中任一标签，或标题/正文包含任一词。
 
@@ -1163,10 +1706,16 @@ def _signal_clauses(
         needle = search_mod._norm(term)
         if not needle:
             continue
-        signal.append("(instr(py_norm(a.title), ?) > 0 OR instr(py_norm(a.body), ?) > 0)")
+        signal.append(
+            "(instr(COALESCE(a.title_norm, py_norm(a.title)), ?) > 0"
+            " OR instr(COALESCE(a.body_norm, py_norm(a.body)), ?) > 0)"
+        )
         args.extend([needle, needle])
     if signal:
         clauses.append("(" + " OR ".join(signal) + ")")
+    if min_relevance is not None:
+        clauses.append("a.relevance_score IS NOT NULL AND a.relevance_score >= ?")
+        args.append(float(min_relevance))
     return clauses, args
 
 
@@ -1177,10 +1726,13 @@ def search_candidates(
     tag_ids: Sequence[str],
     categories: Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
+    industries: Sequence[str] | None = None,
     published_from: str | None = None,
     published_to: str | None = None,
+    min_relevance: float | None = None,
     sort: str = "relevance",
     limit: int = _CANDIDATE_LIMIT,
+    include_body: bool = False,
 ) -> list[dict[str, Any]]:
     """Rows that might match, prefiltered in SQL before scoring.
 
@@ -1221,7 +1773,7 @@ def search_candidates(
     clauses: list[str] = []
     args: list[Any] = []
 
-    signal, signal_args = _signal_clauses(conn, terms, tag_ids)
+    signal, signal_args = _signal_clauses(conn, terms, tag_ids, min_relevance)
     clauses.extend(signal)
     args.extend(signal_args)
 
@@ -1231,6 +1783,12 @@ def search_candidates(
         placeholders = ",".join("?" for _ in categories)
         clauses.append("COALESCE(a.category, '') IN (" + placeholders + ")")
         args.extend(categories)
+    if industries is not None:
+        if not industries:
+            return []
+        placeholders = ",".join("?" for _ in industries)
+        clauses.append("COALESCE(a.industry, '') IN (" + placeholders + ")")
+        args.extend(industries)
 
     # 时间与来源筛选和 list_analyzed 共用同一套子句，两处口径必须一致：
     # 否则同一批数据在「浏览」和「检索」里被筛出不同的集合，用户会以为丢数据。
@@ -1274,12 +1832,18 @@ def search_candidates(
         else f"{_TIME_EXPR} DESC, a.article_id DESC"
     )
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    body_column = ", a.body" if include_body else ""
     rows = conn.execute(
-        "SELECT a.article_id, a.source, a.url, a.title, a.body,"
+        "SELECT a.article_id, a.source, a.url, a.title,"
         " a.published_at, a.published_at_utc, a.content_length,"
         " a.category, a.category_confidence, a.category_engine,"
-        " a.tag_engine, a.analyzed_at"
-        " FROM analyzed_articles a " + where
+        " a.industry, a.industry_confidence, a.industry_engine,"
+        " a.relevance_score, a.relevance_engine, a.relevance_reason,"
+        " a.tag_engine, a.analyzed_at,"
+        " COALESCE(a.title_norm, py_norm(a.title)) AS title_norm,"
+        " COALESCE(a.body_norm, py_norm(a.body)) AS body_norm"
+        + body_column
+        + " FROM analyzed_articles a " + where
         + " ORDER BY " + cutoff_order
         + " LIMIT ?",
         [*args, limit],
@@ -1334,9 +1898,66 @@ def set_body(conn: sqlite3.Connection, *, article_id: str, body: str, commit: bo
     than it is.
     """
     cur = conn.execute(
-        "UPDATE analyzed_articles SET body = ?"
+        "UPDATE analyzed_articles SET body = ?, body_norm = ?"
         " WHERE article_id = ? AND (body IS NULL OR body = '')",
-        (body, article_id),
+        (body, search_mod._norm(body) if body else None, article_id),
+    )
+    written = cur.rowcount > 0
+    if commit:
+        conn.commit()
+    return written
+
+
+def set_industry(
+    conn: sqlite3.Connection,
+    *,
+    article_id: str,
+    industry: str,
+    confidence: float | None,
+    engine: str,
+    commit: bool = True,
+) -> bool:
+    """Write only the industry columns, never overwriting an existing industry."""
+    cur = conn.execute(
+        "UPDATE analyzed_articles SET industry = ?, industry_confidence = ?, industry_engine = ?"
+        " WHERE article_id = ? AND (industry IS NULL OR industry = '')",
+        (industry, confidence, engine, article_id),
+    )
+    written = cur.rowcount > 0
+    if commit:
+        conn.commit()
+    return written
+
+
+def set_relevance(
+    conn: sqlite3.Connection,
+    *,
+    article_id: str,
+    score: float,
+    engine: str,
+    reason: str,
+    commit: bool = True,
+) -> bool:
+    """Write only the semantic relevance columns, never overwriting an existing score."""
+    cur = conn.execute(
+        "UPDATE analyzed_articles SET relevance_score = ?, relevance_engine = ?, relevance_reason = ?"
+        " WHERE article_id = ? AND relevance_score IS NULL",
+        (score, engine, reason, article_id),
+    )
+    written = cur.rowcount > 0
+    if commit:
+        conn.commit()
+    return written
+
+
+def set_body_html(
+    conn: sqlite3.Connection, *, article_id: str, body_html: str, commit: bool = True
+) -> bool:
+    """Write only the body_html column, with the same no-overwrite guard as set_body."""
+    cur = conn.execute(
+        "UPDATE analyzed_articles SET body_html = ?"
+        " WHERE article_id = ? AND (body_html IS NULL OR body_html = '')",
+        (body_html, article_id),
     )
     written = cur.rowcount > 0
     if commit:
@@ -1354,8 +1975,10 @@ def search_grouped(
     category_order: Sequence[str] = (),
     categories: Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
+    industries: Sequence[str] | None = None,
     published_from: str | None = None,
     published_to: str | None = None,
+    min_relevance: float | None = None,
     per_category: int = 20,
     include_body: bool = False,
     sort: str = "relevance",
@@ -1391,12 +2014,15 @@ def search_grouped(
         tag_ids=query.tag_ids,
         categories=categories,
         sources=sources,
+        industries=industries,
         published_from=published_from,
         published_to=published_to,
+        min_relevance=min_relevance,
         # 排序影响截断方向：按时间升序查时不能还按「最新优先」取候选，
         # 否则最老的那批恰好是被截掉的那批。
         sort=sort,
         limit=_CANDIDATE_LIMIT + 1,
+        include_body=include_body,
     )
     undated_excluded = _undated_excluded(
         conn,
@@ -1404,8 +2030,10 @@ def search_grouped(
         tag_ids=query.tag_ids,
         categories=categories,
         sources=sources,
+        industries=industries,
         published_from=published_from,
         published_to=published_to,
+        min_relevance=min_relevance,
     )
     truncated = len(rows) > _CANDIDATE_LIMIT
     if truncated:
@@ -1427,11 +2055,15 @@ def search_grouped(
             title=row["title"],
             body=row.get("body"),
             tag_confidences=row["tag_confidences"],
+            title_norm=row.get("title_norm"),
+            body_norm=row.get("body_norm"),
         )
         if not search_mod.has_signal(rel):
             continue
         item = dict(row)
         item.pop("tag_confidences", None)
+        item.pop("title_norm", None)
+        item.pop("body_norm", None)
         item["relevance"] = rel.as_dict()
         if not include_body:
             item.pop("body", None)

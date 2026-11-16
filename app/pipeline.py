@@ -12,11 +12,14 @@ from app import checklist_service, db
 from app.extraction import extract_article, load_schemas
 from app.llm import LLMClient
 from app.news_client import NewsClient, UpstreamError
+from app.relevance import score_relevance
 from app.settings import Settings
 from app.tagging import (
     FALLBACK_CATEGORY,
     classify_article,
+    classify_industry,
     load_categories,
+    load_industries,
     load_vocab,
     tag_article,
     tag_with_rules,
@@ -62,13 +65,21 @@ class _AnalysisResult:
     category: str = ""
     category_confidence: float | None = None
     category_engine: str = ""
+    industry: str = ""
+    industry_confidence: float | None = None
+    industry_engine: str = ""
+    relevance_score: float | None = None
+    relevance_engine: str = ""
+    relevance_reason: str = ""
     hits: list = field(default_factory=list)
     results: list = field(default_factory=list)
     checklist: tuple[str, list] | None = None
     error: str | None = None
 
 
-def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art, categories=()) -> _AnalysisResult:
+def _analyze_one(
+    settings: Settings, llm: LLMClient, tags, schemas, art, categories=(), industries=()
+) -> _AnalysisResult:
     """Run all LLM calls for one article. Must not touch SQLite: workers are stateless.
 
     两级：先给文章定唯一大类，再（且只在该类允许的标签里）打关键词标签。
@@ -76,13 +87,37 @@ def _analyze_one(settings: Settings, llm: LLMClient, tags, schemas, art, categor
     """
     result = _AnalysisResult(article=art)
     try:
+        if industries:
+            industry_hit = classify_industry(settings, llm, industries, art.title, art.body)
+            result.industry = industry_hit.industry_id
+            result.industry_confidence = industry_hit.confidence if industry_hit.industry_id else None
+            result.industry_engine = industry_hit.engine
         scope = list(tags)
+        score_category = ""
+        score_confidence: float | None = None
         if categories:
             hit = classify_article(settings, llm, categories, art.title, art.body)
             result.category = hit.category_id
             result.category_confidence = hit.confidence if hit.category_id else None
             result.category_engine = hit.engine
             scope = tags_for_category(categories, tags, hit.category_id)
+            score_category = hit.category_id
+            score_confidence = hit.confidence if hit.category_id else None
+        # 独立的一次语义相关性评分：与分类、打标分开调用，避免把两个目标揉进
+        # 同一个提示词后互相稀释。放在分类之后，是为了让规则降级也能用上分类
+        # 先验；同时保证 other/空白名单等提前返回的路径仍带上分数。
+        relevance_hit = score_relevance(
+            settings,
+            llm,
+            title=art.title,
+            body=art.body or "",
+            category=score_category,
+            category_confidence=score_confidence,
+        )
+        result.relevance_score = relevance_hit.score
+        result.relevance_engine = relevance_hit.engine
+        result.relevance_reason = relevance_hit.reason
+        if categories:
             if hit.category_id == FALLBACK_CATEGORY:
                 # 兜底类不做语义打标（省一次模型调用），只用规则引擎保住行业维度标签
                 result.hits = tag_with_rules(
@@ -165,7 +200,14 @@ def _persist_result(conn, result: _AnalysisResult) -> None:
         category=result.category,
         category_confidence=result.category_confidence,
         category_engine=result.category_engine,
+        industry=result.industry,
+        industry_confidence=result.industry_confidence,
+        industry_engine=result.industry_engine,
+        relevance_score=result.relevance_score,
+        relevance_engine=result.relevance_engine,
+        relevance_reason=result.relevance_reason,
         body=art.body or None,
+        body_html=art.body_html or None,
         commit=False,
     )
     if result.checklist is not None:
@@ -220,6 +262,7 @@ def analyze_batch(
 
     _, tags = load_vocab(settings.vocab_dir)
     _, categories = load_categories(settings.vocab_dir)
+    _, industries = load_industries(settings.vocab_dir)
     schemas = load_schemas(settings.vocab_dir / "schemas")
     llm = LLMClient(settings)
     client = NewsClient(settings)
@@ -318,11 +361,15 @@ def analyze_batch(
         LOG.info("开始分析 %d 篇，并发=%d", len(pending), workers)
         executor: ThreadPoolExecutor | None = None
         if workers == 1 or len(pending) <= 1:
-            results_iter = (_analyze_one(settings, llm, tags, schemas, art, categories) for art in pending)
+            results_iter = (
+                _analyze_one(settings, llm, tags, schemas, art, categories, industries)
+                for art in pending
+            )
         else:
             executor = ThreadPoolExecutor(max_workers=min(workers, len(pending)))
             analyze_futures = [
-                executor.submit(_analyze_one, settings, llm, tags, schemas, art, categories) for art in pending
+                executor.submit(_analyze_one, settings, llm, tags, schemas, art, categories, industries)
+                for art in pending
             ]
             results_iter = (f.result() for f in as_completed(analyze_futures))
 

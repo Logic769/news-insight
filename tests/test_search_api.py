@@ -345,3 +345,32 @@ def test_search_source_filter_accepts_comma_separated(client):
     items = _all_items(resp.json()["data"])
     assert items
     assert {i["source"] for i in items} == {"prov-sci-tech"}
+
+
+def test_articles_rejects_min_relevance_out_of_range(client):
+    resp = client.get("/v1/articles", params={"min_relevance": 1.5}, headers=HEADERS)
+    assert resp.status_code == 422
+
+
+def test_articles_filters_and_sorts_by_semantic_score(client):
+    # 先确保所有 demo 文章都有语义分；排序必须由 SQL 完成且 NULL 不混进来。
+    all_rows = client.get(
+        "/v1/articles", params={"sort": "relevance_score_desc", "limit": 20}, headers=HEADERS
+    )
+    assert all_rows.status_code == 200
+    scores = [row["relevance_score"] for row in all_rows.json()["data"]]
+    assert scores and all(score is not None for score in scores)
+    assert scores == sorted(scores, reverse=True)
+
+    filtered = client.get(
+        "/v1/articles",
+        params={"sort": "relevance_score_desc", "min_relevance": 0.7, "limit": 20},
+        headers=HEADERS,
+    )
+    assert filtered.status_code == 200
+    rows = filtered.json()["data"]
+    assert rows
+    assert all(row["relevance_score"] >= 0.7 for row in rows)
+    assert [row["relevance_score"] for row in rows] == sorted(
+        (row["relevance_score"] for row in rows), reverse=True
+    )

@@ -99,7 +99,8 @@ class _FakeClient:
                 message, status_code = spec
                 raise UpstreamError(message, status_code=status_code)
             raise UpstreamError(spec)
-        return {"content": self.bodies.get(article_id, "")}
+        text = self.bodies.get(article_id, "")
+        return {"content": text, "body_html": f"<p>{text}</p>" if text.strip() else ""}
 
     def close(self) -> None:
         pass
@@ -249,12 +250,31 @@ class TestBackfill:
         _seed(settings.db_path, [(f"a{i}", None, same_time) for i in range(5)])
         conn = db.connect(settings.db_path)
         try:
-            first = [r["article_id"] for r in backfill_mod._articles_missing_body(conn, 3)]
-            second = [r["article_id"] for r in backfill_mod._articles_missing_body(conn, 3)]
+            first = [r["article_id"] for r in backfill_mod._articles_missing_content(conn, 3)]
+            second = [r["article_id"] for r in backfill_mod._articles_missing_content(conn, 3)]
         finally:
             conn.close()
         assert first == second
         assert first == ["a4", "a3", "a2"]
+
+    def test_backfills_html_when_body_text_already_exists(self, tmp_path, monkeypatch):
+        """旧版只回填正文；正文已在但 HTML 缺失的行仍必须被补上。"""
+        settings = _settings(tmp_path)
+        _seed(settings.db_path, [("a1", "已有正文", "2026-11-01 00:00:00")])
+        client = _FakeClient({"a1": "上游正文"})
+        _patch_client(monkeypatch, client)
+        result = backfill_mod.backfill_bodies(settings, limit=10, batch=10)
+        assert result["filled"] == 1
+        assert result["html_filled"] == 1
+        conn = db.connect(settings.db_path)
+        try:
+            got = conn.execute(
+                "SELECT body, body_html FROM analyzed_articles WHERE article_id='a1'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert got["body"] == "已有正文", "已有正文不能被回填覆盖"
+        assert got["body_html"] == "<p>上游正文</p>"
 
     def test_set_body_skips_rows_that_already_have_one(self, tmp_path):
         """并发场景：快照之后的写入不能覆盖别人刚填好的正文。"""

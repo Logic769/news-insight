@@ -11,3 +11,5 @@ __pycache__/
 .DS_Store
 # 本地备份可能含 .env / 站点配置，绝不入库
 backups/
+# docker compose 的本地数据卷（DATA_DIR=./data_live），含运行库与文件锁
+data_live/

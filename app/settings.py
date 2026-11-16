@@ -64,11 +64,19 @@ class Settings:
     api_key: str = field(default_factory=lambda: _env("INSIGHT_API_KEY"))
     require_auth: bool = field(default_factory=lambda: _env("INSIGHT_REQUIRE_AUTH", "0") == "1")
 
+    # --- local accounts --------------------------------------------------
+    # 首次启动、users 表为空时创建的唯一管理员；密码只从环境变量读取。
+    admin_username: str = field(default_factory=lambda: _env("INSIGHT_ADMIN_USERNAME", "admin"))
+    admin_password: str = field(default_factory=lambda: _env("INSIGHT_ADMIN_PASSWORD"))
+    session_ttl_days: int = field(default_factory=lambda: _env_int_range("INSIGHT_SESSION_TTL_DAYS", 7, 1, 365))
+
     # --- analysis behaviour ---------------------------------------------
     max_tags_per_article: int = field(default_factory=lambda: _env_int("MAX_TAGS_PER_ARTICLE", 5))
     tag_body_chars: int = field(default_factory=lambda: _env_int("TAG_BODY_CHARS", 1200))
     extract_body_chars: int = field(default_factory=lambda: _env_int("EXTRACT_BODY_CHARS", 6000))
-    # 单进程内并发分析的文章数；每篇内部仍串行调用 3 次 LLM。
+    # 语义相关性评分送给 LLM 的正文上限；独立于抽取/打标的截断长度。
+    relevance_body_chars: int = field(default_factory=lambda: _env_int("RELEVANCE_BODY_CHARS", 4000))
+    # 单进程内并发分析的文章数；每篇内部串行调用最多 6 次 LLM。
     analyze_concurrency: int = field(default_factory=lambda: _env_int_range("ANALYZE_CONCURRENCY", 100, 1, 200))
     # 结果按批提交（主线程唯一写者），减少 SQLite 事务次数。
     analyze_write_batch: int = field(default_factory=lambda: _env_int_range("ANALYZE_WRITE_BATCH", 50, 1, 500))

@@ -53,13 +53,17 @@ def _add(
     category: str = "other",
     tag_confidences: tuple[tuple[str, float], ...] = (),
     published_at: str = "2026-11-01 00:00:00",
+    relevance_score: float | None = None,
+    relevance_engine: str = "",
+    relevance_reason: str = "",
 ) -> None:
     conn.execute(
         "INSERT INTO analyzed_articles"
         " (article_id, source, url, title, published_at, content_length,"
         "  body, category, category_confidence, category_engine,"
+        "  relevance_score, relevance_engine, relevance_reason,"
         "  tag_engine, extract_engine, analyzed_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             article_id,
             "svc",
@@ -71,6 +75,9 @@ def _add(
             category,
             0.9,
             "rules",
+            relevance_score,
+            relevance_engine,
+            relevance_reason,
             "rules",
             "rules",
             "2026-11-02 00:00:00",
@@ -688,14 +695,18 @@ def _add_dt(
     published_at: str | None = "2026-11-01 00:00:00",
     published_at_utc: str | None = None,
     category: str = "other",
+    relevance_score: float | None = None,
+    relevance_engine: str = "",
+    relevance_reason: str = "",
 ) -> None:
     """带 published_at_utc / source 的插入，覆盖混时区与来源筛选。"""
     conn.execute(
         "INSERT INTO analyzed_articles"
         " (article_id, source, url, title, published_at, published_at_utc, content_length,"
         "  body, category, category_confidence, category_engine,"
+        "  relevance_score, relevance_engine, relevance_reason,"
         "  tag_engine, extract_engine, analyzed_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             article_id,
             source,
@@ -708,6 +719,9 @@ def _add_dt(
             category,
             0.9,
             "rules",
+            relevance_score,
+            relevance_engine,
+            relevance_reason,
             "rules",
             "rules",
             "2026-11-02 00:00:00",
@@ -872,6 +886,27 @@ def test_search_grouped_reports_returned_and_truncated() -> None:
     assert result["returned"] == 2, "returned 必须是实际渲染条数"
     assert result["truncated"] is False
     assert result["sort"] == "relevance"
+
+
+def test_search_items_carry_industry_fields() -> None:
+    """检索结果必须带行业三列，前端才能渲染行业徽标并显示筛选依据。
+
+    search_candidates 用的是显式列清单而不是 SELECT *：漏列时接口仍 200，
+    只是卡片上永远没有行业徽标，属于前端无法兜底的静默缺字段。
+    """
+    conn = _conn()
+    _add_dt(conn, "a1", title="光伏补贴通知", body="光伏项目补贴")
+    conn.execute(
+        "UPDATE analyzed_articles SET industry='new_energy',"
+        " industry_confidence=0.88, industry_engine='llm' WHERE article_id='a1'"
+    )
+    conn.commit()
+
+    result = db.search_grouped(conn, raw_query="光伏", tags=TAGS)
+    item = result["groups"][0]["items"][0]
+    assert item["industry"] == "new_energy"
+    assert item["industry_confidence"] == 0.88
+    assert item["industry_engine"] == "llm"
 
 
 def test_source_stats_groups_by_source_and_uses_real_instant() -> None:
@@ -1309,4 +1344,104 @@ def test_search_grouped_empty_query_keeps_response_shape() -> None:
     assert out["returned"] == 0
     assert out["truncated"] is False
     assert out["undated_excluded"] == 0
+
+
+def test_list_analyzed_exposes_and_filters_semantic_relevance() -> None:
+    """语义相关性必须能从列表读出、按阈值过滤，正文等大字段不能顺带漏出。"""
+    conn = _conn()
+    _add_dt(
+        conn, "high", title="项目申报通知", relevance_score=0.92,
+        relevance_engine="llm", relevance_reason="信息具体可行动",
+    )
+    _add_dt(
+        conn, "low", title="产业观察", relevance_score=0.21,
+        relevance_engine="rules", relevance_reason="仅泛泛提及",
+    )
+    _add_dt(conn, "null", title="历史文章")
+
+    rows, total, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, min_relevance=0.5)
+    assert total == 1
+    assert [r["article_id"] for r in rows] == ["high"]
+    assert rows[0]["relevance_score"] == pytest.approx(0.92)
+    assert rows[0]["relevance_engine"] == "llm"
+    assert rows[0]["relevance_reason"] == "信息具体可行动"
+    assert "body" not in rows[0] and "body_html" not in rows[0]
+    assert "title_norm" not in rows[0] and "body_norm" not in rows[0]
+
+
+def test_list_analyzed_semantic_relevance_sort_puts_nulls_last() -> None:
+    conn = _conn()
+    _add_dt(conn, "mid", relevance_score=0.5)
+    _add_dt(conn, "high", relevance_score=0.9)
+    _add_dt(conn, "null")
+
+    for sort, expected in (
+        ("relevance_score_desc", ["high", "mid", "null"]),
+        ("relevance_score_asc", ["mid", "high", "null"]),
+    ):
+        rows, _, _ = db.list_analyzed(conn, tag=None, limit=10, offset=0, sort=sort)
+        assert [r["article_id"] for r in rows] == expected, sort
+
+
+def test_search_grouped_exposes_and_filters_semantic_relevance() -> None:
+    conn = _conn()
+    _add_dt(conn, "high", title="光伏补贴申报", relevance_score=0.88)
+    _add_dt(conn, "low", title="光伏产业观察", relevance_score=0.12)
+    _add_dt(conn, "null", title="光伏历史文章")
+
+    plain = db.search_grouped(conn, raw_query="光伏", tags=TAGS, category_order=CATEGORY_ORDER)
+    by_id = {i["article_id"]: i for g in plain["groups"] for i in g["items"]}
+    assert by_id["high"]["relevance_score"] == pytest.approx(0.88)
+    assert "title_norm" not in by_id["high"]
+    assert "body_norm" not in by_id["high"]
+
+    filtered = db.search_grouped(
+        conn, raw_query="光伏", tags=TAGS, category_order=CATEGORY_ORDER, min_relevance=0.5
+    )
+    ids = [i["article_id"] for g in filtered["groups"] for i in g["items"]]
+    assert ids == ["high"]
+    assert filtered["total"] == 1
+
+
+def test_set_relevance_never_overwrites_existing_score() -> None:
+    conn = _conn()
+    _add_dt(conn, "a1", relevance_score=0.7, relevance_engine="llm", relevance_reason="已有")
+    assert db.set_relevance(conn, article_id="a1", score=0.1, engine="rules", reason="新") is False
+    row = conn.execute(
+        "SELECT relevance_score, relevance_engine, relevance_reason"
+        " FROM analyzed_articles WHERE article_id='a1'"
+    ).fetchone()
+    assert row["relevance_score"] == pytest.approx(0.7)
+    assert row["relevance_engine"] == "llm" and row["relevance_reason"] == "已有"
+
+    _add_dt(conn, "a2")
+    assert db.set_relevance(conn, article_id="a2", score=0.3, engine="rules", reason="补") is True
+    assert db.get_article(conn, "a2")["relevance_score"] == pytest.approx(0.3)
+
+
+def test_save_analysis_populates_norms_without_exposing_them() -> None:
+    """归一列必须在写入时落库，检索才能走索引；它是内部字段，不能出现在详情响应。"""
+    conn = _conn()
+    db.save_analysis(
+        conn,
+        article_id="a1",
+        source="svc",
+        url="https://example.com/a1",
+        title="光伏  补贴通知",
+        published_at="2026-11-01 00:00:00",
+        published_at_utc="2026-11-01 00:00:00",
+        content_length=6,
+        tag_engine="rules",
+        extract_engine="rules",
+        tags=[],
+        extractions=[],
+        body="光伏 正文",
+    )
+    raw = conn.execute(
+        "SELECT title_norm, body_norm FROM analyzed_articles WHERE article_id='a1'"
+    ).fetchone()
+    assert raw["title_norm"] == search._norm("光伏  补贴通知")
+    assert raw["body_norm"] == search._norm("光伏 正文")
+    detail = db.get_article(conn, "a1")
+    assert "title_norm" not in detail and "body_norm" not in detail
 

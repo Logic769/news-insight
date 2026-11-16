@@ -43,6 +43,16 @@ def test_demo_batch_tags_and_extracts(settings):
         assert {t["tag"] for t in row3["tags"]} & {"finance", "policy_release"}
         assert all(t["engine"] == "rules" for t in row3["tags"]), "兜底类不应产生 LLM 标签"
 
+        # 语义相关性在分类之后独立打分；无 LLM 时走规则引擎，other 类也必须落分
+        for article in (row, row2, row3):
+            assert article["relevance_score"] is not None
+            assert 0.0 <= article["relevance_score"] <= 1.0
+            assert article["relevance_engine"] == "rules"
+            assert "分类先验" in article["relevance_reason"]
+        assert "分类先验0.95" in row["relevance_reason"]
+        assert "分类先验0.20" in row3["relevance_reason"]
+        assert row["relevance_score"] > row3["relevance_score"]
+
         # 截止时间查询
         rows = db.list_extractions(conn, schema_id="project_application", field=None,
                                    due_before="2026-04-10", limit=10)

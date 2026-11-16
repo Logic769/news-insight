@@ -6,8 +6,11 @@ query extracted facts (the "project application deadline" example).
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -15,21 +18,29 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import __version__, checklist_service, db
+from app import __version__, accounts, auth, checklist_service, db, recommend
 from app.extraction import load_schemas
 from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull
+from app.news_client import NewsClient, UpstreamError
 from app.pipeline import analyze_batch, connect
 from app.prune import prune
 from app.settings import Settings, load_settings
-from app.tagging import load_categories, load_vocab
+from app.tagging import load_categories, load_industries, load_vocab
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 LOG = logging.getLogger("news_insight.main")
 
 _OPEN_PATHS = ("/health", "/docs", "/redoc", "/openapi.json")
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCK_MINUTES = 15
+# 相关度排序要在 Python 里用用户画像算完再切页，因此只能对固定候选池排序。
+# 超过这个窗口必须显式报错，不能像以前那样返回空页却仍报真实 total。
+RELEVANCE_CANDIDATE_LIMIT = 2000
 
 
-def _split_multi(values: list[str] | None) -> list[str] | None:
+def _split_multi(
+    values: list[str] | None, *, empty_returns_none: bool = True
+) -> list[str] | None:
     """把多值查询参数（?source=、?category=）归一成「去重、去空、支持逗号分隔」的列表。
 
     三类输入必须区分开，否则前端换个写法就静默查错：
@@ -40,8 +51,12 @@ def _split_multi(values: list[str] | None) -> list[str] | None:
       看到的是「无结果」而不是全部数据。
     - 空片段（"a,,b"）同样忽略，与前者同一套规则：空值 = 不参与筛选。
 
-    全部片段都为空时返回 None（不筛）。这与库层 sources=[]（筛完什么都不剩，返回
-    空集）是两种语义：[] 只能由代码显式传入，HTTP 层永远不会产生它。
+    全部片段都为空时默认返回 None（不筛）。这与库层 sources=[]（筛完什么都不剩，
+    返回空集）是两种语义：[] 只能由代码显式传入，HTTP 层永远不会产生它。
+
+    /v1/articles 的 category/industry 需要保留「空串=筛一个不存在的值」的既有
+    语义（见 test_empty_category_filter_returns_empty_not_everything），因此调用方
+    传 empty_returns_none=False 时返回 []。
 
     source 与 category 共用本函数：两者都是前端的多选控件，用户看不出区别，
     只支持其中一种写法会让「站点多选生效、大类多选静默失效」。
@@ -56,7 +71,105 @@ def _split_multi(values: list[str] | None) -> list[str] | None:
             if name and name not in seen:
                 seen.add(name)
                 out.append(name)
-    return out or None
+    return out or (None if empty_returns_none else [])
+
+
+# 留痕写连接自己的锁等待上限（毫秒）。
+#
+# 检索路径上不允许排队：db.connect 的 busy_timeout 是 30000ms，8 worker 抢写锁时
+# 一次检索最坏能挂 30 秒。留痕是可丢的附加信息，宁可快速失败也不要占住请求。
+_RECORD_SEARCH_BUSY_TIMEOUT_MS = 200
+
+
+def _record_search_quietly(
+    settings: Settings, *, user_id: int, query: str, result_count: int
+) -> int | None:
+    """在独立连接上记录搜索留痕，任何失败都不影响已经算好的检索结果。
+
+    三条硬要求：
+
+    1. **检索不能因为留痕失败而失败**。留痕是附加信息，最坏情况是历史里少一条。
+    2. **只读部署要能跑**。库文件只读挂载或 PRAGMA query_only 时，写操作必然报
+       "attempt to write a readonly database"；这是部署形态的既定差异，不是错误，
+       所以降级成 DEBUG 而不是 ERROR。
+    3. **检索不能被留痕拖慢**。这点换了连接也解决不了：写仍然是写，排队等待的
+       时间照样算在响应时间里（实测外部持写锁 2s 时，请求延迟就从 0.046s 变成
+       2.10s）。所以这里把 busy_timeout 压到 200ms —— 抢不到锁就放弃这一次留痕，
+       把「排队 30 秒」换成「最多多等 0.2 秒」。
+
+       为什么不放到响应之后（BackgroundTasks）：meta.search_history_id 是这次留痕
+       记录的 id，前端点结果时要用它回填 clicked_article_id 做归因。改成后台执行后
+       响应里只能给 null，归因链路直接断掉。0.2s 的上界是这两者之间能接受的折中；
+       真要彻底移出请求路径，得把契约改成「先返回 null，再由前端补一次
+       POST /v1/me/search-history」，那是另一个决定，不在本次范围。
+
+    其余异常是真问题（磁盘满、schema 缺列），保留 warning 并带异常类型。
+
+    注意 fail-fast 的代价：高并发写锁争用下会丢部分留痕记录。这是刻意的取舍，
+    历史列表少两条比检索 p99 涨 30 秒好。
+    """
+    conn: sqlite3.Connection | None = None
+    try:
+        # db.connect 也必须在 try 里：db.py:351 会 mkdir 父目录、:363 会
+        # PRAGMA journal_mode=WAL（写操作）。库只读且原本不是 WAL 时，这两步都会抛
+        # "attempt to write a readonly database" —— 放在 try 外面就等于只读部署下
+        # 每次检索都 500，而「只读部署能跑」正是这个函数存在的理由之一。
+        conn = db.connect(settings.db_path)
+        conn.execute(f"PRAGMA busy_timeout={_RECORD_SEARCH_BUSY_TIMEOUT_MS}")
+        return accounts.record_search(
+            conn, user_id=user_id, query=query, result_count=result_count
+        )
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "readonly" in message or "read-only" in message:
+            LOG.debug("只读数据库，跳过搜索留痕：%s", exc)
+        elif "locked" in message or "busy" in message:
+            # 拿不到写锁：这一次留痕直接放弃，不重试（重试会把延迟又还回去）。
+            LOG.debug("写锁繁忙，跳过本次搜索留痕：%s", exc)
+        else:
+            LOG.warning("记录搜索历史失败（%s）：%s", type(exc).__name__, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - 留痕失败绝不能冒泡成 500
+        LOG.warning("记录搜索历史失败（%s）：%s", type(exc).__name__, exc)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# 写端点的锁等待上限（毫秒）。理由同 _RECORD_SEARCH_BUSY_TIMEOUT_MS：8 个 worker
+# 抢同一把 SQLite 写锁，默认 busy_timeout=30000 会让请求干等 30 秒再收到一个语义
+# 错误的 500。写端点拿不到锁就该快速失败并明确告诉客户端「稍后重试」。
+_WRITE_BUSY_TIMEOUT_MS = 3000
+
+
+def _write_conn(settings: Settings) -> sqlite3.Connection:
+    """写端点专用连接：把 busy_timeout 从 30s 压到 3s，失败快、语义清楚。"""
+    conn = db.connect(settings.db_path)
+    conn.execute(f"PRAGMA busy_timeout={_WRITE_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def _write_failure(exc: sqlite3.OperationalError) -> HTTPException | None:
+    """把写端点的 OperationalError 映射成有意义的 HTTP 状态。
+
+    返回 None 表示「这不是可预期的部署/并发问题」，调用方应原样抛出（500）。
+    只读部署返回 503 而不是 500：服务本身是健康的，是这个实例不接受写入。
+    """
+    message = str(exc).lower()
+    if "readonly" in message or "read-only" in message:
+        return HTTPException(
+            status_code=503,
+            detail="当前实例以只读方式运行，暂不支持写入",
+            headers={"Retry-After": "60"},
+        )
+    if "locked" in message or "busy" in message:
+        return HTTPException(
+            status_code=503,
+            detail="数据库繁忙，请稍后重试",
+            headers={"Retry-After": "1"},
+        )
+    return None
 
 
 class AnalyzeJobRequest(BaseModel):
@@ -84,12 +197,102 @@ class ChecklistGenerateRequest(BaseModel):
     force: bool = False
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=1, max_length=200)
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=64)
+    department: str | None = Field(default=None, max_length=64)
+
+
+class FavoriteRequest(BaseModel):
+    article_id: str = Field(min_length=1, max_length=128)
+
+
+class HistoryRequest(BaseModel):
+    article_id: str = Field(min_length=1, max_length=128)
+
+
+class SearchHistoryRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=100, pattern=r"\S")
+    result_count: int = Field(default=0, ge=0, le=100000)
+
+
+class SearchHistoryClickRequest(BaseModel):
+    article_id: str = Field(min_length=1, max_length=128)
+
+
+class PreferencesRequest(BaseModel):
+    industries: list[str] = Field(default_factory=list, max_length=20)
+    push_enabled: bool = True
+    digest_time: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
+
+
+class AdminUserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str | None = Field(default=None, max_length=200)
+    display_name: str = Field(default="", max_length=64)
+    department: str = Field(default="", max_length=64)
+    role: Literal["admin", "user"] = "user"
+    must_change_password: bool = True
+
+
+class AdminUserUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=64)
+    department: str | None = Field(default=None, max_length=64)
+    role: Literal["admin", "user"] | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+class AdminSiteCreate(BaseModel):
+    # 与 news_api/models.py 的 SiteConfigCreate 保持同一组上限：本层先拒掉
+    # 明显超长的输入，避免把 422 留到上游才暴露（两套上限不一致时前端很难判断
+    # 究竟是哪一层拒绝的）。
+    name: str = Field(min_length=1, max_length=100)
+    list_url: str = Field(min_length=1, max_length=2048)
+    category: str = Field(default="", max_length=50)
+    region: str = Field(default="", max_length=100)
+    timezone: str = Field(default="Asia/Shanghai", max_length=100)
+    enabled: bool = True
+    render: bool = False
+    item_xpath: str = Field(default="//li", max_length=1000)
+    title_xpath: str = Field(default=".//a", max_length=1000)
+    url_xpath: str = Field(default=".//a/@href", max_length=1000)
+    date_xpath: str = Field(default="", max_length=1000)
+
+
+class AdminSiteUpdate(BaseModel):
+    list_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    category: str | None = Field(default=None, max_length=50)
+    region: str | None = Field(default=None, max_length=100)
+    timezone: str | None = Field(default=None, max_length=100)
+    enabled: bool | None = None
+    render: bool | None = None
+    item_xpath: str | None = Field(default=None, max_length=1000)
+    title_xpath: str | None = Field(default=None, max_length=1000)
+    url_xpath: str | None = Field(default=None, max_length=1000)
+    date_xpath: str | None = Field(default=None, max_length=1000)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     db.init_db(settings.db_path)
     LOG.info("db ready at %s", settings.db_path)
+    try:
+        admin_user = auth.bootstrap_admin(settings)
+        if admin_user:
+            LOG.info("已创建初始管理员: %s", admin_user["username"])
+    except Exception:
+        LOG.exception("初始化管理员失败（不影响服务启动）")
     manager = JobManager(settings)
     manager.start()
     app.state.jobs = manager
@@ -114,29 +317,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        """入站鉴权。NEWS_API_KEY 只管出站，与本服务的入站认证无关。"""
+        """入站鉴权：用户 Bearer 会话优先，其次服务级 API key。
+
+        无任何凭据时，只有在既未配置 API key、也未显式要求鉴权时才放行
+        （本地单机/测试兼容模式）。生产环境设置 INSIGHT_REQUIRE_AUTH=1 后，
+        除 /health、文档与 /v1/auth/login 外都必须先登录。
+        """
         s: Settings = app.state.settings
         path = request.url.path
+        request.state.user = None
+        request.state.token = ""
+        request.state.auth_kind = "anonymous"
         if path in _OPEN_PATHS or path.startswith("/docs") or path.startswith("/redoc"):
             return await call_next(request)
-        if not (s.api_key or s.require_auth):
-            return await call_next(request)  # 未配置 key 且未强制：保持开放（有 warning）
-        if not s.api_key:
-            return JSONResponse(
-                status_code=401,
-                content={"error": {"code": 401, "message": "服务要求鉴权但未配置 INSIGHT_API_KEY"}},
-            )
+        if path == "/v1/auth/login":
+            return await call_next(request)
+        token = auth.token_from_headers(request.headers)
+        if token and not (s.api_key and token == s.api_key):
+            user = auth.resolve_session(s, token)
+            if user is not None:
+                request.state.user = user
+                request.state.token = token
+                request.state.auth_kind = "user"
+                return await call_next(request)
         provided = request.headers.get("x-api-key") or ""
-        auth = request.headers.get("authorization") or ""
-        if not provided and auth.lower().startswith("bearer "):
-            provided = auth[7:].strip()
-        if provided != s.api_key:
-            return JSONResponse(
-                status_code=401,
-                content={"error": {"code": 401, "message": "API key 无效"}},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return await call_next(request)
+        if not provided and token:
+            provided = token
+        if s.api_key and provided == s.api_key:
+            request.state.auth_kind = "api_key"
+            return await call_next(request)
+        if not (s.api_key or s.require_auth):
+            return await call_next(request)
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"code": 401, "message": "未登录或登录已过期"}},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     @app.get("/health")
     def health() -> dict:
@@ -153,6 +369,693 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "llm_enabled": s.llm_enabled,
             "news_source_mode": s.news_source_mode,
             "auth_enabled": bool(s.api_key or s.require_auth),
+        }
+
+
+    def _current_user(request: Request) -> dict:
+        user = getattr(request.state, "user", None)
+        if user is None:
+            raise HTTPException(status_code=401, detail="请先登录")
+        return user
+
+    def _notification_reader(request: Request, *, write: bool = False) -> dict | None:
+        """通知的用户上下文。
+
+        已登录用户按 user_id 隔离；服务级 API key 视为受信系统调用，可读写全局。
+        无鉴权部署下匿名 GET 保持只读兼容（没有副作用），但任何写操作都必须
+        401——否则跨站页面可用无 body 的简单 POST 把所有人的通知标成已读。
+        """
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            return user
+        if getattr(request.state, "auth_kind", "") == "api_key":
+            return None
+        if write:
+            raise HTTPException(status_code=401, detail="请先登录")
+        return None
+
+    def _require_admin(request: Request) -> dict | None:
+        """管理员接口：允许服务级 API key，或 role=admin 的登录用户。"""
+        if getattr(request.state, "auth_kind", "") == "api_key":
+            return None
+        user = _current_user(request)
+        if user.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="需要管理员权限")
+        return user
+
+    def _require_operator(request: Request) -> None:
+        """触发分析/作业等写操作：API key 或管理员；本地无鉴权模式保持开放。"""
+        if getattr(request.state, "auth_kind", "") == "api_key":
+            return
+        user = getattr(request.state, "user", None)
+        if user is not None and user.get("role") == "admin":
+            return
+        s: Settings = app.state.settings
+        if not (s.api_key or s.require_auth):
+            return
+        raise HTTPException(
+            status_code=401 if user is None else 403,
+            detail="请先登录" if user is None else "需要管理员权限",
+        )
+
+    def _client_ip(request: Request) -> str:
+        return request.client.host if request.client is not None else ""
+
+    def _upstream_status(exc: UpstreamError, *, default: int = 502) -> int:
+        """把爬虫的 4xx 原样传回，只有网络/5xx 才折成 502。
+
+        管理台需要看到「名字重复（409）/字段不合法（422）」这类可修正的错误；
+        全部折成 502 会让前端只能提示「服务不可用」，用户不知道该改什么。
+        """
+        code = exc.status_code or 0
+        if code in (400, 404, 409, 422):
+            return code
+        return default
+
+    def _audit(
+        request: Request,
+        conn,
+        action: str,
+        *,
+        target: str = "",
+        detail: str = "",
+    ) -> None:
+        user = getattr(request.state, "user", None) or {}
+        kind = getattr(request.state, "auth_kind", "anonymous")
+        accounts.log_operation(
+            conn,
+            user_id=user.get("id"),
+            username=user.get("username") or ("service" if kind == "api_key" else "anonymous"),
+            action=action,
+            target=target,
+            detail=detail,
+            ip=_client_ip(request),
+            commit=False,
+        )
+
+    # ------------------------------------------------------------------ auth
+    @app.post("/v1/auth/login")
+    def login(payload: LoginRequest, request: Request) -> dict:
+        s: Settings = app.state.settings
+        conn = _write_conn(s)
+        try:
+            user = accounts.get_user_by_username(conn, payload.username.strip())
+            if user is None:
+                accounts.log_operation(
+                    conn,
+                    user_id=None,
+                    username=payload.username.strip()[:64],
+                    action="auth.login_failed",
+                    detail="unknown username",
+                    ip=_client_ip(request),
+                )
+                raise HTTPException(status_code=401, detail="用户名或密码错误")
+            if user.get("status") != "active":
+                raise HTTPException(status_code=403, detail="账号已被禁用，请联系管理员")
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            locked_until = user.get("locked_until")
+            if locked_until and str(locked_until) > now:
+                raise HTTPException(
+                    status_code=423,
+                    detail=f"账号已锁定，请于 {locked_until} 后再试",
+                )
+            if not auth.verify_password(
+                payload.password,
+                salt=str(user["password_salt"]),
+                expected_hash=str(user["password_hash"]),
+                iterations=int(user["password_iterations"]),
+            ):
+                attempts, locked = accounts.record_login_failure(
+                    conn,
+                    int(user["id"]),
+                    max_attempts=LOGIN_MAX_ATTEMPTS,
+                    lock_minutes=LOGIN_LOCK_MINUTES,
+                )
+                accounts.log_operation(
+                    conn,
+                    user_id=int(user["id"]),
+                    username=str(user["username"]),
+                    action="auth.login_failed",
+                    detail=f"attempt={attempts}",
+                )
+                if locked:
+                    raise HTTPException(
+                        status_code=423,
+                        detail=f"连续 {LOGIN_MAX_ATTEMPTS} 次密码错误，账号已锁定 {LOGIN_LOCK_MINUTES} 分钟",
+                    )
+                remaining = max(0, LOGIN_MAX_ATTEMPTS - attempts)
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"用户名或密码错误，还可尝试 {remaining} 次",
+                )
+            accounts.record_login_success(conn, int(user["id"]))
+            token, expires_at = auth.issue_session(s, conn, int(user["id"]))
+            accounts.log_operation(
+                conn,
+                user_id=int(user["id"]),
+                username=str(user["username"]),
+                action="auth.login",
+            )
+            return {
+                "data": {
+                    "token": token,
+                    "expires_at": expires_at,
+                    "user": accounts.public_user(user),
+                }
+            }
+        finally:
+            conn.close()
+
+    @app.get("/v1/auth/me")
+    def auth_me(request: Request) -> dict:
+        return {"data": accounts.public_user(_current_user(request))}
+
+    @app.post("/v1/auth/logout")
+    def auth_logout(request: Request) -> dict:
+        s: Settings = app.state.settings
+        token = getattr(request.state, "token", "")
+        if token:
+            try:
+                auth.revoke_token(s, token)
+            except sqlite3.OperationalError as exc:
+                mapped = _write_failure(exc)
+                if mapped is None:
+                    raise
+                raise mapped from exc
+        return {"data": {"logged_out": True}}
+
+    @app.post("/v1/auth/password")
+    def auth_change_password(payload: PasswordChangeRequest, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        if payload.current_password == payload.new_password:
+            raise HTTPException(status_code=400, detail="新密码不能与原密码相同")
+        policy_error = auth.password_policy_error(payload.new_password)
+        if policy_error:
+            raise HTTPException(status_code=400, detail=policy_error)
+        conn = _write_conn(s)
+        try:
+            fresh = accounts.get_user(conn, int(user["id"]), include_secret=True)
+            if fresh is None:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            if not auth.verify_password(
+                payload.current_password,
+                salt=str(fresh["password_salt"]),
+                expected_hash=str(fresh["password_hash"]),
+                iterations=int(fresh["password_iterations"]),
+            ):
+                raise HTTPException(status_code=400, detail="原密码不正确")
+            digest, salt, iterations = auth.hash_password(payload.new_password)
+            accounts.update_user_password(
+                conn,
+                int(user["id"]),
+                password_hash=digest,
+                password_salt=salt,
+                password_iterations=iterations,
+                must_change_password=False,
+            )
+            token = getattr(request.state, "token", "")
+            if token:
+                token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+                accounts.revoke_user_sessions(
+                    conn, int(user["id"]), except_token_hash=token_hash
+                )
+            _audit(request, conn, "auth.password_change", target=str(user["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": {"changed": True}}
+
+    # ------------------------------------------------------------ personal
+    @app.patch("/v1/me/profile")
+    def update_profile(payload: ProfileUpdateRequest, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            updated = accounts.update_user(
+                conn,
+                int(user["id"]),
+                display_name=payload.display_name,
+                department=payload.department,
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            _audit(request, conn, "profile.update", target=str(user["id"]))
+            conn.commit()
+            return {"data": accounts.public_user(updated)}
+        finally:
+            conn.close()
+
+    @app.get("/v1/me/favorites")
+    def my_favorites(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = connect(s)
+        try:
+            items, total = accounts.list_favorites(
+                conn, user_id=int(user["id"]), limit=limit, offset=offset
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {"total": total, "returned": len(items), "limit": limit, "offset": offset},
+        }
+
+    @app.post("/v1/me/favorites")
+    def add_my_favorite(payload: FavoriteRequest, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            if db.get_article(conn, payload.article_id) is None:
+                raise HTTPException(status_code=404, detail="未找到该文章")
+            created = accounts.add_favorite(
+                conn, user_id=int(user["id"]), article_id=payload.article_id
+            )
+            _audit(request, conn, "favorite.add", target=payload.article_id)
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": {"article_id": payload.article_id, "favorite": True, "created": created}}
+
+    @app.delete("/v1/me/favorites/{article_id}")
+    def delete_my_favorite(article_id: str, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            removed = accounts.remove_favorite(
+                conn, user_id=int(user["id"]), article_id=article_id
+            )
+            _audit(request, conn, "favorite.remove", target=article_id)
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": {"article_id": article_id, "favorite": False, "removed": removed}}
+
+    @app.get("/v1/me/history")
+    def my_history(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = connect(s)
+        try:
+            items, total = accounts.list_history(
+                conn, user_id=int(user["id"]), limit=limit, offset=offset
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {"total": total, "returned": len(items), "limit": limit, "offset": offset},
+        }
+
+    @app.post("/v1/me/history")
+    def record_my_history(payload: HistoryRequest, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            if db.get_article(conn, payload.article_id) is None:
+                raise HTTPException(status_code=404, detail="未找到该文章")
+            accounts.record_history(
+                conn, user_id=int(user["id"]), article_id=payload.article_id
+            )
+        finally:
+            conn.close()
+        return {"data": {"article_id": payload.article_id, "recorded": True}}
+
+    @app.delete("/v1/me/history")
+    def clear_my_history(request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            cleared = accounts.clear_history(conn, user_id=int(user["id"]))
+        finally:
+            conn.close()
+        return {"data": {"cleared": cleared}}
+
+    @app.get("/v1/me/search-history")
+    def my_search_history(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = connect(s)
+        try:
+            items, total = accounts.list_search_history(
+                conn, user_id=int(user["id"]), limit=limit, offset=offset
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {"total": total, "returned": len(items), "limit": limit, "offset": offset},
+        }
+
+    @app.post("/v1/me/search-history")
+    def record_my_search(payload: SearchHistoryRequest, request: Request) -> dict:
+        """显式记录一次搜索（前端离线/补录用）；/v1/search 也会自动记录。
+
+        写锁/只读的错误映射统一由 create_app 里的 OperationalError 处理器负责
+        （503 + Retry-After），这里不再逐个路由复制 try/except。连接自己把
+        busy_timeout 压到 _WRITE_BUSY_TIMEOUT_MS，拿不到锁最多等 3 秒而不是 30 秒。
+        """
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            history_id = accounts.record_search(
+                conn,
+                user_id=int(user["id"]),
+                query=payload.query,
+                result_count=payload.result_count,
+            )
+        finally:
+            conn.close()
+        return {"data": {"id": history_id, "recorded": True}}
+
+    @app.post("/v1/me/search-history/{history_id}/click")
+    def click_search_result(
+        history_id: int, payload: SearchHistoryClickRequest, request: Request
+    ) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            if db.get_article(conn, payload.article_id) is None:
+                raise HTTPException(status_code=404, detail="未找到该文章")
+            updated = accounts.mark_search_click(
+                conn,
+                user_id=int(user["id"]),
+                history_id=history_id,
+                article_id=payload.article_id,
+            )
+        finally:
+            conn.close()
+        if not updated:
+            raise HTTPException(status_code=404, detail="未找到该搜索记录")
+        return {"data": {"id": history_id, "article_id": payload.article_id, "clicked": True}}
+
+    @app.delete("/v1/me/search-history/{history_id}")
+    def delete_my_search_history(history_id: int, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            removed = accounts.delete_search_history(
+                conn, user_id=int(user["id"]), history_id=history_id
+            )
+        finally:
+            conn.close()
+        return {"data": {"id": history_id, "removed": removed}}
+
+    @app.delete("/v1/me/search-history")
+    def clear_my_search_history(request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = _write_conn(s)
+        try:
+            cleared = accounts.clear_search_history(conn, user_id=int(user["id"]))
+        finally:
+            conn.close()
+        return {"data": {"cleared": cleared}}
+
+    @app.get("/v1/me/preferences")
+    def my_preferences(request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        conn = connect(s)
+        try:
+            prefs = accounts.get_preferences(conn, int(user["id"]))
+        finally:
+            conn.close()
+        return {"data": prefs}
+
+    @app.put("/v1/me/preferences")
+    def save_my_preferences(payload: PreferencesRequest, request: Request) -> dict:
+        s: Settings = app.state.settings
+        user = _current_user(request)
+        if not (0 <= int(payload.digest_time[:2]) <= 23 and 0 <= int(payload.digest_time[3:]) <= 59):
+            raise HTTPException(status_code=400, detail="推送时间格式不正确")
+        conn = _write_conn(s)
+        try:
+            prefs = accounts.save_preferences(
+                conn,
+                int(user["id"]),
+                industries=[x.strip() for x in payload.industries if x.strip()],
+                push_enabled=payload.push_enabled,
+                digest_time=payload.digest_time,
+            )
+            _audit(request, conn, "preferences.update", target=str(user["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": prefs}
+
+    # --------------------------------------------------------------- admin
+    @app.get("/v1/admin/users")
+    def admin_users(
+        request: Request,
+        q: str = Query(default="", max_length=64),
+        role: str = Query(default="", max_length=16),
+        status: str = Query(default="", max_length=16),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            items, total = accounts.list_users(
+                conn, q=q, role=role, status=status, limit=limit, offset=offset
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {"total": total, "returned": len(items), "limit": limit, "offset": offset},
+        }
+
+    @app.post("/v1/admin/users")
+    def admin_create_user(payload: AdminUserCreate, request: Request) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        username = payload.username.strip()
+        temporary_password = None
+        password = payload.password
+        if not password:
+            temporary_password = auth.generate_temp_password()
+            password = temporary_password
+        else:
+            policy_error = auth.password_policy_error(password)
+            if policy_error:
+                raise HTTPException(status_code=400, detail=policy_error)
+        conn = _write_conn(s)
+        try:
+            user = auth.create_user(
+                conn,
+                username=username,
+                password=password,
+                display_name=payload.display_name,
+                department=payload.department,
+                role=payload.role,
+                must_change_password=payload.must_change_password if not temporary_password else True,
+            )
+            _audit(request, conn, "admin.user_create", target=username, detail=f"role={payload.role}")
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="用户名已存在") from None
+        finally:
+            conn.close()
+        data = dict(user)
+        if temporary_password:
+            data["temporary_password"] = temporary_password
+        return {"data": data}
+
+    @app.patch("/v1/admin/users/{user_id}")
+    def admin_update_user(user_id: int, payload: AdminUserUpdate, request: Request) -> dict:
+        admin = _require_admin(request)
+        s: Settings = app.state.settings
+        if admin is not None and int(admin["id"]) == user_id:
+            if payload.status == "disabled" or payload.role == "user":
+                raise HTTPException(status_code=400, detail="不能禁用或降级当前登录的管理员")
+        conn = _write_conn(s)
+        try:
+            updated = accounts.update_user(
+                conn,
+                user_id,
+                display_name=payload.display_name,
+                department=payload.department,
+                role=payload.role,
+                status=payload.status,
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            if payload.status == "disabled":
+                accounts.revoke_user_sessions(conn, user_id)
+            _audit(request, conn, "admin.user_update", target=str(user_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": updated}
+
+    @app.post("/v1/admin/users/{user_id}/reset-password")
+    def admin_reset_password(user_id: int, request: Request) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        conn = _write_conn(s)
+        try:
+            user = accounts.get_user(conn, user_id)
+            if user is None:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            temp = auth.generate_temp_password()
+            digest, salt, iterations = auth.hash_password(temp)
+            accounts.update_user_password(
+                conn,
+                user_id,
+                password_hash=digest,
+                password_salt=salt,
+                password_iterations=iterations,
+                must_change_password=True,
+            )
+            accounts.revoke_user_sessions(conn, user_id)
+            _audit(request, conn, "admin.user_reset_password", target=str(user_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": {"user_id": user_id, "temporary_password": temp}}
+
+    # 站点配置的唯一真相是 crawler 的 sources.local.json。管理台不再维护一份
+    # 只有六个字段的本地 sites 表（那份表既不参与抓取，也无法表达 XPath），
+    # 而是通过新闻 API 的 /v1/admin/sites 代理读写。
+    @app.get("/v1/admin/sites")
+    def admin_sites(request: Request) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        client = NewsClient(s)
+        try:
+            items = client.list_sites()
+        except UpstreamError as exc:
+            raise HTTPException(
+                status_code=_upstream_status(exc), detail=f"读取爬虫站点配置失败: {exc}"
+            ) from exc
+        finally:
+            client.close()
+        return {"data": items, "meta": {"total": len(items), "source": "crawler"}}
+
+    @app.post("/v1/admin/sites", status_code=201)
+    def admin_create_site(payload: AdminSiteCreate, request: Request) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        values = payload.model_dump()
+        client = NewsClient(s)
+        try:
+            site = client.create_site(values)
+        except UpstreamError as exc:
+            raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
+        finally:
+            client.close()
+        conn = _write_conn(s)
+        try:
+            _audit(request, conn, "admin.site_create", target=payload.name)
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": site}
+
+    @app.patch("/v1/admin/sites/{name}")
+    def admin_update_site(name: str, payload: AdminSiteUpdate, request: Request) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        values = payload.model_dump(exclude_none=True)
+        client = NewsClient(s)
+        try:
+            site = client.update_site(name, values)
+        except UpstreamError as exc:
+            raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
+        finally:
+            client.close()
+        conn = _write_conn(s)
+        try:
+            _audit(request, conn, "admin.site_update", target=name)
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": site}
+
+    @app.delete("/v1/admin/sites/{name}")
+    def admin_delete_site(name: str, request: Request) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        client = NewsClient(s)
+        try:
+            client.delete_site(name)
+        except UpstreamError as exc:
+            raise HTTPException(status_code=_upstream_status(exc), detail=str(exc)) from exc
+        finally:
+            client.close()
+        conn = _write_conn(s)
+        try:
+            _audit(request, conn, "admin.site_delete", target=name)
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": {"name": name, "deleted": True}}
+
+    @app.get("/v1/admin/stats")
+    def admin_stats(
+        request: Request, days: int = Query(default=7, ge=1, le=90)
+    ) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            summary = accounts.admin_summary(conn, days=days)
+        finally:
+            conn.close()
+        return {"data": summary}
+
+    @app.get("/v1/admin/operation-logs")
+    def admin_operation_logs(
+        request: Request,
+        action: str = Query(default="", max_length=64),
+        username: str = Query(default="", max_length=64),
+        date_from: str = Query(default="", max_length=10),
+        date_to: str = Query(default="", max_length=10),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        _require_admin(request)
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            items, total = accounts.list_operation_logs(
+                conn,
+                action=action,
+                username=username,
+                date_from=date_from,
+                date_to=date_to,
+                limit=limit,
+                offset=offset,
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {"total": total, "returned": len(items), "limit": limit, "offset": offset},
         }
 
     @app.get("/v1/categories")
@@ -185,6 +1088,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"data": db.category_stats(conn)}
         finally:
             conn.close()
+
+    @app.get("/v1/industries")
+    def industries() -> dict:
+        s: Settings = app.state.settings
+        payload, items = load_industries(s.vocab_dir)
+        conn = connect(s)
+        try:
+            stats = {row["industry"]: row for row in db.industry_stats(conn)}
+        finally:
+            conn.close()
+        data = [
+            {
+                "id": item.id,
+                "name": item.name,
+                "description": item.description,
+                "keywords": list(item.keywords),
+                "article_count": stats.get(item.id, {}).get("count", 0),
+            }
+            for item in items
+        ]
+        return {"data": data, "meta": {"total": len(data), "vocab_version": payload.get("version")}}
 
     # 路径与上游 news-crawler 的 GET /v1/sources（来源统计）保持一致，
     # 前端两个服务共用一个 api 层时不必记两套命名。
@@ -237,14 +1161,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/v1/analyze")
     def analyze(
+        request: Request,
         limit: int = Query(default=10, ge=1, le=50),
         force: bool = Query(default=False),
     ) -> dict:
+        _require_operator(request)
         s: Settings = app.state.settings
         if not ANALYZE_LOCK.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="已有分析或清单生成任务在运行，请稍后再试")
         try:
             result = analyze_batch(s, limit=limit, force=force)
+        except sqlite3.OperationalError as exc:
+            # 只读/繁忙是部署与并发语义，不是「分析失败」：502 会让客户端以为上游
+            # 挂了并重试整批。放在通用分支之前，才能被映射成 503 + Retry-After。
+            mapped = _write_failure(exc)
+            if mapped is None:
+                LOG.exception("分析失败")
+                raise HTTPException(
+                    status_code=502, detail=f"分析失败，内部错误: {type(exc).__name__}"
+                ) from exc
+            LOG.warning("分析因数据库状态失败：%s", exc)
+            raise mapped from exc
         except Exception as exc:
             # 不要把上游/LLM 响应体回传给调用方（可能含内部地址与提示词）
             LOG.exception("分析失败")
@@ -260,14 +1197,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/articles")
     def articles(
+        request: Request,
         tag: str | None = Query(default=None),
-        category: str | None = Query(default=None),
+        category: Annotated[
+            list[str] | None, Query(description="只在这些大类里筛选，可重复或逗号分隔")
+        ] = None,
+        industry: Annotated[
+            list[str] | None, Query(description="只在这些行业里筛选，可重复或逗号分隔")
+        ] = None,
         source: Annotated[list[str] | None, Query(description="只在这些站点里筛选")] = None,
         published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
         published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
-        sort: str = Query(default="published_desc", description="排序键"),
+        min_relevance: float | None = Query(default=None, ge=0, le=1, description="最低文章语义相关性 0-1"),
+        sort: str = Query(default="published_desc", description="排序键，支持 relevance_desc/asc（个性化）与 relevance_score_desc/asc（语义）"),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
+        include_highlights: bool = Query(
+            default=False, description="高相关文章附带要素摘要（≥80 分才返回）"
+        ),
     ) -> dict:
         s: Settings = app.state.settings
         try:
@@ -279,17 +1226,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=f"未知排序: {sort}")
         conn = connect(s)
         try:
-            rows, total, undated = db.list_analyzed(
-                conn,
-                tag=tag,
-                category=category,
-                sources=_split_multi(source),
-                published_from=since,
-                published_to=until,
-                sort=sort,
-                limit=limit,
-                offset=offset,
-            )
+            user = getattr(request.state, "user", None)
+            profile = recommend.build_profile(conn, int(user["id"])) if user else None
+            # 相关度排序必须在 Python 侧用用户画像算完：分页之前就要全量排序，
+            # 否则只能对当前页排序，翻页会看到乱序。当前库 480 篇，用 2000 的
+            # 候选上限足够；达到上限时 total 仍来自 SQL，界面会显示真实总数。
+            if sort in ("relevance_desc", "relevance_asc"):
+                if offset + limit > RELEVANCE_CANDIDATE_LIMIT:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"相关度排序最多支持前 {RELEVANCE_CANDIDATE_LIMIT} 条，"
+                            "请缩小筛选范围或改用发布时间排序"
+                        ),
+                    )
+                rows, total, undated = db.list_analyzed(
+                    conn,
+                    tag=tag,
+                    category=_split_multi(category, empty_returns_none=False),
+                    industry=_split_multi(industry, empty_returns_none=False),
+                    sources=_split_multi(source),
+                    published_from=since,
+                    published_to=until,
+                    min_relevance=min_relevance,
+                    sort="published_desc",
+                    limit=RELEVANCE_CANDIDATE_LIMIT,
+                    offset=0,
+                )
+                recommend.annotate_rows(rows, profile)
+                rows.sort(
+                    key=lambda item: (
+                        float(item.get("relevance") or 0.0),
+                        item.get("article_id", ""),
+                    ),
+                    reverse=(sort == "relevance_desc"),
+                )
+                rows = rows[offset : offset + limit]
+            else:
+                rows, total, undated = db.list_analyzed(
+                    conn,
+                    tag=tag,
+                    # 列表端点保留「空串=筛一个不存在的类」的既有语义；非空值统一
+                    # 支持重复参数与逗号分隔，和 /v1/search 的多选控件行为对齐。
+                    category=_split_multi(category, empty_returns_none=False),
+                    industry=_split_multi(industry, empty_returns_none=False),
+                    sources=_split_multi(source),
+                    published_from=since,
+                    published_to=until,
+                    min_relevance=min_relevance,
+                    sort=sort,
+                    limit=limit,
+                    offset=offset,
+                )
+                recommend.annotate_rows(rows, profile)
+            if include_highlights:
+                db.attach_highlights(conn, rows)
         finally:
             conn.close()
         return {
@@ -305,8 +1296,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         }
 
+    @app.get("/v1/recommendations")
+    def recommendations(
+        request: Request,
+        limit: int = Query(default=10, ge=1, le=50),
+    ) -> dict:
+        """首页推荐：登录用户按画像排序，匿名用户按内容质量排序。"""
+        s: Settings = app.state.settings
+        user = getattr(request.state, "user", None)
+        conn = connect(s)
+        try:
+            items = recommend.recommendations(
+                conn, user_id=int(user["id"]) if user else None, limit=limit
+            )
+        finally:
+            conn.close()
+        return {
+            "data": items,
+            "meta": {
+                "total": len(items),
+                "limit": limit,
+                "personalized": bool(user),
+            },
+        }
+
+    @app.get("/v1/todos")
+    def todos(limit: int = Query(default=5, ge=1, le=50)) -> dict:
+        """首页待办：项目申报类公告中尚未到期的截止日期，按日期升序。"""
+        s: Settings = app.state.settings
+        conn = connect(s)
+        try:
+            items = recommend.upcoming_deadlines(conn, limit=limit)
+            total = recommend.count_upcoming_deadlines(conn)
+        finally:
+            conn.close()
+        return {"data": items, "meta": {"total": total, "limit": limit}}
+
     @app.get("/v1/search")
     def search_articles(
+        request: Request,
         # pattern 要求至少一个非空白字符：q="" 会因 min_length 变成 422，但 q=" "
         # 能绕过它，进 resolve_query 后被 strip 成空、返回 200 空 groups —— 同一件事
         # 两种响应码，前端得写两条分支。这里让纯空白也在参数校验阶段被拒。
@@ -317,9 +1345,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         category: Annotated[
             list[str] | None, Query(description="只在这些大类里检索")
         ] = None,
+        industry: Annotated[
+            list[str] | None, Query(description="只在这些行业里检索")
+        ] = None,
         source: Annotated[list[str] | None, Query(description="只在这些站点里检索")] = None,
         published_from: str | None = Query(default=None, description="发布日期下限 YYYY-MM-DD"),
         published_to: str | None = Query(default=None, description="发布日期上限 YYYY-MM-DD（含当天）"),
+        min_relevance: float | None = Query(default=None, ge=0, le=1, description="最低文章语义相关性 0-1"),
         sort: str = Query(default="relevance", description="类内排序：relevance/published_desc/published_asc"),
         per_category: int = Query(default=20, ge=1, le=100, description="每个大类返回多少条"),
         include_body: bool = Query(default=False, description="是否返回正文（默认不返回，节省带宽）"),
@@ -342,6 +1374,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _, tags = load_vocab(s.vocab_dir)
         _, categories = load_categories(s.vocab_dir)
         conn = connect(s)
+        history_id: int | None = None
         try:
             result = db.search_grouped(
                 conn,
@@ -355,23 +1388,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # 无结果」，所以 _split_multi 收尾返回 None（不传），否则 ?category= 反而
                 # 返回空集。逗号写法（?category=a,b）同样拆开，理由见 _split_multi。
                 categories=_split_multi(category),
+                industries=_split_multi(industry),
                 sources=sources,
                 published_from=since,
                 published_to=until,
+                min_relevance=min_relevance,
                 per_category=per_category,
                 include_body=include_body,
                 sort=sort,
             )
         finally:
             conn.close()
-        return {"data": result}
+        # 登录用户的检索自动留痕：前端不用额外发一次请求，点击归因
+        # 只需拿返回的 search_history_id 回填 clicked_article_id。
+        #
+        # 留痕必须换一条独立连接，不能接着用上面那条。原来的写法在检索连接上
+        # 直接写：一次 GET 会从「读」升级成「读+写事务」，8 个 worker 抢同一把
+        # SQLite 写锁时最坏排到 busy_timeout（30s）；只读部署（库文件只读挂载）
+        # 更是每次都抛 "attempt to write a readonly database"，被日志吞掉后
+        # 变成一条没人看的 ERROR 噪声。
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            history_id = _record_search_quietly(
+                s, user_id=int(user["id"]), query=q, result_count=int(result.get("total") or 0)
+            )
+        return {"data": result, "meta": {"search_history_id": history_id}}
 
     @app.get("/v1/articles/{article_id}")
-    def article_detail(article_id: str) -> dict:
+    def article_detail(article_id: str, request: Request) -> dict:
         s: Settings = app.state.settings
         conn = connect(s)
         try:
             row = db.get_article(conn, article_id)
+            if row is not None:
+                user = getattr(request.state, "user", None)
+                if user is not None:
+                    accounts.record_history(
+                        conn, user_id=int(user["id"]), article_id=article_id
+                    )
+                    row["is_favorite"] = accounts.is_favorite(
+                        conn, user_id=int(user["id"]), article_id=article_id
+                    )
+                else:
+                    row["is_favorite"] = False
         finally:
             conn.close()
         if row is None:
@@ -421,7 +1480,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """
         s: Settings = app.state.settings
         force = bool(payload and payload.force)
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
             row = db.get_article(conn, article_id)
             existing = None if force else db.get_checklist(conn, article_id)
@@ -459,7 +1518,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             # 等锁期间可能已有别的请求生成完成；非 force 必须在持锁后复查，避免重复调用 LLM。
             if not force:
-                conn = connect(s)
+                conn = _write_conn(s)
                 try:
                     existing = db.get_checklist(conn, article_id)
                 finally:
@@ -468,7 +1527,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     return _checklist_data(row, existing)
             result = checklist_service.build_for_input(s, source)
             items = checklist_service.items_payload(result)
-            conn = connect(s)
+            conn = _write_conn(s)
             try:
                 db.save_checklist(conn, article_id=article_id, engine=result.engine, items=items)
                 checklist = db.get_checklist(conn, article_id)
@@ -482,19 +1541,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/notifications")
     def notifications(
+        request: Request,
         limit: int = Query(default=20, ge=1, le=100),
         unread_only: bool = Query(default=False),
     ) -> dict:
         """站内消息提醒：新分析出的项目申报类公告。
 
-        unread 始终是「全库未读数」，不受 unread_only 影响——铃铛角标要的是它，
-        下拉列表才需要只看未读。列表带文章跳转所需的 article_id/url。
+        unread 是「当前用户未读数」：登录用户按 notification_reads 统计，未登录只读模式
+        回退为全库未读数；它不受 unread_only 影响——铃铛角标要的是它，下拉列表才需要只看未读。
+        列表带文章跳转所需的 article_id/url。
         """
         s: Settings = app.state.settings
         conn = connect(s)
         try:
+            user = _notification_reader(request)
             items, total, unread = db.list_notifications(
-                conn, limit=limit, unread_only=unread_only
+                conn,
+                user_id=int(user["id"]) if user is not None else None,
+                limit=limit,
+                unread_only=unread_only,
             )
         finally:
             conn.close()
@@ -504,21 +1569,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/v1/notifications/read-all")
-    def notifications_read_all() -> dict:
+    def notifications_read_all(request: Request) -> dict:
         s: Settings = app.state.settings
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
-            updated = db.mark_all_notifications_read(conn)
+            user = _notification_reader(request, write=True)
+            updated = db.mark_all_notifications_read(
+                conn, user_id=int(user["id"]) if user is not None else None
+            )
         finally:
             conn.close()
         return {"data": {"updated": updated, "unread": 0}}
 
     @app.post("/v1/notifications/{notification_id}/read")
-    def notification_read(notification_id: int) -> dict:
+    def notification_read(notification_id: int, request: Request) -> dict:
         s: Settings = app.state.settings
-        conn = connect(s)
+        conn = _write_conn(s)
         try:
-            item = db.mark_notification_read(conn, notification_id)
+            user = _notification_reader(request, write=True)
+            item = db.mark_notification_read(
+                conn,
+                notification_id,
+                user_id=int(user["id"]) if user is not None else None,
+            )
         finally:
             conn.close()
         if item is None:
@@ -566,8 +1639,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             conn.close()
 
     @app.post("/v1/jobs")
-    def create_job(body: AnalyzeJobRequest):
+    def create_job(body: AnalyzeJobRequest, request: Request):
         """Submit an async analysis batch. Same payload while queued/running reuses the job."""
+        _require_operator(request)
         jobs: JobManager = app.state.jobs
         try:
             job = jobs.submit(limit=body.limit, force=body.force, concurrency=body.concurrency)
@@ -614,11 +1688,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
+    @app.exception_handler(sqlite3.OperationalError)
+    async def sqlite_op_error_handler(request: Request, exc: sqlite3.OperationalError):
+        """兜底映射：任何漏掉显式处理的写端点也不该把「库忙/库只读」变成 500。
+
+        逐路由复制 try/except 一定会漏（新增端点、被 accounts/db 内部再次抛出的
+        路径）。这里按错误性质统一给 503 + Retry-After：客户端能区分「等一会儿
+        重试」和「服务挂了」，日志里也留了完整类型与消息。
+        """
+        mapped = _write_failure(exc)
+        if mapped is None:
+            LOG.error("数据库操作失败：%s", exc, exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": 500, "message": "数据库操作失败"}},
+            )
+        return JSONResponse(
+            status_code=mapped.status_code,
+            content={"error": {"code": mapped.status_code, "message": mapped.detail}},
+            headers=getattr(mapped, "headers", None),
+        )
+
     @app.exception_handler(HTTPException)
     async def http_exc_handler(request, exc: HTTPException):
+        # headers 必须透传：503 + Retry-After 里，Retry-After 只存在于 exc.headers，
+        # 不带给客户端的话「稍后重试」这个语义就丢了，客户端只能硬撞。
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"code": exc.status_code, "message": exc.detail}},
+            headers=getattr(exc, "headers", None),
         )
 
     return app

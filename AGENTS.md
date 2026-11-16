@@ -56,7 +56,7 @@
 | LLM | 任意 OpenAI 兼容 `/chat/completions` | `response_format={"type":"json_object"}`，返回 JSON |
 | 打包 | hatchling + pyproject.toml | `pip install .`，可选 `[dev]` / `[yaml]` |
 | 代码质量 | ruff + mypy | 规则与版本固定在 `pyproject.toml`，与 CI 一致 |
-| 测试 | pytest | `tests/` 下 12 个测试文件 |
+| 测试 | pytest | `tests/` 下 23 个测试文件 |
 | CI | GitHub Actions | `ci.yml`：python 3.10–3.14、yaml lint、docker build + container smoke |
 | 部署 | Docker / Docker Compose | 镜像 `news-insight:0.1.0`，容器内 uid 10001 |
 
@@ -88,7 +88,9 @@ news-insight/
 │   ├── checklist.py           # 申报准备清单（派生视图，LLM + 规则降级）
 │   ├── checklist_service.py   # 清单输入适配与生成服务（API 与 pipeline 共用）
 │   ├── pipeline.py            # 单批次编排：拉取 → 并发分析 → 主线程批量落库
-│   ├── jobs.py                # 进程内异步作业 JobManager + ANALYZE_LOCK
+│   ├── relevance.py           # 文章级语义相关性评分（独立 LLM 调用 + 规则降级）
+│   ├── lockfile.py            # 跨进程文件锁（ANALYZE_LOCK 的实现）
+│   ├── jobs.py                # 进程内异步作业 JobManager + 跨进程 ANALYZE_LOCK
 │   ├── prune.py               # 保留期清理（默认 90 天）
 │   ├── search.py             # 关键词检索与相关度打分（前端拿不到查询覆盖度，排序必须后端算）
 │   ├── backfill.py           # 给历史行回填正文副本（只搬文本，不重跑模型）
@@ -100,7 +102,7 @@ news-insight/
 │       └── schemas/
 │           └── project_application.json   # 申报关键线索 schema（9 字段）
 ├── fixtures/articles.json     # demo 模式内置 4 篇新闻
-├── tests/                     # pytest：test_*.py 共 13 个
+├── tests/                     # pytest：test_*.py 共 23 个
 ├── tools/yaml_lint.py         # CI 的 YAML 门禁脚本（拒绝重复映射键；支持多文档；不误杀 << 合并键）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -176,7 +178,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 
 ### 并发与写入模型（关键）
 
-1. **文章级并发，篇内串行**：`ANALYZE_CONCURRENCY`（默认 100，上限 200）控制同时在途的文章数；每篇文章内部依次「分大类 → 类内打标 → 每个命中 schema 各一次抽取 →（命中申报时）清单」；当前只有 1 个 schema，因此最多 4 次 LLM 调用（归到 `other` 时只有 1 次），**不合并、不省略**——质量优先。
+1. **文章级并发，篇内串行**：`ANALYZE_CONCURRENCY`（默认 100，上限 200）控制同时在途的文章数；每篇文章内部依次「受控行业 → 语义相关性 → 分大类 → 类内打标 → 每个命中 schema 各一次抽取 →（命中申报时）清单」；当前只有 1 个 schema，因此最多 6 次 LLM 调用（归到 `other` 时是行业、语义评分、分类 3 次），**不合并、不省略**——质量优先。
 2. **worker 不碰 SQLite**：`_analyze_one()` 只做网络与计算，返回 `_AnalysisResult`；所有写库由主线程 `_persist_result()` 完成。SQLite 只有一个写者，这是避免 `database is locked` 的核心约定，改并发相关代码时不得破坏。
 3. **批量提交**：`ANALYZE_WRITE_BATCH`（默认 50）篇提交一次；`save_analysis(commit=False)` 在没有外层事务时会显式 `BEGIN`，否则 SAVEPOINT 的 RELEASE 会立即提交、批量提交退化为逐篇提交。
 4. **单篇失败隔离**：入库用 SAVEPOINT，一篇失败只回滚该篇并计入 `errors`，批次继续；批次级异常会 rollback 并写 `runs.finished_at`，不留永久「运行中」的孤儿行。
@@ -192,6 +194,10 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查（无需鉴权，不回显内网地址） |
+| POST/GET | `/v1/auth/login`、`/v1/auth/me`、`/v1/auth/logout`、`/v1/auth/password` | 本地账号登录（数据库会话 Token，`Authorization: Bearer`）、查当前用户、登出、改密；密码策略≥8位且含大小写/数字/特殊字符 |
+| GET/PATCH/POST/DELETE | `/v1/me/profile`、`/v1/me/favorites`、`/v1/me/history`、`/v1/me/preferences` | 个人中心：资料、收藏、浏览历史、关注领域与推送偏好（按会话 user_id 隔离） |
+| GET/POST/DELETE | `/v1/me/search-history`、`/v1/me/search-history/{id}`、`/v1/me/search-history/{id}/click` | 搜索历史：倒序列表（`limit`≤200）、补录、删除单条、清空、点击归因回填。`GET /v1/search` 对登录用户自动留痕，并把这条记录的 id 放在 `meta.search_history_id`；留痕走**独立连接**且失败不影响检索（见「关键语义」） |
+| GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员四模块；登录管理员不能禁用/降级自己；服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`，写入前由爬虫备份配置，接口型源只能改非接口字段；`admin/stats` 的每日趋势、任务数与成功率均按近 N 天（本地日）统计 |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含 `category IS NULL` 的历史行） |
 | GET | `/v1/sources` | 按抓取站点聚合：`source`（空串=未标注来源）、`source_filter`（筛选回传值，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`、`latest_published_at`（真实时刻） |
@@ -200,12 +206,16 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | POST | `/v1/analyze?limit=10&force=false` | 同步跑一批（`limit` 上限 50）；已有分析或清单生成任务持锁时 409，失败 502 |
 | POST | `/v1/jobs` | 提交异步分析作业，202 返回 job；body `{"limit":1000,"force":false,"concurrency":100}` |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`） |
-| GET | `/v1/articles?tag=&category=&limit=&offset=` | 已分析文章列表，可按标签和/或大类过滤（AND 组合，`limit` ≤ 200） |
-| GET | `/v1/search?q=&category=&source=&published_from=&published_to=&sort=&per_category=&include_body=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`source` 可重复也可逗号分隔，`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
+| GET | `/v1/articles?...&include_highlights=false` | `include_highlights=true` 时给高相关文章附带 `highlights`（要素摘要，只对 ≥80 分的文章返回，默认不返回以免列表传输无谓摘要）。其余见下 |
+| GET | `/v1/articles?tag=&category=&industry=&min_relevance=&limit=&offset=&sort=` | 已分析文章列表，可按标签、大类、受控行业和/或文章级语义评分阈值过滤（AND 组合，`limit` ≤ 200）；`category`/`industry` 可重复或逗号分隔；`min_relevance` 取 0–1（只对已评分行生效，0 也排除 NULL）；`sort` 支持 `published_desc/asc`、`updated_desc`、`confidence_desc/asc`、`relevance_score_desc/asc`（语义评分，NULL 最后）与 `relevance_desc/asc`（用户画像分，只在前 2000 条候选内计算，`offset+limit` 超过时 422）；每项带 `relevance`（0–1，画像分）、`profile_reason`（画像排序理由）与 `relevance_score`（0–1，语义分）、`relevance_reason`（语义评分依据） |
+| GET | `/v1/search?q=&category=&industry=&source=&published_from=&published_to=&sort=&per_category=&include_body=&min_relevance=` | 关键词检索：按 6 大类分组、类内按所选 `sort` 排序（默认相关度降序；排序全部在后端算完，前端只渲染）；`q` 必填 1–100 字，`category`/`industry`/`source` 可重复也可逗号分隔，`min_relevance`（0–1，只对已评分行生效，0 也排除 NULL）按文章级语义评分过滤（以 `relevance_score` 字段返回），`sort` 取 `relevance\|published_desc\|published_asc`（见 `SEARCH_SORTS`；未知值 422 而非静默降序。`confidence_desc/asc` 只有 `/v1/articles` 列表支持），`per_category` 1–100 |
+| GET | `/v1/industries` | 受控行业词表 + 每个行业文章数（`meta.total`/词表版本），供前端筛选与徽标 |
+| GET | `/v1/recommendations?limit=10` | 首页推荐：登录用户按关注领域/收藏/浏览历史与内容质量混合打分，匿名用户按内容质量与新鲜度；`meta.personalized` 标识是否个性化 |
+| GET | `/v1/todos?limit=5` | 首页近期截止：从项目申报抽取结果的 `deadline` 取未过期项，按剩余天数升序；`meta.total` 是全部未过期项数量 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable`（字符串）；已有分析/清单生成任务持锁时也 409，但 `error.code` 为数字 409 |
-| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）；`meta.total` 与列表同筛选，`meta.unread` 为全库未读数，同一篇只提醒一次 |
+| GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）；`meta.total` 与列表同筛选，`meta.unread` 为当前登录用户的未读数（未登录只读模式为全库），写已读必须登录或服务级 API key，同一篇只提醒一次 |
 | POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
 | POST | `/v1/notifications/read-all` | 全部标记已读，返回更新条数与 `unread: 0` |
 | GET | `/v1/schemas` | 已注册的抽取 schema 列表 |
@@ -216,11 +226,13 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 
 - **鉴权**：设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/redoc`、`/openapi.json` 外都要求 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。`NEWS_API_KEY` 是**出站**凭证（访问爬虫），与入站认证无关。
 - **错误体**：422 校验错误为 `{"error": {"code": 422, "status": 422, "message", "details"}}`；`HTTPException`（404/409/502 等）只有 `{"error": {"code": <HTTP 码>, "message"}}`，**没有 `status` 与 `details`**，客户端以 HTTP 状态码为准。
-- **同步 vs 异步**：`/v1/analyze` 是兼容接口，`limit` 上限 50；长批次用 `POST /v1/jobs`（`limit` 上限 10000）。两者共享 `ANALYZE_LOCK`：同一时刻只允许一个批次在跑，避免并行重复烧 token；job 拿不到锁直接标 `failed`（不排队等待）。
-- **作业队列**：进程内 `ThreadPoolExecutor(max_workers=1)`；相同 payload 的未完成 job 复用同一 id；排队（queued + running）超过 `ANALYZE_MAX_PENDING_JOBS`（默认 50）返回 429 `too_many_jobs`；进程启动时把上次遗留的 `queued` 与 `running` job 一并标为 `failed`（进程内执行器重启后无法恢复）。
+- **同步 vs 异步**：`/v1/analyze` 是兼容接口，`limit` 上限 50；长批次用 `POST /v1/jobs`（`limit` 上限 10000）。两者共享 `ANALYZE_LOCK`（跨进程文件锁 `DATA_DIR/.insight.analyze.lock`）：同一时刻只允许一个批次在跑，避免多 worker 并行重复烧 token；job 拿不到锁直接标 `failed`（不排队等待）。
+- **作业队列**：每个 API 进程各有进程内 `ThreadPoolExecutor(max_workers=1)`，作业由提交它的进程执行（没有跨进程轮询）；`ANALYZE_LOCK` 文件锁保证多 worker 下同一时刻只有一个批次真正执行；相同 payload 的未完成 job 复用同一 id；排队（queued + running）超过 `ANALYZE_MAX_PENDING_JOBS`（默认 50）返回 429 `too_many_jobs`；进程启动时把上次遗留的 `queued` 与 `running` job 一并标为 `failed`（进程内执行器重启后无法恢复）。
 - **`due_before` 语义**：按文章级过滤——先找出 `deadline` 不晚于该日期的文章，再返回这些文章的抽取记录。**未指定 `field` 时只返回 `deadline` 行**（避免同一篇文章的 materials/contact 等行重复返回）；指定 `field` 时返回该字段行，但同样只限截止日期不晚于该日期的文章。
 - **`/health`**：不回显 `news_base_url`，避免未鉴权端点泄漏内网地址。
 - **`category` 与 `tag`**：`category` 是**单选**一级分类，`tag` 是该类白名单内的多标签；两个过滤条件 AND 组合。`category IS NULL` 表示分类功能上线前分析的历史行，`?category=other` 筛不到它们，需要 `analyze --force` 重跑。
+- **搜索留痕（`user_search_history`）的写入约束**：`GET /v1/search` 对登录用户自动记录一次搜索，这条写操作**必须走独立连接**（`main._record_search_quietly`），不能接在检索连接上。原因有二：一是同连接写会把一次读请求升级成读写事务，8 worker 抢同一把 SQLite 写锁时最坏排到 `busy_timeout`（30s）；二是只读部署（库文件只读挂载 / `PRAGMA query_only`）下写必然失败，原来被 `LOG.exception` 吞成 ERROR 噪声。现在只读部署降级为 DEBUG，其余异常（磁盘满、缺列、锁超时）保留 warning 并带异常类型；**任何情况下留痕失败都不影响检索结果**。
+- **`user_search_history` 的 10 分钟去重靠写锁，不靠唯一索引**：`accounts.record_search` 用 `BEGIN IMMEDIATE` 把「窗口内已有就 UPDATE、没有就 INSERT」和后面的保留期/条数清理包成一个写事务。原来是裸 SELECT-then-INSERT，两个并发同词搜索会各插一条，去重失效且两条挂不同 id 让点击归因记到用户没看到的那条。**不能改成 UNIQUE 索引兜底**：去重窗口是滑动的，唯一键只能是 `(user_id, query, 精确到秒的 created_at)`，本就不会撞；要的是「判断与写入不可分割」。调用方已开事务时（`conn.in_transaction`）不再 BEGIN，避免嵌套事务报错。
 - **`/v1/search` 的排序契约**：搜索界面由前端实现，本服务只提供检索层与 API。**排序必须在后端算完** —— 前端虽能从 `items[]` 读到标签置信度，但拿不到查询覆盖度（要复算词表匹配）、默认也拿不到正文，无法复算出同一个分数，所以 `groups[].items[]` 的顺序就是最终顺序，改动排序逻辑等于改动前端可见行为。
   - 口径：`score = 0.70×标签项 + 0.20×标题命中 + 0.10×正文命中`，三项均落在 `[0,1]`，总分天然有界（权重和 = 1.0，改权重时必须保持这个性质，否则 `score` 不再能直接当百分比用）；
   - 标签项 = 命中标签的 `confidence` × 查询覆盖度（取最大、不累加；`confidence` 先夹到 `[0,1]`，历史脏数据不能让总分突破上界）。覆盖度 = 命中片段占用户输入的长度比，整词 1.0、4 字查询里命中 2 字记 0.5；一个标签可能同时命中多个候选形态（「人才」和「人才计划」都命中「人才计划」），**必须遍历完该标签全部候选再取最大值** —— 命中第一个就停会让完整标签词只拿到前缀分（实测 0.5），结果还会随 `keywords` 排列顺序变化。它是**长度惩罚，不做语义消歧** —— 「人才申报」里 `talent_application`(人才) 与 `project_application`(申报) 同为 0.5，区分两类的实际是标签置信度与标题命中。**这条曾写错过**：最初 docstring 与用例断言前者 1.0，实测 `0.5 == 1.0` 断言失败，结论是代码对、说明错；
@@ -233,13 +245,21 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
   - 代价是每行每列每个形态一次 Python 回调，且**成本取决于是否「标题」命中**（本机 min-of-3，规模「候选集打满 2000 行 × 正文 6000 字」，不同机器差 2–3×）：标题命中预筛约 0.05s / 全链路约 0.5s（`OR` 首个条件为真，短路掉 body 的 6000 字归一）；**仅正文**命中约 0.55s / 约 2.0s（标题不含，必须算完 body 才为真，成本与不命中同档，且候选打满时每行都要打分）；全不命中约 0.52s / 约 0.5s（候选为空、不打分）；`body IS NULL` 的历史行约 0.003s（回填前仍能按标题/标签命中）。**只有标题命中才便宜，而用户查的行业词/细分词大多只在正文出现——这是最常见路径，别按 0.05s 估**。纯 SQL `instr`（不命中全扫）约 0.04s，即 `py_norm` 带来一个数量级预筛开销，这是「两侧归一必须同源」的代价。逐行归一 + `score_article` 是另一块大头（仅正文命中且候选打满时约 1.5s）。泛词会打满候选集，**超时按秒级设**（最坏约 2–3s，建议 10s）；若将来候选集需放大到十万级，再考虑 FTS5 或物化归一列；
   - `search.WS_CHARS` 覆盖 ASCII 控制空白、`\x85`、`\xa0`、`\u2000`–`\u200a`、`\u2028`、`\u2029`、`\u3000`（共 22 个）。从 Word / 网页复制的关键词常带 `\u2002`/`\u2003`/`\u2009`，漏一个就表现为「看起来一样的两个词搜不到」且不报错；
   - `q` 必须含至少 1 个非空白字符（`pattern=r"\S"`）：只靠 `min_length` 时 `q=""` 是 422 而 `q=" "` 会走到 200 空 groups，同一件事两种响应码；
-- **正文副本 `analyzed_articles.body`**：检索需要正文里有而标题里没有的词，因此正文随分析结果一起落库。写入用 `COALESCE(NULLIF(excluded.body, ''), body)` —— 只有本次真拿到文本时才覆盖，避免某次详情抖动把历史正文写成 `NULL` 让检索静默丢文章。历史行 `body IS NULL` 用 `python -m app backfill-bodies` 回填（只搬文本、不重跑模型、可重复执行、单篇失败不中断整批）；这使库体积约增加一倍多，且随 `RETENTION_DAYS` 一起被删除。
+- **正文副本 `analyzed_articles.body`**：检索需要正文里有而标题里没有的词，因此正文随分析结果一起落库。写入用 `COALESCE(NULLIF(excluded.body, ''), body)` —— 只有本次真拿到文本时才覆盖，避免某次详情抖动把历史正文写成 `NULL` 让检索静默丢文章。历史行 `body IS NULL` 用 `python -m app backfill-bodies` 回填（只搬文本、不重跑模型、可重复执行、单篇失败不中断整批）；`body_html` 存清洗后的正文 HTML（`html_sanitize.sanitize_body_html` 白名单），同一条回填命令一并处理，已有一侧不会被空值覆盖；这使库体积约增加一倍多，且随 `RETENTION_DAYS` 一起被删除。
+
+### 6.1 受控行业 `app/vocab/industries.json`
+
+十个行业（**闭集单选**）：`next_gen_it` 新一代信息技术、`high_end_equipment` 高端装备制造、`new_materials` 新材料、`biomedicine` 生物医药、`new_energy` 新能源、`energy_saving` 节能环保、`digital_creative` 数字创意、`modern_agriculture` 现代农业、`modern_services` 现代服务业、`other` 其他。
+
+结构：`version` + `industries`（每条 `{id, name, description, keywords}`）；`id` 是持久化契约（落 `analyzed_articles.industry`），改名不改 id。分类走 `tagging.classify_industry`：LLM 可用先按 `INDUSTRY_SYSTEM_PROMPT` 选一个，`LLMError` 降级为关键词规则（标题命中 +1.0、正文 +0.5，最高分胜出）；表外 id 丢弃并回落到 `other`。历史行用 `python -m app backfill-industries` 回填，只写 `industry`/`industry_confidence`/`industry_engine` 三列，不重跑标签/抽取/清单。
 
 ---
 
 ## 6. 标签词表与抽取 schema
 
 ### 6.0 一级分类 `app/vocab/categories.json`
+
+`project_application` 抽取 schema 的 9 个字段里有三个字段类型容易被误读：`deadline_raw` 是原文表述（不规范日期）、`focus_areas` 是**数组**（专项扶持的行业领域/技术方向，逐项列出）、`funding_amount` 是字符串（含「不超过 500 万元」这类限定语，不转数字）。数组字段在 `/v1/extractions` 里按 JSON 文本返回，消费方需要自行解析。
 
 六个大类（**单选**）：`project_application` 项目申报、`industry_policy` 行业政策、`talent_application` 人才申报、`enterprise_certification` 企业资质申报、`funding_subsidy` 资金补贴、`other` 兜底。
 
@@ -305,9 +325,13 @@ CREATE TABLE analyzed_articles (
     published_at_utc TEXT,               -- 真实时刻，相对日期换算基准
     content_length   INTEGER NOT NULL DEFAULT 0,
     body             TEXT,               -- 正文副本，供关键词检索；NULL = 落库时上游未提供（历史行，需 backfill-bodies）
+    body_html        TEXT,               -- 清洗后的正文 HTML，详情页渲染用；同样可由 backfill-bodies 回填
     category         TEXT,               -- 一级分类 id；NULL = 分类上线前的历史行，与 'other' 不同
     category_confidence REAL,
     category_engine  TEXT,               -- llm / rules / none
+    industry         TEXT,               -- 受控行业 id；NULL = 行业功能上线前的历史行
+    industry_confidence REAL,
+    industry_engine  TEXT,               -- llm / rules / none
     tag_engine       TEXT,               -- llm / rules
     extract_engine   TEXT,               -- llm / rules / none
     analyzed_at      TEXT NOT NULL
@@ -394,7 +418,7 @@ CREATE TABLE analysis_jobs (
 - **无外键**：删除顺序由代码保证（子表 → `analyzed_articles` → `runs` → 已完成 `analysis_jobs`），`prune_old_data()` 在一个事务内执行，失败整体回滚；
 - **保留期**：默认 `RETENTION_DAYS=90`，启动时、每次成功分析后、每次 job 成功后自动硬删除；`0` 表示永久保留；`VACUUM` 单独执行（不能在事务里）；
 - **正文列的覆盖语义**：`body` 走 `COALESCE(NULLIF(excluded.body, ''), body)`，与 `category` 同属「本次没拿到就保留旧值」；区别是 `body` 没有显式清空路径（正文是上游副本，清空没有业务意义）。回填走 `set_body()` 只 UPDATE 这一列，不碰 `analyzed_at` 与标签；
-- **迁移只覆盖含 `content_length` 的库**：`_ADDED_COLUMNS` 是穷举式的显式清单，现声明 `body` 与分类三列共四列。更老的、连 `content_length` 都没有的库不在支持范围内（`SCHEMA_SQL` 对已存在的表不会补列）；
+- **迁移只覆盖含 `content_length` 的库**：`_ADDED_COLUMNS` 是穷举式的显式清单，现声明 `body`、`body_html`、分类三列、行业三列、检索归一 `title_norm`/`body_norm` 与语义评分三列；新增列必须同时改 `SCHEMA_SQL` 与 `_ADDED_COLUMNS`。更老的、连 `content_length` 都没有的库不在支持范围内（`SCHEMA_SQL` 对已存在的表不会补列）；
 - **降级模式下分类与标签可能不同源**：`categories.json` 缺失时 pipeline 退回单级打标（全词表），此时 `category` 为空 → 保留旧分类，但 `article_tags` 会被整体替换成全词表结果。于是可能出现 `category='project_application'` 却带 `ipo`/`tender` 之类类外标签的行。这是「移走词表文件后 force 重跑」这一罕见运维动作的已知取舍，恢复词表后再跑一次即回到类内一致状态；`tests/test_categories.py::test_single_stage_rerun_keeps_category_but_widens_tags` 固定了该行为。
 
 ---
@@ -412,7 +436,9 @@ docker compose run --rm insight python -m app <子命令> [args]
 | `analyze --limit 10 [--force] [--concurrency 100]` | 跑一批分析；结束后自动执行一次 prune（失败只记日志） |
 | `prune [--days 90] [--dry-run] [--vacuum]` | 删除超过保留期的分析结果；先 dry-run 看数量 |
 | `init` | 只建库建表 |
-| `backfill-bodies [--limit 500] [--batch 50]` | 给历史行补 `analyzed_articles.body`：逐篇调上游 detail 取 `raw_content or content`，只 UPDATE 正文列，不重跑模型、不改 `analyzed_at`；可重复执行（只挑 `body IS NULL OR body = ''`），单篇失败不中断整批，打印 `{"filled","failed","skipped","remaining"}`；`demo` 模式直接拒绝（不许碰网络）；候选与分批都按「最新优先 + `article_id` 兜底」取，因此死链不会永久占住小 `--limit` 窗口；每批先取回全部正文再开写事务，网络请求期间不持有未提交事务 |
+| `backfill-bodies [--limit 500] [--batch 50]` | 给历史行补 `analyzed_articles.body` 与 `body_html`：逐篇调上游 detail 取 `raw_content or content` 与 `body_html`，只 UPDATE 两列且不覆盖已有值，不重跑模型、不改 `analyzed_at`；可重复执行（只挑任一侧为空的行），单篇失败不中断整批，打印 `{"filled","html_filled","failed","skipped","remaining"}`；`demo` 模式直接拒绝（不许碰网络）；候选与分批都按「最新优先 + `article_id` 兜底」取，因此死链不会永久占住小 `--limit` 窗口；每批先取回全部正文再开写事务，网络请求期间不持有未提交事务 |
+| `backfill-industries [--limit 500] [--workers N]` | 给历史行补受控行业：只写 `industry`/`industry_confidence`/`industry_engine`，不重跑标签/抽取/清单；可重复执行（只挑 `industry` 为空的行），打印 `{"scanned","analyzed","skipped","errors","remaining","engines"}` |
+| `backfill-relevance [--limit 500] [--workers N]` | 给历史行补文章级语义相关性：只写 `relevance_score`/`relevance_engine`/`relevance_reason`，不重跑标签/抽取/清单；只挑 `relevance_score IS NULL` 的行走独立 LLM 调用（无 LLM 降级规则），已有分不覆盖；可重复执行，打印同上六个统计键 |
 | `health` | 打印当前配置（llm_enabled / 数据源模式 / news_base_url / db 路径 / 保留天数） |
 
 示例：
@@ -437,14 +463,14 @@ docker compose run --rm insight python -m app prune --vacuum
 - 基础镜像 `python:3.12-slim`，`pip install .`，复制 `app/` 与 `fixtures/`；
 - 容器以 **uid 10001 的 `insight` 用户**运行，`/app/data` 已 chown；
 - `EXPOSE 8020`；`HEALTHCHECK` 用 `urllib` 打 `http://127.0.0.1:8020/health`；
-- `CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8020"]`。
+- `CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8020 --workers ${INSIGHT_API_WORKERS:-1}"]`：compose 默认 8 worker，直接 `docker run` 默认 1；`INSIGHT_API_WORKERS` 只提升 HTTP 查询并发。
 
 `docker-compose.yml` 关键点：
 
 - 端口：`${INSIGHT_BIND:-127.0.0.1}:${INSIGHT_PORT:-8020}:8020` —— **默认只绑回环**，因为 `POST /v1/analyze` 会消耗 LLM 额度；
 - 数据卷：`${INSIGHT_DATA_DIR:-insight_data}:/app/data` —— 默认命名卷。bind mount 的 `./data` 由 docker daemon 以 `root:root` 创建，而容器以 uid 10001 运行，Linux 上首次启动会因 SQLite 无法读写而崩溃循环；想直接看库文件须先 `mkdir -p data && sudo chown 10001 data`；
 - `extra_hosts: host.docker.internal:host-gateway` —— Linux 下容器访问宿主机爬虫 API 需要；
-- `environment` 是**逐条显式列出**（当前 22 个，见 `docker-compose.yml:11-42`）：compose 不支持 `NEWS_*` 这类前缀通配，`app/settings.py` 新增字段必须手工追加一行，否则运行期静默走默认值；`.env` 不进镜像也不进 Git；
+- `environment` 是**逐条显式列出**（见 `docker-compose.yml`）：compose 不支持 `NEWS_*` 这类前缀通配，`app/settings.py` 新增字段必须手工追加一行，否则运行期静默走默认值；`.env` 不进镜像也不进 Git；`INSIGHT_API_WORKERS` 默认 8，分析批次仍由 `DATA_DIR/.insight.analyze.lock` 跨进程串行；
 - `restart: unless-stopped`。
 
 ### 9.2 CI 与仓库规则集
@@ -465,11 +491,12 @@ docker compose run --rm insight python -m app prune --vacuum
 
 ## 10. 测试策略
 
-### 10.1 现有测试资产（`tests/`，17 个文件）
+### 10.1 现有测试资产（`tests/`，23 个文件）
 
 | 文件 | 覆盖 |
 | --- | --- |
-| `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=` |
+| `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=`、`/v1/articles` 的 category/industry 多值归一 |
+| `test_accounts_api.py` | 账号与会话：登录成功/失败、Bearer 会话、改密、管理员用户/站点 CRUD、重置密码、操作日志、管理员自保护（不能禁用/降级自己） |
 | `test_notifications.py` | 项目申报公告生成通知、未读/单条已读/全部已读、`--force` 重分析不重复通知、404 |
 | `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
 | `test_tagging.py` | 词表外标签丢弃、去重、max_tags 截断、规则引擎多标签 |
@@ -485,9 +512,12 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_search.py` | 检索层纯逻辑（`:memory:` 直插数据）：候选截断前按最新定序且保留最新 N 行、`published_at` 为空时按 `analyzed_at` 参与定序、短语映射闭集标签、子片段权重低于整词、空查询、未知词回落字面检索、标签命中压过纯正文命中、分数有界 `[0,1]`、无信号被过滤、按类分组且类内降序、未知词空 groups、正文命中不跨类复制、`per_category` 截断但 `count` 报全量、`categories` 过滤、默认不返回 body 且按需返回、`matched_tags`/`terms` 可排障、非 ASCII 大小写（Ärger/ÖBB/MÜLLER）不敏感、`\u2003`/`\u2009`/`\u2028` 等窄空格被折掉、同一处文本只计一次（含重叠出现）、`matched_terms` 不含被长形态吃掉的形态、高频短词记账不退化成 O(n²)、候选集截断只在真丢行时告警 |
 | `test_search_api.py` | `GET /v1/search` 的 HTTP 契约：未带 key 401、返回 groups、类顺序符合 `categories.json`、类内降序、未知词空 groups、`q` 为空 422、默认无 `body` 字段、`include_body=true` 时有 `body`、`category` 过滤生效 |
 | `test_yaml_lint.py` | 合法/重复键/非法 YAML、SKIP 集合与顶层目录语义、工作目录无关、非 UTF-8、仓库全部 YAML 通过 |
-| `test_backfill.py` | 回填正文：demo 模式拒绝访问网络、网络请求期间不持有未提交事务（读**主连接**的 `in_transaction`，不是新连接；必须 `batch>1` **且行数 > batch**，否则只覆盖到「单 chunk 边取边写」而漏掉「事务跨过下一批请求」）、`--limit 1` 下死链不钉死窗口（扫描预算与写入上限解耦）、`limit<0`/`batch<1` 在发请求前被拒绝（SQLite 把 `LIMIT -1` 当成不限）、候选截断前排序确定、已有正文的行不被覆盖 |
+| `test_backfill.py` | 回填正文与正文 HTML：demo 模式拒绝访问网络、网络请求期间不持有未提交事务（读**主连接**的 `in_transaction`，不是新连接；必须 `batch>1` **且行数 > batch**，否则只覆盖到「单 chunk 边取边写」而漏掉「事务跨过下一批请求」）、`--limit 1` 下死链不钉死窗口（扫描预算与写入上限解耦）、`limit<0`/`batch<1` 在发请求前被拒绝（SQLite 把 `LIMIT -1` 当成不限）、候选截断前排序确定、已有正文的行不被覆盖、已有正文但缺 HTML 时只补 HTML |
+| `test_industries.py` | 受控行业：词表 10 项与缺失文件、规则引擎标题优先与 other 兜底、LLM 表外 id 丢弃并夹紧置信度、LLMError 降级规则、save_analysis 行业落库、set_industry 不覆盖已有值、backfill-industries 只补空行且负数 limit 拒绝、检索按行业过滤、/v1/industries 与 /v1/articles?industry= |
+| `test_relevance.py` | 文章级语义相关性：规则分有界且项目申报类高于 other、LLM 独立一次调用并按 `relevance_body_chars` 截断正文、LLMError 降级规则、`_parse_llm_score` 的 0–100 映射/布尔拒绝/原因截断 |
+| `test_backfill_relevance.py` | `backfill-relevance`：已有分不覆盖、缺失分补规则引擎、`remaining` 归零、二次运行 scanned=0、负数 limit 拒绝 |
 
-基线：宿主机全量 `pytest` **198 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **318 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 
@@ -550,8 +580,8 @@ docker compose up -d --force-recreate && curl -f http://127.0.0.1:8020/health
 
 1. **抽取质量取决于模型与 prompt。** 本项目只保证「不越界」（不造标签、不造字段、值可定位），不保证召回；prompt 与模型变更必须用真实样本回归。
 2. **相对截止时间覆盖有限。** 只覆盖 `N日内`/`N个工作日`/`本月底` 等常见表述，「公示结束后5个工作日」这类链式表述仍会漏。
-3. **分析作业进程内全局串行。** 同步接口与异步 job 共用 `ANALYZE_LOCK`，单进程单 SQLite，不适合多副本水平扩展；要横向扩展需外部队列（Redis/Celery 等）并改存储层。
-4. **每篇最多 4 次 LLM 调用（当前单 schema 下）。** 一级分类 1 次 + 类内打标 1 次 + 每个命中 schema 各 1 次抽取 +（命中申报时）清单 1 次；新增 schema 后按命中数线性增加，估算额度与并发时不能仍按 4 次算。归到兜底类 `other` 的文章只有 1 次（分类），不打二级标签；`categories.json` 缺失时退回单级打标，仍是原来的 3 次。吞吐取决于供应商并发与限流。`ANALYZE_CONCURRENCY` 只是本地上限，`LLM_MAX_CONCURRENCY` 另外限制真正同时在途的供应商请求；429/5xx 优先按 `Retry-After`、否则指数退避加抖动重试。
+3. **分析作业跨进程全局串行。** 同步接口与异步 job 共用 `ANALYZE_LOCK`（`DATA_DIR/.insight.analyze.lock` 文件锁），API 多 worker 只提升查询并发，分析仍单批次执行；多副本部署仍需外部队列（Redis/Celery 等）并改存储层。
+4. **每篇最多 6 次 LLM 调用（当前单 schema 下）。** 受控行业 1 次 + 语义相关性 1 次 + 一级分类 1 次 + 类内打标 1 次 + 每个命中 schema 各 1 次抽取 +（命中申报时）清单 1 次；新增 schema 后按命中数线性增加，估算额度与并发时不能仍按 4 次算。归到兜底类 `other` 的文章是行业、语义评分、分类 3 次，不打二级标签；`categories.json` 缺失时退回单级打标，最多 5 次（无分类调用）。吞吐取决于供应商并发与限流。`ANALYZE_CONCURRENCY` 只是本地上限，`LLM_MAX_CONCURRENCY` 另外限制真正同时在途的供应商请求；429/5xx 优先按 `Retry-After`、否则指数退避加抖动重试。
 5. **保留期是硬删除。** `RETENTION_DAYS` 默认 90，不保留归档；`runs` 与已完成的 `analysis_jobs` 也一起清。
 6. **数据库没有版本号，只有幂等补列。** `_migrate_columns()` 靠 `PRAGMA table_info` 补缺失列（见 §7.2），加列是自动的；改类型、加约束、改索引语义仍需手写一次性迁移。升级后历史行 `category` 为 `NULL`，要拿分类得 `analyze --force` 重跑。
 7. **演示数据与规则引擎只用于跑通链路。** 不作为效果基线；生产必须配置 `LLM_API_KEY`。
@@ -609,7 +639,7 @@ docker compose up -d --force-recreate && curl -f http://127.0.0.1:8020/health
 - `create_app(settings: Settings | None = None) -> FastAPI`：测试可注入独立设置；
 - `POST /v1/jobs` 的 body schema（`type`/`limit`/`force`/`concurrency`）属于对外契约，新增字段必须保持向后兼容；
 - 数据库字段与 `runs`/`analysis_jobs` 状态语义保持向后兼容，新增字段需要迁移策略；`analyzed_articles.category` 为 `NULL` 表示「分类上线前分析的历史行」，不得用 `other` 代替——两者在统计与过滤上语义不同。
-- `db.search_grouped(conn, *, raw_query, tags, category_order=(), categories=None, sources=None, published_from=None, published_to=None, per_category=20, include_body=False, sort="relevance") -> dict`：检索入口。返回 `{"query", "matched_tags", "terms", "groups": [{"category", "count", "items"}], "total", "returned", "truncated", "undated_excluded", "sort"}`。四个统计键的语义：`total` = 候选集（上限 `_CANDIDATE_LIMIT`=2000 行）内的命中数，`truncated=true` 时它只是下界；`returned` = 实际渲染条数（每类被 `per_category` 截断后），与 `total` 的差额即"还有更多没显示"；`undated_excluded` = 带日期过滤时"命中关键词与分类/来源条件、但两个时间列都判不出日期"而被排除的篇数（不带日期过滤时恒为 0，是 `COUNT(*)` 因而不受候选集截断影响，统计条件是 SQL 预筛命中，未过 `search.has_signal`）；**空查询（`q` 归一后为空）走早退分支，返回同样的键集合**，前端不必为它单独兜默认值。`count` 是漏斗后的全量命中数，`items` 被 `per_category` 截断。**返回顺序即最终展示顺序**（类按 `category_order`；类内顺序由 `sort` 决定：`relevance` 按 `score` 降序、`published_desc`/`published_asc` 按真实时刻 `_TIME_EXPR` 升/降序，两种模式都以相关度 `score` 为第一同分键、`article_id` 为最终兜底），改动排序等于改动前端可见行为；
+- `db.search_grouped(conn, *, raw_query, tags, category_order=(), categories=None, sources=None, industries=None, published_from=None, published_to=None, min_relevance=None, per_category=20, include_body=False, sort="relevance") -> dict`：检索入口；`min_relevance`（0–1）按文章级语义评分过滤。返回 `{"query", "matched_tags", "terms", "groups": [{"category", "count", "items"}], "total", "returned", "truncated", "undated_excluded", "sort"}`。四个统计键的语义：`total` = 候选集（上限 `_CANDIDATE_LIMIT`=2000 行）内的命中数，`truncated=true` 时它只是下界；`returned` = 实际渲染条数（每类被 `per_category` 截断后），与 `total` 的差额即"还有更多没显示"；`undated_excluded` = 带日期过滤时"命中关键词与分类/来源条件、但两个时间列都判不出日期"而被排除的篇数（不带日期过滤时恒为 0，是 `COUNT(*)` 因而不受候选集截断影响，统计条件是 SQL 预筛命中，未过 `search.has_signal`）；**空查询（`q` 归一后为空）走早退分支，返回同样的键集合**，前端不必为它单独兜默认值。`count` 是漏斗后的全量命中数，`items` 被 `per_category` 截断。**返回顺序即最终展示顺序**（类按 `category_order`；类内顺序由 `sort` 决定：`relevance` 按 `score` 降序、`published_desc`/`published_asc` 按真实时刻 `_TIME_EXPR` 升/降序，两种模式都以相关度 `score` 为第一同分键、`article_id` 为最终兜底），改动排序等于改动前端可见行为；
 - `search.resolve_query(raw: str, tags: list[TagDef]) -> Query` / `search.score_article(query, *, title, body, tag_confidences) -> Relevance` / `search._masked_hits(text, terms) -> tuple[int, float, list[str]]`：纯函数，无 I/O，可直接单测。纯函数，行为细节（标记数组记账、重叠只计一次、`+1` 步进的用意）见 §5 排序契约中的命中计数条目，此处只固定契约：按 `terms` 顺序（`resolve_query` 已按权重降序输出）逐个计数，同一处文本只计一次；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；第三个返回值是实际贡献命中的形态，供 `matched_terms` 使用（被长形态吃掉的短形态不列）；
 - `db._ensure_norm_func(conn)`：把 `search._norm` 注册为 SQL 函数 `py_norm`，预筛与打分共用同一份归一实现。新增涉及 `instr` 预筛的查询时必须先调用它，否则报 `no such function: py_norm`。权重常量在 `app/search.py` 顶部，改动须保持 `W_TAG + W_TITLE + W_BODY == 1.0`（否则 `score` 不再落在 `[0,1]`）并补用例；
 - `db.set_body(conn, *, article_id, body, commit=True)`：只 UPDATE `body` 一列，不碰 `analyzed_at` 与标签，供回填使用；正文写入走 `COALESCE(NULLIF(excluded.body, ''), body)`，本次没拿到就保留旧值；

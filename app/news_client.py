@@ -21,6 +21,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -63,6 +64,7 @@ class NewsArticle:
     raw_content: str | None
     content_length: int
     updated_at: str | None
+    body_html: str | None = None
     # False = 详情接口没拿到（正文为空不代表文章没正文），调用方不应据此定档
     body_ok: bool = True
 
@@ -83,6 +85,7 @@ class NewsArticle:
             timezone=str(row.get("timezone") or "Asia/Shanghai"),
             content=row.get("content"),
             raw_content=row.get("raw_content"),
+            body_html=row.get("body_html"),
             content_length=_to_int(row.get("content_length")),
             updated_at=row.get("updated_at"),
         )
@@ -221,6 +224,57 @@ class NewsClient:
             raise UpstreamError(f"文章详情 {article_id} 返回格式不正确")
         return detail
 
+    # ---------------------------------------------------------- admin sites
+    def _admin_call(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> Any:
+        url = f"{self.settings.news_base_url}{path}"
+        try:
+            resp = self._client().request(
+                method, url, headers=self._headers(), json=payload
+            )
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"无法连接新闻 API {url}: {exc}") from exc
+        if resp.status_code == 404:
+            raise UpstreamError("站点不存在", status_code=404, fallbackable=False)
+        if resp.status_code >= 400:
+            detail = resp.text[:300]
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and body.get("detail"):
+                    detail = str(body["detail"])
+            except ValueError:
+                pass
+            raise UpstreamError(
+                f"新闻 API 返回 {resp.status_code}: {detail}",
+                status_code=resp.status_code,
+                fallbackable=False,
+            )
+        if resp.status_code == 204 or not resp.content:
+            return None
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise UpstreamError(f"新闻 API 返回非 JSON: {exc}") from exc
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return body
+
+    def list_sites(self) -> list[dict[str, Any]]:
+        data = self._admin_call("GET", "/v1/admin/sites")
+        return data if isinstance(data, list) else []
+
+    def create_site(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._admin_call("POST", "/v1/admin/sites", payload) or {}
+
+    def update_site(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # 站点名允许中文；不编码时 httpx 虽能兜底，但路径里的 ?/# 会被当成
+        # 查询串/片段，导致更新到错误的站点。
+        return self._admin_call("PUT", f"/v1/admin/sites/{quote(name, safe='')}", payload) or {}
+
+    def delete_site(self, name: str) -> None:
+        self._admin_call("DELETE", f"/v1/admin/sites/{quote(name, safe='')}")
+
     def hydrate_bodies(self, articles: Iterable[NewsArticle], mode: str) -> list[NewsArticle]:
         """Fill in body text. Demo rows already carry it; live rows need the detail call."""
         items = list(articles)
@@ -253,6 +307,7 @@ class NewsClient:
             art.published_at = merged.published_at or art.published_at
             art.content = merged.content
             art.raw_content = merged.raw_content
+            art.body_html = merged.body_html
             art.content_length = merged.content_length or art.content_length
 
         concurrency = max(1, min(self.settings.news_detail_concurrency, len(pending)))

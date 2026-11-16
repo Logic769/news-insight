@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 
 from app import db
 from app.settings import Settings
@@ -28,7 +29,20 @@ def prune(
     db.init_db(settings.db_path)
     conn = db.connect(settings.db_path)
     try:
-        result = db.prune_old_data(conn, retention_days=retention, dry_run=dry_run)
+        try:
+            result = db.prune_old_data(conn, retention_days=retention, dry_run=dry_run)
+        except sqlite3.OperationalError as exc:
+            # 只读部署下清理整个跑不了，这不是错误而是部署形态的既定差异：把
+            # ERROR + traceback 降成 DEBUG + 一句结论，避免每次启动都刷一屏
+            # 「看起来坏了」的日志，真出问题（磁盘满、schema 缺列）仍按 ERROR 抛。
+            if db.is_readonly_error(exc):
+                LOG.debug("数据库只读，跳过保留期清理：%s", exc)
+                return {
+                    "skipped": True,
+                    "reason": "数据库只读，跳过清理",
+                    "retention_days": retention,
+                }
+            raise
         if do_vacuum and not dry_run:
             db.vacuum(conn)
             result["vacuumed"] = True
