@@ -147,7 +147,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET/POST/PATCH/DELETE | `/v1/admin/users`、`/v1/admin/users/{id}`、`/v1/admin/users/{id}/reset-password`、`/v1/admin/sites`、`/v1/admin/stats`、`/v1/admin/operation-logs` | 管理员：用户/站点 CRUD、重置密码、统计看板、操作日志；登录管理员不能禁用/降级自己，服务级 API key 等同超级权限；`admin/sites` 代理 news-crawler 的 `/v1/admin/sites`（写前由爬虫备份配置，接口型源只能改非接口字段）；`admin/stats` 的每日趋势、任务数与成功率均按近 N 天（本地日）统计 |
 | POST | `/v1/analyze?limit=10&force=false` | 跑一批：拉取 → 打标 → 抽取 → 入库（同步兼容接口，`limit` 上限 50） |
 | GET | `/v1/search?q=&category=&industry=&source=&published_from=&published_to=&sort=&per_category=&include_body=&min_relevance=` | 关键词检索：结果按 6 大类分组、类内按所选 `sort` 排序（**排序全部在后端算完**，前端只渲染）；`q` 必填 1–100 字；登录用户的这次检索会被自动记入搜索历史，响应 `meta.search_history_id` 供点击归因 |
-| POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
+| POST | `/v1/jobs` | 提交异步分析作业，202 返回 `{"code": 0, "msg": "ok", "data": {"id": ...}}`；body `{"limit":1000,"force":false,"concurrency":100}`，`limit` 上限 10000；排队超过 `ANALYZE_MAX_PENDING_JOBS` 返回 429 |
 | GET | `/v1/jobs`、`/v1/jobs/{job_id}` | 作业列表与状态（`queued`/`running`/`succeeded`/`failed`，含结果统计） |
 | GET | `/v1/articles?...&include_highlights=true` | `include_highlights` 默认 `false`：只有 ≥80 分的文章才附 `highlights`（要素摘要），列表默认不带该字段以节省带宽 |
 | GET | `/v1/articles?tag=project_application&limit=20&sort=relevance_desc` | 已分析文章列表，可按标签、大类（`category=funding_subsidy`）、受控行业（`industry=new_energy`）或语义相关性阈值（`min_relevance=0.5`，0–1）过滤（AND 组合）；`category`、`industry` 均可重复或逗号分隔；`sort` 支持 `published_desc/asc`、`updated_desc`、`confidence_desc/asc`、`relevance_score_desc/asc`（文章级语义评分，NULL 最后）与 `relevance_desc/asc`（用户画像相关度，只在前 2000 条候选内计算，`offset+limit` 超过时 422）；每项含 `relevance`（0–1，画像分）、`profile_reason`（画像排序理由）与 `relevance_score`（0–1，语义分）、`relevance_reason`（语义评分依据） |
@@ -157,11 +157,11 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/todos?limit=5` | 首页近期申报截止：取项目申报抽取结果中未过期的 `deadline`，按剩余天数升序；`meta.total` 为全部未过期项数量 |
 | — | 项目申报 schema 字段类型 | `focus_areas` 是**数组**（专项扶持的行业领域/技术方向，逐项列出），在 `/v1/extractions` 与文章详情里以 JSON 文本返回；`deadline_raw` 是未归一化的原文表述，规范化日期在 `deadline`；`funding_amount` 是字符串，可能带「不超过 500 万元」这类限定语 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
-| GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 用错误码区分 |
-| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `article_not_found`；非项目申报或缺少可用要素/正文 409 `checklist_not_applicable`（字符串错误码）；已有分析/清单生成任务持有同一把全局锁时也返回 409，但错误码为数字 `409`，客户端按 `error.code` 类型区分业务不适用与并发冲突 |
+| GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 分别用业务码 `40401` / `40402` 区分 |
+| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `40401`；非项目申报或缺少可用要素/正文 409 `40902`；已有分析/清单生成任务持有同一把全局锁时也返回 409，业务码为 `40901` |
 | GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）：`data` 为通知列表，`meta.total` 与列表同筛选（`unread_only=true` 时为未读总数），`meta.unread` 为当前登录用户的未读数（未登录只读模式为全库；不受 `unread_only` 影响）；写已读必须登录或使用服务级 API key；同一篇文章只提醒一次 |
 | POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
-| POST | `/v1/notifications/read-all` | 全部标记已读，返回 `{"data": {"updated": N, "unread": 0}}` |
+| POST | `/v1/notifications/read-all` | 全部标记已读，`data` 返回 `{"updated": N, "unread": 0}` |
 | GET | `/v1/categories` | 一级分类词表（id/中文名/描述/关键词/允许的标签）+ 每类文章数 |
 | GET | `/v1/categories/stats` | 分类分布与平均置信度（不含分类功能上线前的历史行） |
 | GET | `/v1/sources` | 按抓取站点聚合：`source`（空串表示未标注来源，前端显示「未标注来源」）、`source_filter`（筛选时回传的值：普通来源等于 `source`，未标注来源为 `__unlabeled__`）、`count`、`avg_confidence`（平均分类置信度）、`latest_published_at`（按真实时刻取最新发布时间）；前端「发布单位」筛选应使用 `source_filter`，统计看板用 `source` 展示 |
@@ -170,6 +170,32 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/schemas` | 已注册的抽取 schema |
 | GET | `/v1/extractions?schema=&field=&due_before=` | 抽取结果平铺查询，`due_before` 按截止日期过滤，可与 `field` 同时使用（按文章过滤，不是按字段） |
 | GET | `/v1/runs` | 运行记录（模式、扫描/分析/跳过/错误数） |
+
+### 响应格式与错误码
+
+除 `/health`、`/docs`、`/redoc`、`/openapi.json` 外，所有 `/v1/*` 接口返回统一信封：
+
+```json
+{"code": 0, "msg": "ok", "data": {...}, "meta": {...}}
+```
+
+- 成功时 `code` 恒为 `0`、`msg` 为 `ok`；`meta` 只在分页/统计类接口出现（`total`、`limit`、`offset` 等）。
+- 失败时 `data` 为 `null`，HTTP 状态码保留；参数校验失败额外带 `details` 数组。客户端应优先读 `code`，`msg` 可直接展示。
+
+| 业务码 | 含义 |
+| --- | --- |
+| 40001 | 请求参数不合法（通用 400） |
+| 40101 | 未登录或登录已过期 |
+| 40301 | 当前账号无权限 |
+| 40401 | 文章不存在 |
+| 40402 | 申报清单不存在 |
+| 40901 | 资源冲突（含分析/清单任务锁占用） |
+| 40902 | 申报清单不适用（非项目申报或缺要素） |
+| 42201 | 参数校验失败（带 `details`） |
+| 42901 | 请求/作业过多 |
+| 50001 | 服务内部错误 |
+| 50201 | 上游新闻 API 不可用 |
+| 50301 | 服务暂不可用（只读库/库忙） |
 
 CLI 也可：`docker compose run --rm insight python -m app analyze --limit 10 --concurrency 100`；清理历史数据：`python -m app prune --dry-run`、`python -m app prune --vacuum`。
 

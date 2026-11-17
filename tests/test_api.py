@@ -57,10 +57,10 @@ def test_checklist_endpoint(client):
     # 非申报文章没有清单，返回 404 而不是空数组；两种 404 用不同错误码区分
     no_checklist = client.get("/v1/articles/c3a2e5f4d9b06c73/checklist", headers=headers)
     assert no_checklist.status_code == 404
-    assert no_checklist.json()["error"]["code"] == "checklist_not_found"
+    assert no_checklist.json()["code"] == 40402
     missing = client.get("/v1/articles/notexist/checklist", headers=headers)
     assert missing.status_code == 404
-    assert missing.json()["error"]["code"] == "article_not_found"
+    assert missing.json()["code"] == 40401
 
 
 def test_checklist_generation_is_idempotent_and_force_regenerates(client):
@@ -97,11 +97,11 @@ def test_checklist_generation_rejects_inapplicable_and_missing_articles(client):
 
     not_applicable = client.post("/v1/articles/c3a2e5f4d9b06c73/checklist", headers=headers)
     assert not_applicable.status_code == 409
-    assert not_applicable.json()["error"]["code"] == "checklist_not_applicable"
+    assert not_applicable.json()["code"] == 40902
 
     missing = client.post("/v1/articles/notexist/checklist", headers=headers)
     assert missing.status_code == 404
-    assert missing.json()["error"]["code"] == "article_not_found"
+    assert missing.json()["code"] == 40401
 
 
 def test_checklist_generation_returns_409_when_another_job_running(client):
@@ -114,7 +114,7 @@ def test_checklist_generation_returns_409_when_another_job_running(client):
             "/v1/articles/a1f0c3e2b7d94a51/checklist", json={"force": True}, headers=headers
         )
         assert blocked.status_code == 409
-        assert "已有分析或清单生成任务在运行" in blocked.json()["error"]["message"]
+        assert "已有分析或清单生成任务在运行" in blocked.json()["msg"]
     finally:
         ANALYZE_LOCK.release()
 
@@ -224,8 +224,8 @@ def test_analyze_limit_capped(client):
         "/v1/analyze", params={"limit": 500}, headers={"X-API-Key": "secret"}
     )
     assert resp.status_code == 422
-    body = resp.json()["error"]
-    assert body["code"] == 422 and body["details"]
+    body = resp.json()
+    assert body["code"] == 42201 and body["details"]
 
 
 def test_async_job_lifecycle(client):
@@ -307,7 +307,7 @@ def test_articles_relevance_sort_rejects_window_beyond_candidate_limit(client):
         headers=headers,
     )
     assert resp.status_code == 422
-    assert "2000" in resp.json()["error"]["message"]
+    assert "2000" in resp.json()["msg"]
 
 
 def test_recommendations_and_todos_endpoints(client):

@@ -69,13 +69,13 @@ def test_login_locks_after_five_failures_and_rejects_correct_password(client):
     for _ in range(4):
         resp = _login(client, "alice", "wrong")
         assert resp.status_code == 401
-        messages.append(resp.json()["error"]["message"])
+        messages.append(resp.json()["msg"])
     assert "还可尝试 4 次" in messages[0]
     assert "还可尝试 1 次" in messages[-1]
 
     locked = _login(client, "alice", "wrong")
     assert locked.status_code == 423
-    assert "锁定 15 分钟" in locked.json()["error"]["message"]
+    assert "锁定 15 分钟" in locked.json()["msg"]
 
     # 锁定期内即使密码正确也不放行
     assert _login(client, "alice").status_code == 423
@@ -93,7 +93,7 @@ def test_login_me_logout_and_unknown_user(client):
     assert client.post("/v1/auth/logout", headers=_auth(token)).status_code == 200
     assert client.get("/v1/auth/me", headers=_auth(token)).status_code == 401
     assert _login(client, "nobody").status_code == 401
-    assert _login(client, "nobody").json()["error"]["message"] == "用户名或密码错误"
+    assert _login(client, "nobody").json()["msg"] == "用户名或密码错误"
 
 
 def test_change_password_enforces_policy_and_current_password(client):
@@ -106,7 +106,7 @@ def test_change_password_enforces_policy_and_current_password(client):
         headers=_auth(token),
     )
     assert weak.status_code == 400
-    assert "大写字母" in weak.json()["error"]["message"]
+    assert "大写字母" in weak.json()["msg"]
 
     wrong = client.post(
         "/v1/auth/password",
@@ -114,7 +114,7 @@ def test_change_password_enforces_policy_and_current_password(client):
         headers=_auth(token),
     )
     assert wrong.status_code == 400
-    assert wrong.json()["error"]["message"] == "原密码不正确"
+    assert wrong.json()["msg"] == "原密码不正确"
 
     changed = client.post(
         "/v1/auth/password",
@@ -225,7 +225,7 @@ def test_admin_cannot_disable_or_demote_self(client):
         f"/v1/admin/users/{me['id']}", json={"status": "disabled"}, headers=headers
     )
     assert disabled.status_code == 400
-    assert "不能禁用或降级当前登录的管理员" in disabled.json()["error"]["message"]
+    assert "不能禁用或降级当前登录的管理员" in disabled.json()["msg"]
 
     demoted = client.patch(
         f"/v1/admin/users/{me['id']}", json={"role": "user"}, headers=headers
@@ -418,7 +418,7 @@ def test_admin_sites_proxy_passes_upstream_422(client, monkeypatch):
     monkeypatch.setattr("app.main.NewsClient.update_site", reject)
     resp = client.patch("/v1/admin/sites/demo", json={"enabled": False}, headers=headers)
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == 422
+    assert resp.json()["code"] == 42201
 
 
 def test_notifications_are_isolated_per_user(client):

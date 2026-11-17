@@ -213,8 +213,8 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 | GET | `/v1/recommendations?limit=10` | 首页推荐：登录用户按关注领域/收藏/浏览历史与内容质量混合打分，匿名用户按内容质量与新鲜度；`meta.personalized` 标识是否个性化 |
 | GET | `/v1/todos?limit=5` | 首页近期截止：从项目申报抽取结果的 `deadline` 取未过期项，按剩余天数升序；`meta.total` 是全部未过期项数量 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
-| GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 用错误码区分 |
-| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `article_not_found` / 409 `checklist_not_applicable`（字符串）；已有分析/清单生成任务持锁时也 409，但 `error.code` 为数字 409 |
+| GET | `/v1/articles/{article_id}/checklist` | 申报准备清单；`article_not_found`/`checklist_not_found` 两种 404 分别用业务码 `40401`/`40402` 区分 |
+| POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单，body `{"force": false}`：默认幂等，`force=true` 重新生成；404 `40401` / 409 `40902`；已有分析/清单生成任务持锁时也 409，业务码 `40901` |
 | GET | `/v1/notifications?limit=20&unread_only=false` | 站内消息提醒（新分析出的项目申报公告）；`meta.total` 与列表同筛选，`meta.unread` 为当前登录用户的未读数（未登录只读模式为全库），写已读必须登录或服务级 API key，同一篇只提醒一次 |
 | POST | `/v1/notifications/{notification_id}/read` | 标记单条已读；不存在 404 |
 | POST | `/v1/notifications/read-all` | 全部标记已读，返回更新条数与 `unread: 0` |
@@ -225,7 +225,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 ### 关键语义
 
 - **鉴权**：设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/redoc`、`/openapi.json` 外都要求 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。`NEWS_API_KEY` 是**出站**凭证（访问爬虫），与入站认证无关。
-- **错误体**：422 校验错误为 `{"error": {"code": 422, "status": 422, "message", "details"}}`；`HTTPException`（404/409/502 等）只有 `{"error": {"code": <HTTP 码>, "message"}}`，**没有 `status` 与 `details`**，客户端以 HTTP 状态码为准。
+- **错误体**：`/v1/*` 统一返回 `{"code": 0, "msg": "ok", "data": ..., "meta": ...}`（成功）或 `{"code": <非 0 整数>, "msg": "...", "data": null}`（失败，HTTP 状态码保留；422 校验错误额外带 `details`）。`/health`、`/docs`、`/redoc`、`/openapi.json` 不包装。业务码见 README「响应格式与错误码」：40101 未登录、40401 文章不存在、40402 清单不存在、40901 冲突、40902 清单不适用、42201 参数校验失败、42901 过多、50201 上游不可用、50301 暂不可用。实现位于 `app/wire.py`（`wire.install(app)` 在 `create_app` 末尾注册，位于鉴权中间件外层）。
 - **同步 vs 异步**：`/v1/analyze` 是兼容接口，`limit` 上限 50；长批次用 `POST /v1/jobs`（`limit` 上限 10000）。两者共享 `ANALYZE_LOCK`（跨进程文件锁 `DATA_DIR/.insight.analyze.lock`）：同一时刻只允许一个批次在跑，避免多 worker 并行重复烧 token；job 拿不到锁直接标 `failed`（不排队等待）。
 - **作业队列**：每个 API 进程各有进程内 `ThreadPoolExecutor(max_workers=1)`，作业由提交它的进程执行（没有跨进程轮询）；`ANALYZE_LOCK` 文件锁保证多 worker 下同一时刻只有一个批次真正执行；相同 payload 的未完成 job 复用同一 id；排队（queued + running）超过 `ANALYZE_MAX_PENDING_JOBS`（默认 50）返回 429 `too_many_jobs`；进程启动时把上次遗留的 `queued` 与 `running` job 一并标为 `failed`（进程内执行器重启后无法恢复）。
 - **`due_before` 语义**：按文章级过滤——先找出 `deadline` 不晚于该日期的文章，再返回这些文章的抽取记录。**未指定 `field` 时只返回 `deadline` 行**（避免同一篇文章的 materials/contact 等行重复返回）；指定 `field` 时返回该字段行，但同样只限截止日期不晚于该日期的文章。
@@ -496,6 +496,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=`、`/v1/articles` 的 category/industry 多值归一 |
+| `test_wire.py` | 统一响应信封：成功 `{code,msg,data}`、分页 `meta` 保留、401 业务码、422 `details`、404/409 业务码区分、`/health` 与 `/docs` 不包装、OpenAPI 文档包含信封 schema |
 | `test_accounts_api.py` | 账号与会话：登录成功/失败、Bearer 会话、改密、管理员用户/站点 CRUD、重置密码、操作日志、管理员自保护（不能禁用/降级自己） |
 | `test_notifications.py` | 项目申报公告生成通知、未读/单条已读/全部已读、`--force` 重分析不重复通知、404 |
 | `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
@@ -517,7 +518,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_relevance.py` | 文章级语义相关性：规则分有界且项目申报类高于 other、LLM 独立一次调用并按 `relevance_body_chars` 截断正文、LLMError 降级规则、`_parse_llm_score` 的 0–100 映射/布尔拒绝/原因截断 |
 | `test_backfill_relevance.py` | `backfill-relevance`：已有分不覆盖、缺失分补规则引擎、`remaining` 归零、二次运行 scanned=0、负数 limit 拒绝 |
 
-基线：宿主机全量 `pytest` **318 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **349 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 
