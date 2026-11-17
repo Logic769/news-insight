@@ -163,6 +163,7 @@ def test_openapi_documents_envelope(client):
 
     api_error = schema["components"]["schemas"]["ApiError"]
     assert "details" in api_error["properties"]
+    assert "nullable" not in api_error["properties"]["data"]
 
     # FastAPI 预置的 422 必须被统一错误 schema 替换。
     validation = schema["paths"]["/v1/articles"]["get"]["responses"]["422"]
@@ -190,8 +191,55 @@ def test_all_v1_operations_have_envelope_and_api_error(client):
                     continue
                 envelope = response["content"]["application/json"]["schema"]
                 assert set(envelope["required"]) == {"code", "msg", "data"}
-                assert "data" in envelope["properties"]
+                # 当前 /v1 路由都返回裸 dict，无法表达 data 结构时必须留空，
+                # 不能被 additionalProperties 的整响应 schema 冒充。
+                assert envelope["properties"]["data"] == {}
             assert responses["422"]["content"]["application/json"]["schema"] == {
                 "$ref": "#/components/schemas/ApiError"
             }
     assert operation_count >= 50
+
+
+def test_custom_error_response_metadata_is_preserved(tmp_path, monkeypatch):
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                 "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NEWS_SOURCE_MODE", "demo")
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("INSIGHT_API_KEY", "secret")
+    app = create_app(load_settings())
+
+    @app.get(
+        "/v1/_custom_400",
+        responses={
+            400: {
+                "description": "自定义 400",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"reason": {"type": "string"}},
+                        }
+                    }
+                },
+            }
+        },
+    )
+    def custom_400():
+        return {"ok": True}
+
+    @app.get("/v1/_custom_401", responses={401: {"description": "自定义 401"}})
+    def custom_401():
+        return {"ok": True}
+
+    with TestClient(app) as c:
+        schema = c.get("/openapi.json").json()
+    responses = schema["paths"]["/v1/_custom_400"]["get"]["responses"]
+    assert responses["400"]["description"] == "自定义 400"
+    assert responses["400"]["content"]["application/json"]["schema"]["properties"]["reason"] == {
+        "type": "string"
+    }
+    assert schema["paths"]["/v1/_custom_401"]["get"]["responses"]["401"]["description"] == (
+        "自定义 401"
+    )

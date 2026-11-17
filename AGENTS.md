@@ -496,7 +496,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_api.py` | 鉴权（open/401/两种头）、checklist 端点、`/v1/analyze` limit 上限、异步 job 生命周期、`/v1/categories` 词表与按类过滤、`/v1/tags?category=`、`/v1/articles` 的 category/industry 多值归一 |
-| `test_wire.py` | 统一响应信封：成功 `{code,msg,data}`、分页 `meta` 保留、401 业务码、422 `details`、404/409 业务码区分、`/health` 与 `/docs` 不包装、OpenAPI 文档包含信封 schema |
+| `test_wire.py` | 统一响应信封：成功 `{code,msg,data}`、分页 `meta` 保留、401 业务码、422 `details`、404/409 业务码区分、`/health` 与 `/docs` 不包装、OpenAPI 信封/data schema/422 ApiError、ApiError 无 nullable、全部 /v1 操作的统一错误 schema、自定义 4xx 描述与 schema 保留 |
 | `test_accounts_api.py` | 账号与会话：登录成功/失败、Bearer 会话、改密、管理员用户/站点 CRUD、重置密码、操作日志、管理员自保护（不能禁用/降级自己） |
 | `test_notifications.py` | 项目申报公告生成通知、未读/单条已读/全部已读、`--force` 重分析不重复通知、404 |
 | `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
@@ -518,7 +518,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_relevance.py` | 文章级语义相关性：规则分有界且项目申报类高于 other、LLM 独立一次调用并按 `relevance_body_chars` 截断正文、LLMError 降级规则、`_parse_llm_score` 的 0–100 映射/布尔拒绝/原因截断 |
 | `test_backfill_relevance.py` | `backfill-relevance`：已有分不覆盖、缺失分补规则引擎、`remaining` 归零、二次运行 scanned=0、负数 limit 拒绝 |
 
-基线：宿主机全量 `pytest` **353 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **355 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 

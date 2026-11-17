@@ -167,11 +167,15 @@ def _rebuild_stream(response: Response, raw: bytes, content_type: str) -> Respon
 def install(app) -> None:
     """注册统一响应中间件，并让 OpenAPI 文档显示包装后的结构。"""
     app.add_middleware(UnifiedResponseMiddleware)
+    # 先清掉可能存在的原始缓存，下面只缓存「包装后」的 schema；否则直接读
+    # app.openapi_schema 的工具会拿到未包装的旧契约。
+    app.openapi_schema = None
     original_openapi = app.openapi
 
     def openapi() -> dict[str, Any]:
-        # FastAPI 会缓存 openapi_schema，原地改写会让第二次调用把信封再包一层；
-        # 每次基于副本生成，保证 /openapi.json 多次访问结果一致。
+        cached = getattr(app, "_wire_openapi_schema", None)
+        if cached is not None:
+            return cached
         schema = copy.deepcopy(original_openapi())
         components = schema.setdefault("components", {}).setdefault("schemas", {})
         components["ApiError"] = {
@@ -238,13 +242,20 @@ def install(app) -> None:
                         if isinstance(existing, dict)
                         else None
                     )
-                    if (
-                        status != "422"
-                        and isinstance(existing, dict)
-                        and isinstance(existing_schema, dict)
+                    existing_description = (
+                        existing.get("description") if isinstance(existing, dict) else None
+                    )
+                    custom_description = existing_description not in (
+                        None,
+                        "",
+                        "Successful Response",
+                    )
+                    custom_schema = (
+                        isinstance(existing_schema, dict)
                         and existing_schema.get("$ref")
                         not in (None, "#/components/schemas/HTTPValidationError")
-                    ):
+                    )
+                    if status != "422" and (custom_description or custom_schema):
                         continue
                     responses[status] = {
                         "description": "统一错误响应",
@@ -254,6 +265,8 @@ def install(app) -> None:
                             }
                         },
                     }
+        app._wire_openapi_schema = schema
+        app.openapi_schema = schema
         return schema
 
     app.openapi = openapi  # type: ignore[method-assign]
