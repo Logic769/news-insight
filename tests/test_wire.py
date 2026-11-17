@@ -111,6 +111,28 @@ def test_unhandled_exception_is_a_json_error_envelope(tmp_path, monkeypatch):
     }
 
 
+def test_pre_wrapped_error_envelope_is_not_overwritten(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NEWS_SOURCE_MODE", "demo")
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("INSIGHT_API_KEY", "secret")
+    app = create_app(load_settings())
+
+    @app.get("/v1/_wrapped_404")
+    def wrapped_404():
+        from starlette.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=404,
+            content={"code": 40402, "msg": "清单不存在", "data": None},
+        )
+
+    with TestClient(app) as c:
+        resp = c.get("/v1/_wrapped_404", headers=HEADERS)
+    assert resp.status_code == 404
+    assert resp.json() == {"code": 40402, "msg": "清单不存在", "data": None}
+
+
 def test_lock_error_has_its_own_business_code():
     assert error_code(423) == 42301
 

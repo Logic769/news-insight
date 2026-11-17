@@ -134,15 +134,16 @@ class UnifiedResponseMiddleware(BaseHTTPMiddleware):
             LOG.warning("无法解析 %s %s 的响应体，按成功空数据包装", request.method, path)
             return _rebuild(response, success_body(None))
 
+        if isinstance(payload, dict) and "code" in payload and "msg" in payload:
+            # 已经是统一信封（例如未来的新路由直接返回信封），保留原业务码，
+            # 不能因为 HTTP 4xx 被状态码兜底覆盖成通用码。
+            return _rebuild(response, payload)
         if response.status_code >= 400:
             # 未匹配路由/方法由 Starlette 直接返回 {"detail": ...}，它没有 error 键，
             # 不能按成功包装，否则 HTTP 404/405 会带 code=0。
             return _rebuild(response, error_body(response.status_code, payload))
         if isinstance(payload, dict) and "error" in payload:
             return _rebuild(response, error_body(response.status_code, payload))
-        if isinstance(payload, dict) and "code" in payload and "msg" in payload:
-            # 已经是统一信封（例如未来的新路由直接返回信封），不重复包装
-            return _rebuild(response, payload)
         return _rebuild(response, success_body(payload))
 
 
