@@ -14,6 +14,11 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("NEWS_SOURCE_MODE", "demo")
     monkeypatch.setenv("LLM_API_KEY", "")
     monkeypatch.setenv("INSIGHT_API_KEY", "secret")
+    # 宿主机若配置了 NO_PROXY=[::1]，httpx 0.28 会把它解析成非法端口；
+    # 这套用例只打 TestClient，不需要任何代理变量。
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                 "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
     app = create_app(load_settings())
     with TestClient(app) as c:
         yield c
@@ -153,7 +158,40 @@ def test_openapi_documents_envelope(client):
     operation = schema["paths"]["/v1/schemas"]["get"]["responses"]["200"]
     envelope = operation["content"]["application/json"]["schema"]
     assert set(envelope["required"]) == {"code", "msg", "data"}
-    assert "ApiError" in schema["components"]["schemas"]
+    # /v1/schemas 的 data 是数组；裸 dict 返回注解不能被文档化成 object。
+    assert envelope["properties"]["data"] == {}
+
+    api_error = schema["components"]["schemas"]["ApiError"]
+    assert "details" in api_error["properties"]
+
+    # FastAPI 预置的 422 必须被统一错误 schema 替换。
+    validation = schema["paths"]["/v1/articles"]["get"]["responses"]["422"]
+    assert validation["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ApiError"
+    }
 
     # 同一进程内第二次访问不能把 data schema 再包一层
     assert client.get("/openapi.json").json() == schema
+
+
+def test_all_v1_operations_have_envelope_and_api_error(client):
+    schema = client.get("/openapi.json").json()
+    operation_count = 0
+    for path, methods in schema["paths"].items():
+        if not path.startswith("/v1/"):
+            continue
+        for method, operation in methods.items():
+            if method.lower() not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            operation_count += 1
+            responses = operation["responses"]
+            for status, response in responses.items():
+                if not status.startswith("2"):
+                    continue
+                envelope = response["content"]["application/json"]["schema"]
+                assert set(envelope["required"]) == {"code", "msg", "data"}
+                assert "data" in envelope["properties"]
+            assert responses["422"]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ApiError"
+            }
+    assert operation_count >= 50

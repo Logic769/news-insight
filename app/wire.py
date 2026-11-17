@@ -180,7 +180,10 @@ def install(app) -> None:
             "properties": {
                 "code": {"type": "integer", "example": 40101},
                 "msg": {"type": "string", "example": "未登录或登录已过期"},
-                "data": {"nullable": True},
+                "data": {"description": "错误响应恒为 null"},
+                "details": {
+                    "description": "参数校验明细等可选上下文",
+                },
             },
         }
         for path, methods in schema.get("paths", {}).items():
@@ -198,6 +201,17 @@ def install(app) -> None:
                         .get("application/json", {})
                         .get("schema")
                     )
+                    # 路由返回裸 dict 时 FastAPI 生成
+                    # {"type":"object","additionalProperties":true,...}，它描述的是
+                    # 包装前的整个响应体，不是 data 的值。无法据此推断 data 结构时
+                    # 不约束 data，避免把数组结果文档化成 object。
+                    if (
+                        isinstance(inner, dict)
+                        and inner.get("type") == "object"
+                        and inner.get("additionalProperties") is True
+                        and "properties" not in inner
+                    ):
+                        inner = None
                     response["content"] = {
                         "application/json": {
                             "schema": {
@@ -213,17 +227,33 @@ def install(app) -> None:
                         }
                     }
                 for status in ("400", "401", "403", "404", "409", "422", "429", "500", "502", "503"):
-                    responses.setdefault(
-                        status,
-                        {
-                            "description": "统一错误响应",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/ApiError"}
-                                }
-                            },
-                        },
+                    # FastAPI 会为带参数的路由预置 422 + HTTPValidationError，
+                    # 必须覆盖而不是 setdefault，否则文档仍描述旧的 detail 结构。
+                    # 但已有自定义 schema 的路由保留其描述与 headers。
+                    existing = responses.get(status)
+                    existing_schema = (
+                        existing.get("content", {})
+                        .get("application/json", {})
+                        .get("schema")
+                        if isinstance(existing, dict)
+                        else None
                     )
+                    if (
+                        status != "422"
+                        and isinstance(existing, dict)
+                        and isinstance(existing_schema, dict)
+                        and existing_schema.get("$ref")
+                        not in (None, "#/components/schemas/HTTPValidationError")
+                    ):
+                        continue
+                    responses[status] = {
+                        "description": "统一错误响应",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ApiError"}
+                            }
+                        },
+                    }
         return schema
 
     app.openapi = openapi  # type: ignore[method-assign]
