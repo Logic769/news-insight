@@ -225,7 +225,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 ### 关键语义
 
 - **鉴权**：设置 `INSIGHT_API_KEY` 后，除 `/health`、`/docs`、`/redoc`、`/openapi.json` 外都要求 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`；`INSIGHT_REQUIRE_AUTH=1` 表示强制（未配置 key 时业务请求一律 401）。`NEWS_API_KEY` 是**出站**凭证（访问爬虫），与入站认证无关。
-- **错误体**：`/v1/*` 统一返回 `{"code": 0, "msg": "ok", "data": ..., "meta": ...}`（成功）或 `{"code": <非 0 整数>, "msg": "...", "data": null}`（失败，HTTP 状态码保留；422 校验错误额外带 `details`）。`/health`、`/docs`、`/redoc`、`/openapi.json` 不包装。业务码见 README「响应格式与错误码」：40101 未登录、40401 文章不存在、40402 清单不存在、40901 冲突、40902 清单不适用、42201 参数校验失败、42901 过多、50201 上游不可用、50301 暂不可用。实现位于 `app/wire.py`（`wire.install(app)` 在 `create_app` 末尾注册，位于鉴权中间件外层）。
+- **错误体**：`/v1/*` 统一返回 `{"code": 0, "msg": "ok", "data": ..., "meta": ...}`（成功）或 `{"code": <非 0 整数>, "msg": "...", "data": null}`（失败，HTTP 状态码保留；422 校验错误额外带 `details`）。`/health`、`/docs`、`/redoc`、`/openapi.json` 不包装。业务码见 README「响应格式与错误码」：40101 未登录、40400 资源不存在（含未匹配路由/方法）、40401 文章不存在、40402 清单不存在、40901 冲突、40902 清单不适用、42201 参数校验失败、42301 账号临时锁定、42901 过多、50201 上游不可用、50301 暂不可用。实现位于 `app/wire.py`（`wire.install(app)` 在 `create_app` 末尾注册，位于鉴权中间件外层）。
 - **同步 vs 异步**：`/v1/analyze` 是兼容接口，`limit` 上限 50；长批次用 `POST /v1/jobs`（`limit` 上限 10000）。两者共享 `ANALYZE_LOCK`（跨进程文件锁 `DATA_DIR/.insight.analyze.lock`）：同一时刻只允许一个批次在跑，避免多 worker 并行重复烧 token；job 拿不到锁直接标 `failed`（不排队等待）。
 - **作业队列**：每个 API 进程各有进程内 `ThreadPoolExecutor(max_workers=1)`，作业由提交它的进程执行（没有跨进程轮询）；`ANALYZE_LOCK` 文件锁保证多 worker 下同一时刻只有一个批次真正执行；相同 payload 的未完成 job 复用同一 id；排队（queued + running）超过 `ANALYZE_MAX_PENDING_JOBS`（默认 50）返回 429 `too_many_jobs`；进程启动时把上次遗留的 `queued` 与 `running` job 一并标为 `failed`（进程内执行器重启后无法恢复）。
 - **`due_before` 语义**：按文章级过滤——先找出 `deadline` 不晚于该日期的文章，再返回这些文章的抽取记录。**未指定 `field` 时只返回 `deadline` 行**（避免同一篇文章的 materials/contact 等行重复返回）；指定 `field` 时返回该字段行，但同样只限截止日期不晚于该日期的文章。
@@ -518,7 +518,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_relevance.py` | 文章级语义相关性：规则分有界且项目申报类高于 other、LLM 独立一次调用并按 `relevance_body_chars` 截断正文、LLMError 降级规则、`_parse_llm_score` 的 0–100 映射/布尔拒绝/原因截断 |
 | `test_backfill_relevance.py` | `backfill-relevance`：已有分不覆盖、缺失分补规则引擎、`remaining` 归零、二次运行 scanned=0、负数 limit 拒绝 |
 
-基线：宿主机全量 `pytest` **349 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **353 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 

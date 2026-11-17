@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from typing import Any
@@ -39,11 +40,12 @@ _CODE_BY_STATUS = {
     400: 40001,
     401: 40101,
     403: 40301,
-    404: 40401,
+    404: 40400,
     405: 40501,
     408: 40801,
     409: 40901,
     422: 42201,
+    423: 42301,
     429: 42901,
     500: 50001,
     502: 50201,
@@ -80,6 +82,8 @@ def error_body(status: int, payload: Any) -> dict[str, Any]:
             details = error.get("details")
         elif payload.get("msg"):
             message = str(payload["msg"])
+        elif payload.get("detail"):
+            message = str(payload["detail"])
     body: dict[str, Any] = {"code": error_code(status, name), "msg": message, "data": None}
     if details is not None:
         body["details"] = details
@@ -99,7 +103,14 @@ class UnifiedResponseMiddleware(BaseHTTPMiddleware):
     """把 ``/v1/*`` 的 JSON 响应改写为统一信封。"""
 
     async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:  # noqa: BLE001 - 未处理异常也必须落在 /v1 统一信封里
+            LOG.exception("未处理异常: %s %s", request.method, request.url.path)
+            return JSONResponse(
+                status_code=500,
+                content=error_body(500, {"msg": "服务器内部错误"}),
+            )
         path = request.url.path
         if not path.startswith("/v1/") or response.status_code in {204, 304}:
             return response
@@ -123,6 +134,10 @@ class UnifiedResponseMiddleware(BaseHTTPMiddleware):
             LOG.warning("无法解析 %s %s 的响应体，按成功空数据包装", request.method, path)
             return _rebuild(response, success_body(None))
 
+        if response.status_code >= 400:
+            # 未匹配路由/方法由 Starlette 直接返回 {"detail": ...}，它没有 error 键，
+            # 不能按成功包装，否则 HTTP 404/405 会带 code=0。
+            return _rebuild(response, error_body(response.status_code, payload))
         if isinstance(payload, dict) and "error" in payload:
             return _rebuild(response, error_body(response.status_code, payload))
         if isinstance(payload, dict) and "code" in payload and "msg" in payload:
@@ -154,7 +169,9 @@ def install(app) -> None:
     original_openapi = app.openapi
 
     def openapi() -> dict[str, Any]:
-        schema = original_openapi()
+        # FastAPI 会缓存 openapi_schema，原地改写会让第二次调用把信封再包一层；
+        # 每次基于副本生成，保证 /openapi.json 多次访问结果一致。
+        schema = copy.deepcopy(original_openapi())
         components = schema.setdefault("components", {}).setdefault("schemas", {})
         components["ApiError"] = {
             "type": "object",
