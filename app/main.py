@@ -18,7 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import __version__, accounts, auth, checklist_service, db, recommend
+from app import __version__, accounts, auth, checklist_service, db, recommend, wire
 from app.extraction import load_schemas
 from app.jobs import ANALYZE_LOCK, JobManager, JobQueueFull
 from app.news_client import NewsClient, UpstreamError
@@ -1719,6 +1719,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers=getattr(exc, "headers", None),
         )
 
+    # 最后注册：Starlette 后注册的中间件位于外层，才能把鉴权中间件直接返回的 401
+    # 也包进统一信封。
+    wire.install(app)
     return app
 
 
