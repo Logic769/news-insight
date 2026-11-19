@@ -2,6 +2,7 @@
   "schema_id": "project_application",
   "name": "项目申报关键线索",
   "description": "从项目申报类新闻中抽取申报要件。原文没有的字段必须返回 null，禁止推测。",
+  "category": "project_application",
   "trigger_tags": [
     "project_application"
   ],
@@ -29,7 +30,7 @@
     {
       "name": "deadline",
       "type": "date",
-      "description": "申报截止日期，归一化为 YYYY-MM-DD；原文为起止区间时取区间结束日期"
+      "description": "申报截止日期，归一化为 YYYY-MM-DD；原文为起止区间时取区间结束日期，不要把起始日期或受理开始日期当作截止日期"
     },
     {
       "name": "deadline_raw",

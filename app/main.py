@@ -1605,6 +1605,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {
                 "schema_id": sc.schema_id,
                 "name": sc.name,
+                "category": sc.category,
                 "trigger_tags": list(sc.trigger_tags),
                 "fields": [f["name"] for f in sc.fields],
             }

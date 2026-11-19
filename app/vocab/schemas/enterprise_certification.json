@@ -1,0 +1,69 @@
+{
+  "schema_id": "enterprise_certification",
+  "name": "企业资质申报关键信息",
+  "description": "从高新技术企业、专精特新、科技型中小企业等资质认定公告中抽取认定条件、材料和后续管理要求。原文没有的字段必须返回 null，禁止推测。",
+  "category": "enterprise_certification",
+  "trigger_tags": [],
+  "fields": [
+    {
+      "name": "certification_name",
+      "type": "string",
+      "description": "资质、认定或入库培育项目的正式名称"
+    },
+    {
+      "name": "issuing_authority",
+      "type": "string",
+      "description": "发布或组织认定的单位"
+    },
+    {
+      "name": "certification_level",
+      "type": "string",
+      "description": "资质等级或认定类别，如国家级、省级、专精特新“小巨人”、创新型中小企业"
+    },
+    {
+      "name": "eligible_entities",
+      "type": "string",
+      "description": "可申报的企业类型、规模、注册地或行业范围"
+    },
+    {
+      "name": "certification_conditions",
+      "type": "string",
+      "description": "认定条件或评价指标，如研发投入、知识产权、营收、人员比例等要求"
+    },
+    {
+      "name": "materials",
+      "type": "array",
+      "description": "申报所需材料清单，逐项列出"
+    },
+    {
+      "name": "deadline",
+      "type": "date",
+      "description": "申报截止日期，归一化为 YYYY-MM-DD；原文为起止区间时取区间结束日期，不要把起始日期或受理开始日期当作截止日期"
+    },
+    {
+      "name": "deadline_raw",
+      "type": "string",
+      "description": "截止时间的原文表述"
+    },
+    {
+      "name": "validity_period",
+      "type": "string",
+      "description": "资质有效期、复审周期或动态管理期限"
+    },
+    {
+      "name": "review_requirement",
+      "type": "string",
+      "description": "复审、复核、抽查或动态管理要求"
+    },
+    {
+      "name": "benefits",
+      "type": "string",
+      "description": "认定后可享受的优惠、奖励或支持政策"
+    },
+    {
+      "name": "application_channel",
+      "type": "string",
+      "description": "申报渠道、系统名称或网址"
+    }
+  ]
+}

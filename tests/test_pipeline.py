@@ -27,16 +27,21 @@ def test_demo_batch_tags_and_extracts(settings):
         # 绝对日期：2026年4月20日
         row = db.get_article(conn, "a1f0c3e2b7d94a51")
         assert row is not None
+        assert row["category"] == "project_application"
+        assert set(row["extractions"]) == {"project_application"}
         assert row["extractions"]["project_application"]["deadline"]["value"] == "2026-04-20"
         assert row["extractions"]["project_application"]["funding_amount"]["value"] == "500万元"
 
         # 相对日期：自发布之日起30日内，基准取 published_at_utc=2026-03-05
         row2 = db.get_article(conn, "b2e1d4f3c8a95b62")
+        assert row2["category"] == "project_application"
+        assert set(row2["extractions"]) == {"project_application"}
         assert row2["extractions"]["project_application"]["deadline"]["value"] == "2026-04-04"
 
         # 非申报文章不触发抽取
         row3 = db.get_article(conn, "c3a2e5f4d9b06c73")
         assert "project_application" not in row3["extractions"]
+        assert row3["extractions"] == {}
         # 央行降准不属于 5 大类 → other；兜底类不做语义打标，但规则引擎仍保住行业标签
         assert row3["category"] == "other"
         assert row3["category_engine"] == "rules"

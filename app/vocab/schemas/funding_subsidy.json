@@ -1,0 +1,69 @@
+{
+  "schema_id": "funding_subsidy",
+  "name": "资金补贴关键信息",
+  "description": "从财政补贴、奖补、贴息、资助、奖励等资金政策与兑现通知中抽取资金类型、额度、对象和办理要求。原文没有的字段必须返回 null，禁止推测。",
+  "category": "funding_subsidy",
+  "trigger_tags": [],
+  "fields": [
+    {
+      "name": "subsidy_name",
+      "type": "string",
+      "description": "补贴、奖补、贴息、资助或奖励项目的正式名称"
+    },
+    {
+      "name": "issuing_authority",
+      "type": "string",
+      "description": "发布或组织申报的单位"
+    },
+    {
+      "name": "funding_type",
+      "type": "string",
+      "description": "资金类型，如财政补贴、奖补、贴息、资助、奖励、专项资金"
+    },
+    {
+      "name": "funding_amount",
+      "type": "string",
+      "description": "补贴金额、资助额度或奖励金额"
+    },
+    {
+      "name": "funding_standard",
+      "type": "string",
+      "description": "补助标准、计算方式或支持比例，如“按实际投入的30%给予补助”"
+    },
+    {
+      "name": "eligible_entities",
+      "type": "string",
+      "description": "可申报的对象，如企业、个人、机构及其规模或行业范围"
+    },
+    {
+      "name": "subsidy_conditions",
+      "type": "string",
+      "description": "申报条件或兑现条件"
+    },
+    {
+      "name": "deadline",
+      "type": "date",
+      "description": "申报或兑现截止日期，归一化为 YYYY-MM-DD；原文为起止区间时取区间结束日期，不要把起始日期或受理开始日期当作截止日期"
+    },
+    {
+      "name": "deadline_raw",
+      "type": "string",
+      "description": "截止时间的原文表述"
+    },
+    {
+      "name": "materials",
+      "type": "array",
+      "description": "申报所需材料清单，逐项列出"
+    },
+    {
+      "name": "application_channel",
+      "type": "string",
+      "description": "申报渠道、系统名称或网址"
+    },
+    {
+      "name": "contact",
+      "type": "string",
+      "description": "联系人及联系电话"
+    }
+  ]
+}

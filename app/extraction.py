@@ -1,8 +1,9 @@
 """Schema-driven key-fact extraction.
 
-Extraction runs only for articles whose tags intersect the schema's
-`trigger_tags` -- tagging acts as the router, so we never pay extraction cost
-on irrelevant news.
+Extraction runs only for articles whose category matches a schema's
+`category` (or, for legacy callers without a category, whose tags intersect
+`trigger_tags`) -- the category acts as the router, so one article never gets
+another category's template and we never pay extraction cost on irrelevant news.
 
 Two guardrails matter more than prompt quality here:
 
@@ -69,6 +70,8 @@ class ExtractSchema:
     name: str
     trigger_tags: tuple[str, ...]
     fields: tuple[dict[str, Any], ...]
+    # 大类路由键：一篇新闻只应命中一个 schema，避免项目申报模板被套到其他大类。
+    category: str = ""
 
 
 @lru_cache(maxsize=8)
@@ -79,6 +82,7 @@ def load_schema(path: Path) -> ExtractSchema:
         name=str(payload.get("name", payload["schema_id"])),
         trigger_tags=tuple(payload.get("trigger_tags", [])),
         fields=tuple(payload.get("fields", [])),
+        category=str(payload.get("category") or "").strip(),
     )
 
 
@@ -297,11 +301,12 @@ _DATE_PART = (
 # 区间右端可能只写「日」：中文公告里「11月25日至30日」「9月12日至17日」很常见。
 _DAY_ONLY = r"\d{1,2}\s*日"
 _RANGE_SEP = r"[至到—–~～\-－→]"
+_TIME_PART = r"\d{1,2}[:：]\d{2}"
 
-# 「A 至 B」起止区间：日期后允许跟 HH:MM，政府公告写成「2025年11月25日17:00至2025年12月1日9:00」。
+# 「A 至 B」起止区间：两端日期后都允许跟 HH:MM，政府公告写成「2025年11月25日17:00至2025年12月1日9:00」。
 _RANGE_RE = re.compile(
-    rf"({_DATE_PART})(?:\s*\d{{1,2}}[:：]\d{{2}})?\s*{_RANGE_SEP}\s*"
-    rf"({_DATE_PART}|{_DAY_ONLY})"
+    rf"({_DATE_PART})(?:\s*{_TIME_PART})?\s*{_RANGE_SEP}\s*"
+    rf"({_DATE_PART}|{_DAY_ONLY})(?:\s*{_TIME_PART})?"
 )
 
 # 前缀只收「截止」类语义词：裸的「申报」「受理」多半是区间起点
@@ -313,8 +318,8 @@ _DEADLINE_RANGE_RE = re.compile(
     # 不跨逗号：否则「截止后不再受理，评审时间3月1日至3月5日」会把评审区间
     # 当成截止区间。真实写法「截止时间：4月20日」没有逗号，不受影响。
     + r"[^。；，\n]{0,20}?"
-    + rf"({_DATE_PART})"
-    + rf"\s*{_RANGE_SEP}\s*({_DATE_PART}|{_DAY_ONLY})"
+    + rf"({_DATE_PART})(?:\s*{_TIME_PART})?"
+    + rf"\s*{_RANGE_SEP}\s*({_DATE_PART}|{_DAY_ONLY})(?:\s*{_TIME_PART})?"
 )
 
 # 文本里出现「截止」字样时，全文唯一区间的兜底必须让位给模型判断：
@@ -327,7 +332,8 @@ _DEADLINE_SINGLE_RE = re.compile(
     _DEADLINE_PREFIX
     + r"[^。；，\n]{0,30}?("
     + _DATE_PART
-    + r")(?![0-9年月日])(?!\s*"
+    # 日期后紧跟「HH:MM 至/到」时是区间起点，不能被单日期分支回溯吞掉。
+    + rf")(?!\s*{_TIME_PART}\s*{_RANGE_SEP})(?:\s*{_TIME_PART})?(?![0-9年月日])(?!\s*"
     + _RANGE_SEP
     + r")"
 )
@@ -338,8 +344,8 @@ _APPLICATION_RANGE_RE = re.compile(
     r"(?:网上填报|网络填报|申报|填报|报送|受理|提交)(?:时间|日期|期限)?"
     # 同样不跨逗号：避免把「不再受理，评审时间...」里的「受理」当成申报前缀。
     + r"[^。；，\n]{0,20}?"
-    + rf"({_DATE_PART})(?:\s*\d{{1,2}}[:：]\d{{2}})?\s*{_RANGE_SEP}\s*"
-    + rf"({_DATE_PART}|{_DAY_ONLY})"
+    + rf"({_DATE_PART})(?:\s*{_TIME_PART})?\s*{_RANGE_SEP}\s*"
+    + rf"({_DATE_PART}|{_DAY_ONLY})(?:\s*{_TIME_PART})?"
 )
 
 
@@ -438,33 +444,36 @@ def _emit_deadline(
 def extract_with_rules(schema: ExtractSchema, body: str, base: dt.date | None) -> ExtractionResult:
     """Deterministic fallback used when no LLM is configured.
 
-    Only high-precision, pattern-shaped fields are attempted (deadline plus two
-    single-pattern facts). Anything that needs judgement is left out, so a caller
-    can distinguish "the article does not state it" from "nobody looked".
+    Only high-precision, pattern-shaped fields are attempted. The same rules are
+    applied to every category whose schema declares the field: deadline for
+    project/talent/certification/funding, amount for project/talent/funding, and
+    contact for project/talent/funding. Industry policy has no such fields and
+    therefore stays LLM-only.
     """
     result = ExtractionResult(schema_id=schema.schema_id, engine="rules")
-    if schema.schema_id != "project_application":
-        return result
     allowed = {f["name"] for f in schema.fields}
+    if not allowed:
+        return result
     text = body or ""
 
-    range_match = _DEADLINE_RANGE_RE.search(text)
-    if range_match:
-        # 「3月1日至4月20日」取右端：区间结束才是截止
-        deadline = _resolve_range_end(range_match.group(1), range_match.group(2), base)
-        if deadline:
-            _emit_deadline(result, allowed, deadline, range_match.group(0).strip())
-    else:
-        for _, pattern in _RULE_PATTERNS:
-            m = re.search(pattern, text)
-            if not m:
-                continue
-            raw = m.group(0).strip()
-            deadline = normalize_deadline(raw, base)
-            if deadline is None:
-                continue
-            _emit_deadline(result, allowed, deadline, raw)
-            break
+    if "deadline" in allowed:
+        range_match = _DEADLINE_RANGE_RE.search(text)
+        if range_match:
+            # 「3月1日至4月20日」取右端：区间结束才是截止
+            deadline = _resolve_range_end(range_match.group(1), range_match.group(2), base)
+            if deadline:
+                _emit_deadline(result, allowed, deadline, range_match.group(0).strip())
+        else:
+            for _, pattern in _RULE_PATTERNS:
+                m = re.search(pattern, text)
+                if not m:
+                    continue
+                raw = m.group(0).strip()
+                deadline = normalize_deadline(raw, base)
+                if deadline is None:
+                    continue
+                _emit_deadline(result, allowed, deadline, raw)
+                break
 
     m = re.search(
         r"[^。；\n]{0,20}(?:资助|补贴|经费|扶持|支持)[^。；\n]{0,20}?(\d+(?:\.\d+)?\s*万?元)[^。；\n]{0,10}",
@@ -484,7 +493,12 @@ def extract_with_rules(schema: ExtractSchema, body: str, base: dt.date | None) -
     return result
 
 
-def trigger_schemas(schemas: list[ExtractSchema], hits: list[TagHit]) -> list[ExtractSchema]:
+def trigger_schemas(
+    schemas: list[ExtractSchema], hits: list[TagHit], category: str = ""
+) -> list[ExtractSchema]:
+    """按大类路由 schema；没有 category 时保留旧的标签路由（兼容旧调用）。"""
+    if category:
+        return [s for s in schemas if s.category == category]
     tag_ids = {h.tag_id for h in hits}
     return [s for s in schemas if tag_ids & set(s.trigger_tags)]
 
@@ -499,8 +513,9 @@ def extract_article(
     *,
     published_at_utc: str | None,
     published_at: str | None,
+    category: str = "",
 ) -> list[ExtractionResult]:
-    matched = trigger_schemas(schemas, hits)
+    matched = trigger_schemas(schemas, hits, category)
     if not matched:
         return []
     base = _parse_base(published_at_utc, published_at)
