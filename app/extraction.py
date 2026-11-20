@@ -416,12 +416,14 @@ def _resolve_range_end(
 ) -> str | None:
     """把「A 至 B」的右端 B 归一化为 ISO 日期；无法确定时返回 None。
 
-    右端有三种写法：完整日期（不依赖 base）、「M月D日」（按 base 年推断）、
-    以及只写「日」的省略形式（借用左端的年月补齐）。
+    右端有三种写法：完整日期（不依赖 base）、「M月D日」（左端有完整年月日时
+    按左端年份推断，否则回退按 base 年推断）、以及只写「日」的省略形式
+    （借用左端的年月补齐）。
     """
     # 区间右端不能早于左端：左端写了完整年月日、右端只写「M月D日」时，
     # 以左端年份补齐；补出来早于左端就说明跨年，推进一年。
     # 「2026年12月20日至1月10日」-> 2027-01-10；「2026年1月1日至1月10日」-> 2026-01-10。
+    # 「2023年12月20日至2月29日」-> 2024-02-29（2月29日只在闰年合法，按年份逐个尝试）。
     # 这一步优先于 normalize_deadline 的“早于发布时间 180 天”启发：后者只认 base，
     # 会把同年追溯区间误推到次年；past_ok 时又可能把跨年区间压回左端之前。
     start_match = re.search(
@@ -435,19 +437,18 @@ def _resolve_range_end(
                 int(start_match.group(2)),
                 int(start_match.group(3)),
             )
-            candidate = dt.date(
-                start_date.year,
-                int(end_month_day.group(1)),
-                int(end_month_day.group(2)),
-            )
         except ValueError:
             return None
-        if candidate < start_date:
+        month = int(end_month_day.group(1))
+        day = int(end_month_day.group(2))
+        for year in (start_date.year, start_date.year + 1):
             try:
-                candidate = candidate.replace(year=start_date.year + 1)
+                candidate = dt.date(year, month, day)
             except ValueError:
-                return None
-        return candidate.isoformat()
+                continue
+            if candidate >= start_date:
+                return candidate.isoformat()
+        return None
     end = normalize_deadline(end_raw, base, allow_past=allow_past)
     if end is not None:
         return end

@@ -342,3 +342,37 @@ def test_range_end_keeps_retroactive_same_year_interval():
     field = {f.name: f for f in result.fields}["deadline"]
     assert field.value == "2026-01-10"
     assert field.verified is True
+
+
+def test_range_end_crosses_year_to_leap_day():
+    """跨年右端为 2月29日 时按闰年补齐，不能因当年非法而丢弃。"""
+    raw = "截止时间：2023年12月20日至2月29日"
+    body = raw + "，逾期不予受理。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2024-02-29", raw),
+        _schema(),
+        "申报通知",
+        body,
+        base=dt.date(2024, 1, 1),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2024-02-29"
+    assert field.verified is True
+
+
+def test_range_end_uses_start_year_not_base_year():
+    """左端年份与 base 年不同时，右端年份必须按左端补齐（覆盖两条 allow_past 路径）。"""
+    raw = "截止时间：2026年12月20日至1月10日"
+    body = raw + "，逾期不予受理。"
+    for schema in (_schema(), _past_ok_schema()):
+        result = extract_with_llm(
+            _llm_answering("deadline", "2027-01-10", raw),
+            schema,
+            "申报通知",
+            body,
+            base=dt.date(2025, 12, 20),
+            body_chars=1000,
+        )
+        field = {f.name: f for f in result.fields}["deadline"]
+        assert field.value == "2027-01-10", schema.schema_id
