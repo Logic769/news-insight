@@ -1,0 +1,64 @@
+{
+  "schema_id": "talent_application",
+  "name": "人才申报关键信息",
+  "description": "从人才计划、人才项目、职称与团队评选等公告中抽取申报对象、条件、待遇和办理要求。原文没有的字段必须返回 null，禁止推测。",
+  "category": "talent_application",
+  "trigger_tags": [],
+  "fields": [
+    {
+      "name": "talent_program_name",
+      "type": "string",
+      "description": "人才计划、人才项目或评选活动的正式名称"
+    },
+    {
+      "name": "issuing_authority",
+      "type": "string",
+      "description": "发布或组织申报的单位"
+    },
+    {
+      "name": "talent_targets",
+      "type": "string",
+      "description": "面向的人才类别、层次或对象，如领军人才、青年拔尖人才、创新团队"
+    },
+    {
+      "name": "talent_eligibility",
+      "type": "string",
+      "description": "申报条件，如年龄、学历、职称、任职年限、团队组成等要求"
+    },
+    {
+      "name": "benefits",
+      "type": "string",
+      "description": "入选后可享受的支持措施、待遇或政策，如安家补贴、科研经费、编制保障"
+    },
+    {
+      "name": "funding_amount",
+      "type": "string",
+      "description": "资助、补贴或奖励金额/额度"
+    },
+    {
+      "name": "deadline",
+      "type": "date",
+      "description": "申报截止日期，归一化为 YYYY-MM-DD；原文为起止区间时取区间结束日期，不要把起始日期或受理开始日期当作截止日期"
+    },
+    {
+      "name": "deadline_raw",
+      "type": "string",
+      "description": "截止时间的原文表述，如“自发布之日起30日内”"
+    },
+    {
+      "name": "materials",
+      "type": "array",
+      "description": "申报所需材料清单，逐项列出"
+    },
+    {
+      "name": "application_channel",
+      "type": "string",
+      "description": "申报渠道、系统名称或网址"
+    },
+    {
+      "name": "contact",
+      "type": "string",
+      "description": "联系人及联系电话"
+    }
+  ]
+}

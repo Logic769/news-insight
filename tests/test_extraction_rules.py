@@ -8,7 +8,7 @@
 
 import datetime as dt
 
-from app.extraction import ExtractSchema, extract_with_rules, normalize_deadline
+from app.extraction import ExtractSchema, extract_with_llm, extract_with_rules, normalize_deadline
 
 
 def _schema() -> ExtractSchema:
@@ -30,6 +30,40 @@ def test_date_range_takes_right_end():
     result = extract_with_rules(_schema(), body, dt.date(2026, 3, 1))
     assert {f.name: f.value for f in result.fields}["deadline"] == "2026-04-20"
 
+def test_deadline_range_with_times_takes_end_date():
+    # 政府公告常见「截止时间：2025年11月25日17:00至2025年12月1日9:00」，
+    # 起始日期带时刻时不能把起始日当截止日。
+    body = "截止时间：2025年11月25日17:00至2025年12月1日9:00，逾期不予受理。"
+    result = extract_with_rules(_schema(), body, dt.date(2025, 11, 1))
+    assert {f.name: f.value for f in result.fields}["deadline"] == "2025-12-01"
+
+
+def test_deadline_range_with_spaced_times_takes_end_date():
+    body = "截止时间：2025年11月25日 17:00 至 2025年12月1日 9:00。"
+    result = extract_with_rules(_schema(), body, dt.date(2025, 11, 1))
+    assert {f.name: f.value for f in result.fields}["deadline"] == "2025-12-01"
+
+
+def test_llm_deadline_range_with_times_takes_end_date():
+    class FakeLLM:
+        def chat_json(self, system, user, **kwargs):
+            return {
+                "fields": {
+                    "deadline": {
+                        "value": "2025-11-25",
+                        "raw_text": "截止时间：2025年11月25日17:00至2025年12月1日9:00",
+                        "confidence": 0.9,
+                    }
+                }
+            }
+
+    body = "截止时间：2025年11月25日17:00至2025年12月1日9:00，逾期不予受理。"
+    result = extract_with_llm(
+        FakeLLM(), _schema(), "申报通知", body, base=dt.date(2025, 11, 1), body_chars=1000
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2025-12-01"
+
 
 def test_bare_start_date_is_not_a_deadline():
     # 「申报时间」不是截止语义词，宁可抽不到也不能把开始日期当截止日期
@@ -48,6 +82,33 @@ def test_leap_day_does_not_raise():
     assert normalize_deadline("截止2月29日", dt.date(2028, 12, 1)) is None
 
 
+def test_llm_start_date_with_time_is_replaced_by_deadline_end():
+    # 原文同时有「起始时间」和「截止时间」时，LLM 可能把起始日期当 deadline；
+    # 截止日期带 HH:MM 时也必须能从「截止时间」分支取到结束日，而不是取第一个日期。
+    class FakeLLM:
+        def chat_json(self, system, user, **kwargs):
+            return {
+                "fields": {
+                    "deadline": {
+                        "value": "2016-09-22",
+                        "raw_text": "项目网上填报起始时间为2016年9月22日9:00，截止时间为2016年10月17日16:30",
+                        "confidence": 0.8,
+                    }
+                }
+            }
+
+    # body 必须包含 raw_text，否则 _locate 失败、verified 恒为 False，
+    # 下面的「not date_mismatch」断言就永远为真，测不出降级逻辑被删掉。
+    body = "请按通知填报：项目网上填报起始时间为2016年9月22日9:00，截止时间为2016年10月17日16:30，逾期不予受理。"
+    result = extract_with_llm(
+        FakeLLM(), _schema(), "申报通知", body, base=dt.date(2016, 9, 1), body_chars=1000
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2016-10-17"
+    assert field.confidence <= 0.5
+    assert field.verified is False
+
+
 def test_rules_engine_never_claims_verified():
     """正则只证明文本出现过，不证明语义正确，所以规则引擎一律 verified=False。"""
     body = "申报截止时间为2026年4月20日，资助经费不超过500万元，联系人：王工 电话：0571-88886666。"
@@ -57,3 +118,261 @@ def test_rules_engine_never_claims_verified():
     values = {f.name: f.value for f in result.fields}
     assert values["deadline"] == "2026-04-20"
     assert "88886666" in values["contact"]
+
+
+def _policy_schema() -> ExtractSchema:
+    return ExtractSchema(
+        schema_id="industry_policy",
+        name="行业政策",
+        trigger_tags=(),
+        fields=(
+            {"name": "effective_date", "type": "date", "description": "施行日期"},
+            {"name": "policy_name", "type": "string", "description": "政策名称"},
+        ),
+        category="industry_policy",
+    )
+
+
+def _llm_answering(name: str, value: object, raw_text: str, confidence: float = 0.9):
+    """只吐单个字段的 stub LLM，本文件的日期用例共用。"""
+
+    class _FakeLLM:
+        def chat_json(self, system, user, **kwargs):
+            return {
+                "fields": {
+                    name: {
+                        "value": value,
+                        "raw_text": raw_text,
+                        "confidence": confidence,
+                    }
+                }
+            }
+
+    return _FakeLLM()
+
+
+def _policy_result(
+    value: str, raw: str, base: dt.date = dt.date(2026, 9, 1)
+):
+    """按行业政策 schema 跑一次 LLM 抽取，正文里一定包含 raw。"""
+    body = "本办法" + raw + "，有效期三年。"
+    return extract_with_llm(
+        _llm_answering("effective_date", value, raw),
+        _policy_schema(),
+        "关于印发管理办法的通知",
+        body,
+        base=base,
+        body_chars=1000,
+    )
+
+
+def _policy_field(value: str, raw: str) -> object:
+    return {f.name: f for f in _policy_result(value, raw).fields}["effective_date"]
+
+
+def test_effective_date_is_not_rolled_to_next_year():
+    """9 月发布、「自1月1日起施行」指当年 1 月 1 日，不能被截止日期的跨年启发挪到次年。"""
+    field = _policy_field("2026-01-01", "自1月1日起施行")
+    assert field.value == "2026-01-01"
+    # 原文确实写了这句话，代码也没有改写模型给出的日期
+    assert field.confidence == 0.9
+    assert field.verified is True
+
+
+def test_effective_date_accepts_next_year_start():
+    """次年 1 月 1 日施行是合理的：落在窗口内就采信模型日期，不推进也不降级。"""
+    field = _policy_field("2027-01-01", "自1月1日起施行")
+    assert field.value == "2027-01-01"
+    assert field.confidence == 0.9
+    assert field.verified is True
+
+
+def test_effective_date_rejects_far_off_model_year():
+    """模型编错年份（离发布年超过一年）不能包装成高置信事实，退回按原文重算并降级。"""
+    field = _policy_field("2019-01-01", "自1月1日起施行")
+    assert field.value == "2026-01-01"
+    assert field.confidence <= 0.4
+    assert field.verified is False
+
+
+def test_effective_date_rejects_impossible_calendar_date():
+    """2026-02-30 不是真实日期：不能因为「原文没写年份」就照单全收。"""
+    field = _policy_field("2026-02-30", "自1月1日起施行")
+    assert field.value == "2026-01-01"
+    assert field.confidence <= 0.4
+    assert field.verified is False
+
+
+def test_deadline_still_rolls_over_to_next_year():
+    """截止日期的既有跨年启发必须保留，生效日期则不套用。"""
+    assert normalize_deadline("截止1月15日", dt.date(2025, 12, 31)) == "2026-01-15"
+    assert normalize_deadline("自1月1日起施行", dt.date(2026, 9, 1), allow_past=True) == "2026-01-01"
+
+
+def test_deadline_llm_still_rolls_over_without_explicit_year():
+    """原文只写「1月10日」时截止日仍须推进到次年，防止 allow_past 误伤 deadline。"""
+    # 这里刻意不用「截止1月10日」：_pick_range 会把带截止语义的单日期当成起止
+    # 同一的区间、走右端分支，由下面 test_deadline_single_date_still_rolls_over_
+    # without_past_ok 单独覆盖。模型值用非 ISO（「1月10日」）才真正走
+    # normalize_deadline 的跨年分支。
+    raw = "1月10日"
+    body = "请于" + raw + "前提交材料。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "1月10日", raw),
+        _schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2027-01-10"
+
+
+def test_effective_date_with_explicit_year_follows_text():
+    """原文写了年份就仍以原文为准：模型给错年份必须降级待人工确认。"""
+    field = _policy_field("2026-01-01", "自2025年1月1日起施行")
+    assert field.value == "2025-01-01"
+    assert field.confidence <= 0.4
+    assert field.verified is False
+
+
+def test_effective_date_without_model_iso_uses_base_year():
+    """模型没给完整日期时按基准年补齐，同样不做跨年推进。"""
+    field = _policy_field("1月1日", "自1月1日起施行")
+    assert field.value == "2026-01-01"
+
+
+def test_effective_date_relative_phrase_uses_publish_base():
+    """「自发布之日起30日内」没有月日可对齐，必须按发布时间重算，不能采信模型 ISO。"""
+    field = _policy_field("2026-12-31", "自发布之日起30日内")
+    assert field.value == "2026-10-01"
+    assert field.confidence <= 0.4
+    assert field.verified is False
+
+
+def test_effective_date_rejects_month_day_mismatch():
+    """模型给 2026-03-15 而原文只写「1月1日」：月日对不上，不能采信模型补齐的年份。"""
+    field = _policy_field("2026-03-15", "自1月1日起施行")
+    assert field.value == "2026-01-01"
+    assert field.confidence <= 0.4
+    assert field.verified is False
+
+
+def _past_ok_schema() -> ExtractSchema:
+    return ExtractSchema(
+        schema_id="past_ok_probe",
+        name="带 past_ok 的截止字段",
+        trigger_tags=(),
+        fields=(
+            {
+                "name": "deadline",
+                "type": "date",
+                "description": "截止日期",
+                "past_ok": True,
+            },
+        ),
+    )
+
+
+def test_past_ok_deadline_single_date_keeps_past_year():
+    """声明 past_ok 的 deadline 单日期不能走区间路径被推进到次年。"""
+    raw = "截止1月10日"
+    body = "请于" + raw + "前提交材料。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _past_ok_schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2026-01-10"
+
+
+def test_deadline_single_date_still_rolls_over_without_past_ok():
+    """未声明 past_ok 时，带「截止」的单日期仍按截止语义推进到次年。"""
+    raw = "截止1月10日"
+    body = "请于" + raw + "前提交材料。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2027-01-10"
+    assert field.confidence <= 0.5
+    assert field.verified is False
+
+
+def test_range_end_never_precedes_start_date_with_past_ok():
+    """past_ok 只允许右端早于发布时间，不允许右端早于区间左端。"""
+    raw = "截止时间：2026年12月20日至1月10日"
+    body = raw + "，逾期不予受理。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _past_ok_schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2027-01-10"
+    assert field.confidence <= 0.5
+    assert field.verified is False
+
+
+def test_range_end_keeps_retroactive_same_year_interval():
+    """「2026年1月1日至1月10日」这类同年区间不能被 180 天启发推到次年。"""
+    raw = "截止时间：2026年1月1日至1月10日"
+    body = raw + "，逾期不予受理。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2026-01-10"
+    assert field.verified is True
+
+
+def test_range_end_crosses_year_to_leap_day():
+    """跨年右端为 2月29日 时按闰年补齐，不能因当年非法而丢弃。"""
+    raw = "截止时间：2023年12月20日至2月29日"
+    body = raw + "，逾期不予受理。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2024-02-29", raw),
+        _schema(),
+        "申报通知",
+        body,
+        base=dt.date(2024, 1, 1),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2024-02-29"
+    assert field.verified is True
+
+
+def test_range_end_uses_start_year_not_base_year():
+    """左端年份与 base 年不同时，右端年份必须按左端补齐（覆盖两条 allow_past 路径）。"""
+    raw = "截止时间：2026年12月20日至1月10日"
+    body = raw + "，逾期不予受理。"
+    for schema in (_schema(), _past_ok_schema()):
+        result = extract_with_llm(
+            _llm_answering("deadline", "2027-01-10", raw),
+            schema,
+            "申报通知",
+            body,
+            base=dt.date(2025, 12, 20),
+            body_chars=1000,
+        )
+        field = {f.name: f for f in result.fields}["deadline"]
+        assert field.value == "2027-01-10", schema.schema_id

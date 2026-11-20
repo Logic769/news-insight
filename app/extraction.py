@@ -1,8 +1,9 @@
 """Schema-driven key-fact extraction.
 
-Extraction runs only for articles whose tags intersect the schema's
-`trigger_tags` -- tagging acts as the router, so we never pay extraction cost
-on irrelevant news.
+Extraction runs only for articles whose category matches a schema's
+`category` (or, for legacy callers without a category, whose tags intersect
+`trigger_tags`) -- the category acts as the router, so one article never gets
+another category's template and we never pay extraction cost on irrelevant news.
 
 Two guardrails matter more than prompt quality here:
 
@@ -69,6 +70,8 @@ class ExtractSchema:
     name: str
     trigger_tags: tuple[str, ...]
     fields: tuple[dict[str, Any], ...]
+    # 大类路由键：一篇新闻只应命中一个 schema，避免项目申报模板被套到其他大类。
+    category: str = ""
 
 
 @lru_cache(maxsize=8)
@@ -79,6 +82,7 @@ def load_schema(path: Path) -> ExtractSchema:
         name=str(payload.get("name", payload["schema_id"])),
         trigger_tags=tuple(payload.get("trigger_tags", [])),
         fields=tuple(payload.get("fields", [])),
+        category=str(payload.get("category") or "").strip(),
     )
 
 
@@ -126,8 +130,48 @@ def _cn_to_int(token: str) -> int | None:
     return _CN_NUM.get(token)
 
 
-def normalize_deadline(raw_text: str, base: dt.date | None) -> str | None:
-    """Best-effort normalization of a Chinese deadline phrase to YYYY-MM-DD."""
+# 采信模型 ISO 日期的年份容差：生效日期通常与发布年相差不超过一年（当年或次年施行），
+# 超出这个范围的多半是模型编错年份。
+_MODEL_DATE_YEAR_WINDOW = 1
+
+
+def _plausible_model_date(value: str, base: dt.date | None) -> bool:
+    """模型给出的完整日期能否用于「原文没写年份」的采信分支。
+
+    该分支绕过了「按原文重算」，至少要保证日期真实存在（2026-02-30 不是日期）、
+    且年份离基准日不远；否则退回按原文重算并降级，避免把模型幻觉当成高置信事实。
+    """
+    try:
+        parsed = dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return base is None or abs(parsed.year - base.year) <= _MODEL_DATE_YEAR_WINDOW
+
+
+def _model_date_matches_text(value: str, raw_text: str) -> bool:
+    """模型给出的 ISO 日期是否是原文「M月D日」按年份的等价写法。
+
+    只有原文确实是缺年份的月日表达、且模型给出的月日与原文一致时才成立；
+    相对日期（「自发布之日起30日内」）没有月日可对齐，必须按发布时间重算。
+    """
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", raw_text or "")
+    if not m:
+        return False
+    try:
+        parsed = dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return (parsed.month, parsed.day) == (int(m.group(1)), int(m.group(2)))
+
+
+def normalize_deadline(
+    raw_text: str, base: dt.date | None, *, allow_past: bool = False
+) -> str | None:
+    """Best-effort normalization of a Chinese date phrase to YYYY-MM-DD.
+
+    ``allow_past`` 用于生效日期这类可以早于发布日的字段：它们不能套用
+    截止日期的「早于基准 180 天即视为跨年」启发。
+    """
     text = (raw_text or "").strip()
     if not text:
         return None
@@ -152,8 +196,9 @@ def normalize_deadline(raw_text: str, base: dt.date | None) -> str | None:
             candidate = dt.date(base.year, int(m.group(1)), int(m.group(2)))
         except ValueError:
             return None
-        # 12月发布却写 1月截止 -> 跨年
-        if candidate < base - dt.timedelta(days=180):
+        # 12月发布却写 1月截止 -> 跨年。生效日期可以追溯（政策 9 月发布、
+        # 原文「自1月1日起施行」指的是当年 1 月 1 日），不做这条推进。
+        if not allow_past and candidate < base - dt.timedelta(days=180):
             try:
                 candidate = candidate.replace(year=base.year + 1)
             except ValueError:  # 2月29日跨到非闰年
@@ -236,13 +281,20 @@ def extract_with_llm(
             # 几乎总是「开始至结束」，而 LLM 习惯把起点当成截止日。
             # 只对 deadline（或 schema 显式标了 range_end 的字段）生效：评审时间
             # 这类字段的起点反而更有意义。
+            # 生效日期与截止日期的年份语义不同：前者允许早于发布日（追溯生效），
+            # 不能套用截止日期的跨年推进。字段名之外，schema 也可用 past_ok 显式声明。
+            # 必须在区间解析之前确定：声明 past_ok 的 deadline 单日期（「截止1月10日」
+            # 会被 _pick_range 当成起止同一的区间）同样不该被推进到次年。
+            allow_past = name == "effective_date" or bool(spec.get("past_ok"))
             range_parts = (
                 _pick_range(raw_text)
                 if name == "deadline" or spec.get("range_end")
                 else None
             )
             end_value = (
-                _resolve_range_end(range_parts[0], range_parts[1], base)
+                _resolve_range_end(
+                    range_parts[0], range_parts[1], base, allow_past=allow_past
+                )
                 if range_parts
                 else None
             )
@@ -259,10 +311,24 @@ def extract_with_llm(
                     conf = min(conf, 0.5)
                     date_mismatch = True
             else:
-                # 以原文为准重算：模型自算的 ISO 日期如果与原文对不上，降级可信度
-                derived = normalize_deadline(raw_text, base) or normalize_deadline(
-                    f"{value} {raw_text}", base
-                )
+                iso_value = re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value))
+                if (
+                    allow_past
+                    and iso_value
+                    and not re.search(r"\d{4}\s*[-/年]", raw_text)
+                    and _model_date_matches_text(str(value), raw_text)
+                    and _plausible_model_date(str(value), base)
+                ):
+                    # 原文只写「1月1日」时，按基准年补齐会把追溯生效挪到错误的年份；
+                    # 模型给出的完整日期比这条启发更接近原意，直接采信——但要求原文
+                    # 确实缺年份、模型月日与原文一致、日期合法且年份在窗口内，
+                    # 否则（含相对日期）一律按原文与发布时间重算并降级。
+                    derived = str(value)
+                else:
+                    # 以原文为准重算：模型自算的 ISO 日期如果与原文对不上，降级可信度
+                    derived = normalize_deadline(
+                        raw_text, base, allow_past=allow_past
+                    ) or normalize_deadline(f"{value} {raw_text}", base, allow_past=allow_past)
             if derived is None:
                 LOG.warning("日期字段 %s 无法归一化: %r", name, value)
                 continue
@@ -297,11 +363,12 @@ _DATE_PART = (
 # 区间右端可能只写「日」：中文公告里「11月25日至30日」「9月12日至17日」很常见。
 _DAY_ONLY = r"\d{1,2}\s*日"
 _RANGE_SEP = r"[至到—–~～\-－→]"
+_TIME_PART = r"\d{1,2}[:：]\d{2}"
 
-# 「A 至 B」起止区间：日期后允许跟 HH:MM，政府公告写成「2025年11月25日17:00至2025年12月1日9:00」。
+# 「A 至 B」起止区间：两端日期后都允许跟 HH:MM，政府公告写成「2025年11月25日17:00至2025年12月1日9:00」。
 _RANGE_RE = re.compile(
-    rf"({_DATE_PART})(?:\s*\d{{1,2}}[:：]\d{{2}})?\s*{_RANGE_SEP}\s*"
-    rf"({_DATE_PART}|{_DAY_ONLY})"
+    rf"({_DATE_PART})(?:\s*{_TIME_PART})?\s*{_RANGE_SEP}\s*"
+    rf"({_DATE_PART}|{_DAY_ONLY})(?:\s*{_TIME_PART})?"
 )
 
 # 前缀只收「截止」类语义词：裸的「申报」「受理」多半是区间起点
@@ -313,8 +380,8 @@ _DEADLINE_RANGE_RE = re.compile(
     # 不跨逗号：否则「截止后不再受理，评审时间3月1日至3月5日」会把评审区间
     # 当成截止区间。真实写法「截止时间：4月20日」没有逗号，不受影响。
     + r"[^。；，\n]{0,20}?"
-    + rf"({_DATE_PART})"
-    + rf"\s*{_RANGE_SEP}\s*({_DATE_PART}|{_DAY_ONLY})"
+    + rf"({_DATE_PART})(?:\s*{_TIME_PART})?"
+    + rf"\s*{_RANGE_SEP}\s*({_DATE_PART}|{_DAY_ONLY})(?:\s*{_TIME_PART})?"
 )
 
 # 文本里出现「截止」字样时，全文唯一区间的兜底必须让位给模型判断：
@@ -327,7 +394,8 @@ _DEADLINE_SINGLE_RE = re.compile(
     _DEADLINE_PREFIX
     + r"[^。；，\n]{0,30}?("
     + _DATE_PART
-    + r")(?![0-9年月日])(?!\s*"
+    # 日期后紧跟「HH:MM 至/到」时是区间起点，不能被单日期分支回溯吞掉。
+    + rf")(?!\s*{_TIME_PART}\s*{_RANGE_SEP})(?:\s*{_TIME_PART})?(?![0-9年月日])(?!\s*"
     + _RANGE_SEP
     + r")"
 )
@@ -338,18 +406,50 @@ _APPLICATION_RANGE_RE = re.compile(
     r"(?:网上填报|网络填报|申报|填报|报送|受理|提交)(?:时间|日期|期限)?"
     # 同样不跨逗号：避免把「不再受理，评审时间...」里的「受理」当成申报前缀。
     + r"[^。；，\n]{0,20}?"
-    + rf"({_DATE_PART})(?:\s*\d{{1,2}}[:：]\d{{2}})?\s*{_RANGE_SEP}\s*"
-    + rf"({_DATE_PART}|{_DAY_ONLY})"
+    + rf"({_DATE_PART})(?:\s*{_TIME_PART})?\s*{_RANGE_SEP}\s*"
+    + rf"({_DATE_PART}|{_DAY_ONLY})(?:\s*{_TIME_PART})?"
 )
 
 
-def _resolve_range_end(start_raw: str, end_raw: str, base: dt.date | None) -> str | None:
+def _resolve_range_end(
+    start_raw: str, end_raw: str, base: dt.date | None, *, allow_past: bool = False
+) -> str | None:
     """把「A 至 B」的右端 B 归一化为 ISO 日期；无法确定时返回 None。
 
-    右端有三种写法：完整日期（不依赖 base）、「M月D日」（按 base 年推断）、
-    以及只写「日」的省略形式（借用左端的年月补齐）。
+    右端有三种写法：完整日期（不依赖 base）、「M月D日」（左端有完整年月日时
+    按左端年份推断，否则回退按 base 年推断）、以及只写「日」的省略形式
+    （借用左端的年月补齐）。
     """
-    end = normalize_deadline(end_raw, base)
+    # 区间右端不能早于左端：左端写了完整年月日、右端只写「M月D日」时，
+    # 以左端年份补齐；补出来早于左端就说明跨年，推进一年。
+    # 「2026年12月20日至1月10日」-> 2027-01-10；「2026年1月1日至1月10日」-> 2026-01-10。
+    # 「2023年12月20日至2月29日」-> 2024-02-29（2月29日只在闰年合法，按年份逐个尝试）。
+    # 这一步优先于 normalize_deadline 的“早于发布时间 180 天”启发：后者只认 base，
+    # 会把同年追溯区间误推到次年；past_ok 时又可能把跨年区间压回左端之前。
+    start_match = re.search(
+        r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", start_raw or ""
+    )
+    end_month_day = re.match(r"\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", end_raw or "")
+    if start_match and end_month_day:
+        try:
+            start_date = dt.date(
+                int(start_match.group(1)),
+                int(start_match.group(2)),
+                int(start_match.group(3)),
+            )
+        except ValueError:
+            return None
+        month = int(end_month_day.group(1))
+        day = int(end_month_day.group(2))
+        for year in (start_date.year, start_date.year + 1):
+            try:
+                candidate = dt.date(year, month, day)
+            except ValueError:
+                continue
+            if candidate >= start_date:
+                return candidate.isoformat()
+        return None
+    end = normalize_deadline(end_raw, base, allow_past=allow_past)
     if end is not None:
         return end
     m = re.fullmatch(r"\s*(\d{1,2})\s*日\s*", end_raw or "")
@@ -370,8 +470,8 @@ def _resolve_range_end(start_raw: str, end_raw: str, base: dt.date | None) -> st
         candidate = dt.date(base.year, int(sm.group(1)), day)
     except ValueError:
         return None
-    # 与 normalize_deadline 一致的 180 天跨年启发
-    if candidate < base - dt.timedelta(days=180):
+    # 与 normalize_deadline 一致的 180 天跨年启发（allow_past 时不推进）
+    if not allow_past and candidate < base - dt.timedelta(days=180):
         try:
             candidate = candidate.replace(year=base.year + 1)
         except ValueError:
@@ -438,33 +538,36 @@ def _emit_deadline(
 def extract_with_rules(schema: ExtractSchema, body: str, base: dt.date | None) -> ExtractionResult:
     """Deterministic fallback used when no LLM is configured.
 
-    Only high-precision, pattern-shaped fields are attempted (deadline plus two
-    single-pattern facts). Anything that needs judgement is left out, so a caller
-    can distinguish "the article does not state it" from "nobody looked".
+    Only high-precision, pattern-shaped fields are attempted. The same rules are
+    applied to every category whose schema declares the field: deadline for
+    project/talent/certification/funding, amount for project/talent/funding, and
+    contact for project/talent/funding. Industry policy has no such fields and
+    therefore stays LLM-only.
     """
     result = ExtractionResult(schema_id=schema.schema_id, engine="rules")
-    if schema.schema_id != "project_application":
-        return result
     allowed = {f["name"] for f in schema.fields}
+    if not allowed:
+        return result
     text = body or ""
 
-    range_match = _DEADLINE_RANGE_RE.search(text)
-    if range_match:
-        # 「3月1日至4月20日」取右端：区间结束才是截止
-        deadline = _resolve_range_end(range_match.group(1), range_match.group(2), base)
-        if deadline:
-            _emit_deadline(result, allowed, deadline, range_match.group(0).strip())
-    else:
-        for _, pattern in _RULE_PATTERNS:
-            m = re.search(pattern, text)
-            if not m:
-                continue
-            raw = m.group(0).strip()
-            deadline = normalize_deadline(raw, base)
-            if deadline is None:
-                continue
-            _emit_deadline(result, allowed, deadline, raw)
-            break
+    if "deadline" in allowed:
+        range_match = _DEADLINE_RANGE_RE.search(text)
+        if range_match:
+            # 「3月1日至4月20日」取右端：区间结束才是截止
+            deadline = _resolve_range_end(range_match.group(1), range_match.group(2), base)
+            if deadline:
+                _emit_deadline(result, allowed, deadline, range_match.group(0).strip())
+        else:
+            for _, pattern in _RULE_PATTERNS:
+                m = re.search(pattern, text)
+                if not m:
+                    continue
+                raw = m.group(0).strip()
+                deadline = normalize_deadline(raw, base)
+                if deadline is None:
+                    continue
+                _emit_deadline(result, allowed, deadline, raw)
+                break
 
     m = re.search(
         r"[^。；\n]{0,20}(?:资助|补贴|经费|扶持|支持)[^。；\n]{0,20}?(\d+(?:\.\d+)?\s*万?元)[^。；\n]{0,10}",
@@ -484,7 +587,12 @@ def extract_with_rules(schema: ExtractSchema, body: str, base: dt.date | None) -
     return result
 
 
-def trigger_schemas(schemas: list[ExtractSchema], hits: list[TagHit]) -> list[ExtractSchema]:
+def trigger_schemas(
+    schemas: list[ExtractSchema], hits: list[TagHit], category: str = ""
+) -> list[ExtractSchema]:
+    """按大类路由 schema；没有 category 时保留旧的标签路由（兼容旧调用）。"""
+    if category:
+        return [s for s in schemas if s.category == category]
     tag_ids = {h.tag_id for h in hits}
     return [s for s in schemas if tag_ids & set(s.trigger_tags)]
 
@@ -499,8 +607,9 @@ def extract_article(
     *,
     published_at_utc: str | None,
     published_at: str | None,
+    category: str = "",
 ) -> list[ExtractionResult]:
-    matched = trigger_schemas(schemas, hits)
+    matched = trigger_schemas(schemas, hits, category)
     if not matched:
         return []
     base = _parse_base(published_at_utc, published_at)

@@ -4,7 +4,7 @@
 
 1. **分大类** —— 每篇新闻先归入唯一的一个一级大类（项目申报 / 行业政策 / 人才申报 / 企业资质申报 / 资金补贴 / 其他）；
 2. **打标签** —— 再**只在该大类允许的标签**里做闭集多标签打标，模型不许自己造标签；
-3. **抽关键线索** —— 命中 `project_application` 这类标签后，进入 schema 驱动的事实抽取，例如项目申报的申报主体、材料清单、**截止时间**、资助额度、申报渠道；
+3. **抽关键线索** —— 按文章大类命中对应 schema 后，进入 schema 驱动的事实抽取：项目申报看申报主体/材料/截止时间/资助额度/申报渠道，行业政策看文号/政策类型/施行日期/有效期/主要举措，人才申报、企业资质、资金补贴也各有自己的字段；
 4. **出准备清单** —— 把抽到的事实按申报执行顺序排成可直接照做的清单（确认项目 → 核对资格 → 备材料 → 系统填报 → 截止提交），每条标注原文依据或「流程建议」；
 5. **落库 + 出接口** —— 结果存独立 SQLite，通过 HTTP API 查询，供后续业务系统消费；
 6. **推提醒** —— 新分析出项目申报类公告时写入站内通知，前端铃铛展示未读角标，点开直达详情。
@@ -155,7 +155,7 @@ docker compose run --rm insight python -m app prune --vacuum    # 删除并回�
 | GET | `/v1/industries` | 受控行业词表（10 个 id/中文名/描述/关键词）+ 每个行业的文章数，供前端行业筛选与徽标 |
 | GET | `/v1/recommendations?limit=10` | 首页 Top10 推荐：登录用户按关注领域/收藏/浏览历史、内容质量与文章语义相关性混合打分，匿名用户按内容质量、新鲜度与语义相关性打分；`meta.personalized` 标识是否个性化 |
 | GET | `/v1/todos?limit=5` | 首页近期申报截止：取项目申报抽取结果中未过期的 `deadline`，按剩余天数升序；`meta.total` 为全部未过期项数量 |
-| — | 项目申报 schema 字段类型 | `focus_areas` 是**数组**（专项扶持的行业领域/技术方向，逐项列出），在 `/v1/extractions` 与文章详情里以 JSON 文本返回；`deadline_raw` 是未归一化的原文表述，规范化日期在 `deadline`；`funding_amount` 是字符串，可能带「不超过 500 万元」这类限定语 |
+| — | 五类抽取 schema | `project_application` 10 字段（含数组 `focus_areas`、原文 `deadline_raw`、字符串 `funding_amount`）；`industry_policy` 9 字段（政策名称/文号/类型/施行日期/有效期/适用范围/主要举措/涉及行业）；`talent_application` 11 字段；`enterprise_certification` 12 字段；`funding_subsidy` 12 字段。每个 schema 的 `category` 与大类 id 一一对应，跨类不会串用模板 |
 | GET | `/v1/articles/{article_id}` | 单篇详情：标签 + 抽取结果 |
 | GET | `/v1/articles/{article_id}/checklist` | 申报准备清单（按执行顺序排列，每项带 `basis=excerpt\|suggested` 与 `verified`）；`article_not_found` / `checklist_not_found` 两种 404 分别用业务码 `40401` / `40402` 区分 |
 | POST | `/v1/articles/{article_id}/checklist` | 生成/复用申报清单：body `{"force": false}`；默认幂等复用已有清单，`force=true` 重新生成。文章不存在 404 `40401`；非项目申报或缺少可用要素/正文 409 `40902`；已有分析/清单生成任务持有同一把全局锁时也返回 409，业务码为 `40901` |
@@ -409,21 +409,22 @@ python -m app backfill-bodies --limit 500 --batch 50
 
 ### 加抽取 schema
 
-在 `app/vocab/schemas/` 下加 JSON：
+在 `app/vocab/schemas/` 下加 JSON。当前五类各有一个 schema，`category` 与大类 id 一一对应：
 
 ```json
 {
-  "schema_id": "tender_notice",
-  "name": "招标公告关键线索",
-  "trigger_tags": ["tender"],
+  "schema_id": "industry_policy",
+  "name": "行业政策关键线索",
+  "category": "industry_policy",
+  "trigger_tags": [],
   "fields": [
-    { "name": "tenderer", "type": "string", "description": "招标人" },
-    { "name": "bid_deadline", "type": "date", "description": "投标截止时间" }
+    { "name": "policy_name", "type": "string", "description": "政策名称" },
+    { "name": "document_number", "type": "string", "description": "文号" }
   ]
 }
 ```
 
-`trigger_tags` 就是路由：标签命中它才会跑这个抽取器，避免对无关新闻付 token。
+`category` 是主路由：文章先归入唯一大类，再只跑该类的 schema，不会把项目申报模板套到其他类。`trigger_tags` 仅保留给不传 category 的旧调用；新 schema 建议留空数组。
 
 ## 设计决策
 
@@ -431,7 +432,7 @@ python -m app backfill-bodies --limit 500 --batch 50
 2. **闭集打标，标签外一律丢弃。** 放任模型自造标签，会把 `Artificial Intelligence` 和 `AI` 变成两个标签——这是 [karakeep](https://github.com/karakeep-app/karakeep) issue #111 记录的原始问题，#529 的解法就是「只允许使用用户已建的标签」，并已合入。本项目在 `tagging.py` 里做了同样的守卫（词表外丢弃 + 告警）。标签集合与「标签→schema 路由」借鉴 [autolabel](https://github.com/refuel-ai/autolabel) 的闭集思路。
 3. **打标与抽取分离。** 打标的输出空间是闭合的（必须是词表内 id），抽取的输出空间是固定的（必须是 schema 内字段）；打标漏标只是少一条线索，抽取编造会污染下游。因此两者用的是不同 prompt、不同校验：标签必须 `in` 词表，抽取值必须能在原文定位。
 4. **相对时间以发布时间为基准。** 「自发布之日起30日内」「本月底」如果用抓取时间换算，会随重跑静默漂移。抽取提示词里显式传入 `published_at_utc`（缺失时回退 `published_at`），`normalize_deadline()` 按下这个基准推算。
-5. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关的子串校验，定位不到的值保留但标 `verified=false`，供人工复核，而不是静默采信。模型给出的日期还会用原文重算一遍，与原文对不上就降级可信度；规则引擎（无 LLM 降级）产出的一切恒为 `verified=false`——正则只证明文本出现过，不证明语义正确（「3月1日至4月20日」取左端就是活生生的反例）。
+5. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关的子串校验，定位不到的值保留但标 `verified=false`，供人工复核，而不是静默采信。模型给出的日期还会用原文重算一遍，与原文对不上就降级可信度；例外是生效日期（`effective_date`）：原文只写「1月1日」时按发布年补齐会把它错推到次年，这种情况采信模型给出的完整日期，但要求日期真实存在、模型月日与原文一致且年份与发布日相差不超过一年（原文是「自发布之日起30日内」这类相对日期时一律按发布时间重算）；规则引擎（无 LLM 降级）产出的一切恒为 `verified=false`——正则只证明文本出现过，不证明语义正确（「3月1日至4月20日」取左端就是活生生的反例）。
 6. **结果独立成库。** 见上文对照表。
 7. **清单是派生视图，不是新事实。** 清单项要么引用已抽取的事实（`basis="excerpt"`：原文片段必须能在正文定位，且 `text` 里的日期/金额/电话等事实 token 必须被该片段支持，否则丢弃），要么显式标成 `suggested`（盖章、留存回执这类流程建议，禁止出现任何数字）。规则引擎生成的项沿用抽取行的 `verified` 标记（通常为 `false`），不会冒充已核验事实。它单独存在 `article_checklists`，重新生成不重写标签/抽取表；已分析但缺清单的文章会在下次运行自动补生成。
 8. **单篇失败不拖垮批次，但「没拿到正文」不算成功。** 单篇异常计入 `errors` 并继续，运行统计落到 `runs` 表。详情接口没取到正文的文章只拿标题打标会把「确无截止日」永久定档，所以这类文章**不入库**、计入 `errors`，下次运行自然重试；`save_analysis` 整体在一个事务里，中途失败立即回滚，不会留下「有主行、无标签」的脏状态。

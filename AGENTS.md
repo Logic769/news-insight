@@ -12,7 +12,7 @@
 
 1. **分大类** —— 先单选一个一级分类（项目申报 / 行业政策 / 人才申报 / 企业资质申报 / 资金补贴 / 兜底 `other`），类别定义在 `categories.json`；
 2. **打标签** —— 只能从该类允许的受控标签（闭集多标签）中选择，模型不许自造标签，也拿不到别的类的标签；
-3. **抽关键线索** —— 标签命中 schema 的 `trigger_tags` 后，进入 schema 驱动的事实抽取（例如项目申报的申报主体、材料清单、截止时间、资助额度、申报渠道）；
+3. **抽关键线索** —— 文章归入唯一大类后，按 schema 的 `category` 命中该类专属字段，进入 schema 驱动的事实抽取（项目申报看申报主体/材料/截止时间/资助额度/申报渠道；行业政策看文号/政策类型/施行日期/有效期/主要举措；人才、资质、资金补贴各有独立字段）；
 4. **出准备清单** —— 把抽到的事实按申报执行顺序排成可直接照做的清单（确认项目 → 核对资格 → 备材料 → 系统填报 → 核对经费 → 记下咨询方式 → 截止前提交），每项标注原文依据或「流程建议」；
 5. **落库 + 出接口** —— 结果存独立 SQLite，通过 FastAPI 的 `/v1` 暴露，供后续业务系统消费。
 
@@ -100,7 +100,11 @@ news-insight/
 │       ├── categories.json    # 一级分类词表（6 类：5 大类 + other 兜底）
 │       ├── tags.json          # 受控标签词表（45 个标签，3 个分组）
 │       └── schemas/
-│           └── project_application.json   # 申报关键线索 schema（9 字段）
+│           ├── project_application.json       # 项目申报 schema（10 字段）
+│           ├── industry_policy.json           # 行业政策 schema（9 字段）
+│           ├── talent_application.json        # 人才申报 schema（11 字段）
+│           ├── enterprise_certification.json  # 企业资质 schema（12 字段）
+│           └── funding_subsidy.json           # 资金补贴 schema（12 字段）
 ├── fixtures/articles.json     # demo 模式内置 4 篇新闻
 ├── tests/                     # pytest：test_*.py 共 23 个
 ├── tools/yaml_lint.py         # CI 的 YAML 门禁脚本（拒绝重复映射键；支持多文档；不误杀 << 合并键）
@@ -126,7 +130,7 @@ news-insight/
 | `load_categories()` / `classify_article()` | `app/tagging.py` | 读 `vocab/categories.json`；单选一级分类，LLM 不可用时降级规则引擎，缺文件退回单级打标 |
 | `tags_for_category()` / `tags_for_unclassified()` | `app/tagging.py` | 把二级标签收窄到大类白名单；兜底类只保留 `domain` 组 |
 | `tag_article()` | `app/tagging.py` | 返回 `(hits, engine)`；有 LLM 走模型，失败或无凭证降级规则引擎 |
-| `load_schemas()` / `extract_article()` | `app/extraction.py` | 按 `trigger_tags` 路由 schema；日期归一与原文定位校验 |
+| `load_schemas()` / `extract_article()` | `app/extraction.py` | 按 `category` 路由 schema（旧调用可用 `trigger_tags`）；日期归一与原文定位校验 |
 | `build_checklist()` | `app/checklist.py` | 由已抽取事实生成准备清单；LLM 失败降级规则引擎 |
 | `checklist_input_from_detail()` / `build_for_input()` | `app/checklist_service.py` | 从文章详情构造清单输入（要求项目申报标签、抽取块与正文）；API 与 pipeline 共用的生成入口 |
 | `analyze_batch()` | `app/pipeline.py` | 单批次全流程编排，返回本次统计 |
@@ -178,7 +182,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 
 ### 并发与写入模型（关键）
 
-1. **文章级并发，篇内串行**：`ANALYZE_CONCURRENCY`（默认 100，上限 200）控制同时在途的文章数；每篇文章内部依次「受控行业 → 语义相关性 → 分大类 → 类内打标 → 每个命中 schema 各一次抽取 →（命中申报时）清单」；当前只有 1 个 schema，因此最多 6 次 LLM 调用（归到 `other` 时是行业、语义评分、分类 3 次），**不合并、不省略**——质量优先。
+1. **文章级并发，篇内串行**：`ANALYZE_CONCURRENCY`（默认 100，上限 200）控制同时在途的文章数；每篇文章内部依次「受控行业 → 语义相关性 → 分大类 → 类内打标 → 按该大类 schema 抽取 →（命中申报时）清单」；当前五类各 1 个 schema，每篇固定只跑所属大类的那一个，因此仍最多 6 次 LLM 调用（归到 `other` 时是行业、语义评分、分类 3 次），**不合并、不省略**——质量优先。
 2. **worker 不碰 SQLite**：`_analyze_one()` 只做网络与计算，返回 `_AnalysisResult`；所有写库由主线程 `_persist_result()` 完成。SQLite 只有一个写者，这是避免 `database is locked` 的核心约定，改并发相关代码时不得破坏。
 3. **批量提交**：`ANALYZE_WRITE_BATCH`（默认 50）篇提交一次；`save_analysis(commit=False)` 在没有外层事务时会显式 `BEGIN`，否则 SAVEPOINT 的 RELEASE 会立即提交、批量提交退化为逐篇提交。
 4. **单篇失败隔离**：入库用 SAVEPOINT，一篇失败只回滚该篇并计入 `errors`，批次继续；批次级异常会 rollback 并写 `runs.finished_at`，不留永久「运行中」的孤儿行。
@@ -259,7 +263,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 
 ### 6.0 一级分类 `app/vocab/categories.json`
 
-`project_application` 抽取 schema 的 9 个字段里有三个字段类型容易被误读：`deadline_raw` 是原文表述（不规范日期）、`focus_areas` 是**数组**（专项扶持的行业领域/技术方向，逐项列出）、`funding_amount` 是字符串（含「不超过 500 万元」这类限定语，不转数字）。数组字段在 `/v1/extractions` 里按 JSON 文本返回，消费方需要自行解析。
+五类抽取 schema 的 `category` 与大类 id 一一对应：`project_application`（10 字段）、`industry_policy`（9 字段）、`talent_application`（11 字段）、`enterprise_certification`（12 字段）、`funding_subsidy`（12 字段）。`project_application` 里三个字段类型容易被误读：`deadline_raw` 是原文表述（不规范日期）、`focus_areas` 是**数组**（专项扶持的行业领域/技术方向，逐项列出）、`funding_amount` 是字符串（含「不超过 500 万元」这类限定语，不转数字）。数组字段在 `/v1/extractions` 里按 JSON 文本返回，消费方需要自行解析。
 
 六个大类（**单选**）：`project_application` 项目申报、`industry_policy` 行业政策、`talent_application` 人才申报、`enterprise_certification` 企业资质申报、`funding_subsidy` 资金补贴、`other` 兜底。
 
@@ -278,7 +282,7 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 
 `group` 的两层含义：`domain` 是行业维度（金融/科技/农业…），`event`/`policy` 是业务维度（申报/补贴/资质…）。归到 `other` 的文章只保留 `domain` 组，业务标签必须由大类白名单授权。
 
-- `id` 是唯一契约：落库、`/v1/articles?tag=` 过滤、schema 的 `trigger_tags` 都用它，**改名不要改 id**；
+- `id` 是唯一契约：落库、`/v1/articles?tag=` 过滤都用它，**改名不要改 id**；schema 的 `category` 用大类 id，不再依赖标签触发；
 - `keywords` 只在无 LLM 的规则降级时使用；模型看到的是 `id + name + group + keywords` 的完整描述；
 - 几十个标签全部塞进单次 prompt 完全放得下，不需要两阶段召回；词表涨到几百条再考虑粗筛候选；
 - 闭集守卫在 `tagging.py`：模型返回的 `id` 不在词表内直接丢弃并 `LOG.warning`，绝不入库。
@@ -287,19 +291,21 @@ GET /v1/articles、/v1/articles/{id}、/v1/articles/{id}/checklist、/v1/extract
 
 ```json
 {
-  "schema_id": "tender_notice",
-  "name": "招标公告关键线索",
-  "trigger_tags": ["tender"],
+  "schema_id": "industry_policy",
+  "name": "行业政策关键线索",
+  "category": "industry_policy",
+  "trigger_tags": [],
   "fields": [
-    { "name": "tenderer", "type": "string", "description": "招标人" },
-    { "name": "bid_deadline", "type": "date", "description": "投标截止时间" }
+    { "name": "policy_name", "type": "string", "description": "政策名称" },
+    { "name": "document_number", "type": "string", "description": "文号" }
   ]
 }
 ```
 
-- `trigger_tags` 就是路由：标签命中它才会跑这个抽取器，避免对无关新闻付 token；
+- `category` 是主路由：文章先归入唯一大类，再只跑该类的 schema，避免把项目申报模板套到其他类；`trigger_tags` 只保留给不传 category 的旧调用，新 schema 建议留空；
 - 字段 `type` 目前支持 `string` / `date` / `array`（`materials` 这类清单字段输出字符串数组）；
-- `deadline` 的日期归一与区间取右端逻辑在 `extraction.py`，schema 描述里写的「原文为起止区间时取区间结束日期」是行为约定，改代码要同步改描述。
+- `date` 字段默认按截止日期语义归一：原文是「A 至 B」区间时取右端，早于发布日 180 天以上视为跨年并推进一年。例外是生效日期类字段（字段名 `effective_date`，或 schema 里显式写 `"past_ok": true`）：它们允许早于发布日，不推进年份；原文没写年份（「自1月1日起施行」）时采信模型给出的完整日期，但要求它是合法日历日期、模型月日与原文一致且年份与发布日相差不超过一年；原文是相对日期（「自发布之日起30日内」等没有月日可对齐）时一律按发布时间重算，否则退回按原文重算并降级可信度。新增同类字段必须显式加 `past_ok`，否则会自动继承截止日期的跨年启发（`past_ok` 只关闭单日期与「日」省略形式的过去日期保护，区间右端仍按左端年份补齐）；
+- `deadline` 的日期归一与区间取右端逻辑在 `extraction.py`：左端写了完整年月日、右端只写「M月D日」时，右端年份按左端补齐（补出来早于左端就推进一年，`past_ok` 也不例外），不套用基于发布日的 180 天启发；左端没有完整日期时才回退到按发布日推断。schema 描述里写的「原文为起止区间时取区间结束日期」是行为约定，改代码要同步改描述。
 
 ### 6.3 加分类 / 加标签 / 加 schema 的标准流程
 
@@ -491,7 +497,7 @@ docker compose run --rm insight python -m app prune --vacuum
 
 ## 10. 测试策略
 
-### 10.1 现有测试资产（`tests/`，23 个文件）
+### 10.1 现有测试资产（`tests/`，26 个文件）
 
 | 文件 | 覆盖 |
 | --- | --- |
@@ -501,7 +507,8 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_notifications.py` | 项目申报公告生成通知、未读/单条已读/全部已读、`--force` 重分析不重复通知、404 |
 | `test_categories.py` | 分类词表自洽（末位 other、other.tags 为空、引用标签都存在、新增业务标签必须被某类引用）、词表外大类回落兜底且 conf=0、非 dict payload 回落、置信度夹取、并列按声明顺序、缺 `categories.json` 退回单级、类内打标白名单交集、兜底类只留 `domain` 组、分类 UPSERT 保留式写入、降级重跑保留分类但标签退回全词表、老库迁移补列与索引幂等、规则引擎用原始分比较（高分先命中不被低分翻盘）、词表缺兜底类时告警 |
 | `test_tagging.py` | 词表外标签丢弃、去重、max_tags 截断、规则引擎多标签 |
-| `test_extraction_rules.py` | 日期区间取右端、裸开始日期不当截止、中文两位数、闰日、规则引擎不标 verified |
+| `test_extraction_rules.py` | 日期区间取右端、裸开始日期不当截止、带 HH:MM 的截止日期取结束日、中文两位数、闰日、规则引擎不标 verified |
+| `test_extraction_categories.py` | 五类 schema 与 category 一一对应且字段非空；category 精确路由不被共享 tag 串类；无 category 保留旧标签路由；行业政策规则不造 deadline；人才规则抽截止/金额/联系方式 |
 | `test_extraction_llm_range.py` | 13 个区间用例：右端仅「日」、跨年、多区间取最后、截止前缀优先、电话/时钟不误判、跨逗号不误取评审区间 |
 | `test_deadline.py` | 绝对日期、相对发布日期、无基准不猜测、月日跨年、月底、未知文本 |
 | `test_checklist.py` | 规则顺序、缺字段跳过、verified 传递、列表扁平化、上限保留截止项、LLM 丢弃不可定位/编造事实/过短依据、数字子序列误判、引擎降级、缺清单补生成、JSON 损坏 |
@@ -518,7 +525,7 @@ docker compose run --rm insight python -m app prune --vacuum
 | `test_relevance.py` | 文章级语义相关性：规则分有界且项目申报类高于 other、LLM 独立一次调用并按 `relevance_body_chars` 截断正文、LLMError 降级规则、`_parse_llm_score` 的 0–100 映射/布尔拒绝/原因截断 |
 | `test_backfill_relevance.py` | `backfill-relevance`：已有分不覆盖、缺失分补规则引擎、`remaining` 归零、二次运行 scanned=0、负数 limit 拒绝 |
 
-基线：宿主机全量 `pytest` **355 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
+基线：宿主机全量 `pytest` **364 passed, 1 warning**（StarletteDeprecationWarning）；只挂 `tests/`（不挂 `tools/`）时相应减少。
 
 **宿主机跑 pytest 前必须清代理变量**：本机 `NO_PROXY` 形如 `localhost,...,[::1]` 会被 httpx 当成 mounts 模式解析，在 `httpx.Client` 构造处抛 `InvalidURL: invalid literal for int() with base 10: ':1]'`，表现为 19 个与代码无关的失败。`$env:X=''` 清不掉（PowerShell 空串赋值等于删除，子进程仍继承），要显式删除：
 
@@ -569,7 +576,7 @@ docker compose up -d --force-recreate && curl -f http://127.0.0.1:8020/health
 2. **闭集打标，标签外一律丢弃。** 放任模型自造标签，会把 `Artificial Intelligence` 和 `AI` 变成两个标签——这是 [karakeep](https://github.com/karakeep-app/karakeep) issue #111 记录的原始问题，#529 的解法是「只允许使用用户已建的标签」。本项目在 `tagging.py` 做了同样的守卫。标签集合与「标签→schema 路由」借鉴 [autolabel](https://github.com/refuel-ai/autolabel) 的闭集思路。
 3. **打标与抽取分离。** 打标输出空间闭合（必须 `in` 词表），抽取输出空间固定（必须 schema 内字段）；打标漏标只是少一条线索，抽取编造会污染下游。因此两者不同 prompt、不同校验。
 4. **相对时间以发布时间为基准。** 「自发布之日起30日内」「本月底」若用抓取时间换算会随重跑漂移；抽取提示词显式传入 `published_at_utc`（缺失回退 `published_at`），`normalize_deadline()` 按此推算。
-5. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关子串校验；定位不到保留但标 `verified=false`，供人工复核。模型给出的日期用原文重算，对不上就降级。规则引擎产出恒为 `verified=false` —— 正则只证明文本出现过，不证明语义正确（例如「报名时间3月1日至3月20日，评审时间4月1日至4月10日」里哪个才是截止，只有语义能判断）。
+5. **缺失字段返回 null，值要能在原文定位。** `_locate()` 做空白无关子串校验；定位不到保留但标 `verified=false`，供人工复核。模型给出的日期用原文重算，对不上就降级；生效日期是例外——原文没写年份时按发布年补齐会把它错推到次年，所以采信模型给出的完整日期，但先校验日历合法性、模型月日与原文一致与年份窗口（离发布日不超过一年）；相对日期（无月日可对齐）一律按发布时间重算，编错年份或月日的幻觉值仍走重算降级。规则引擎产出恒为 `verified=false` —— 正则只证明文本出现过，不证明语义正确（例如「报名时间3月1日至3月20日，评审时间4月1日至4月10日」里哪个才是截止，只有语义能判断）。
 6. **结果独立成库。** 见 §1 对照表：SQLite 单写 + 许可证隔离 + 失败隔离。
 7. **清单是派生视图，不是新事实。** 清单项要么引用已抽取事实（`basis="excerpt"`：原文片段必须能在正文定位，且 `text` 里的日期/金额/电话等事实 token 必须被该片段支持），要么显式标 `suggested`（盖章、留存回执这类流程建议，禁止出现任何数字）。规则生成的项沿用抽取行的 `verified`，不冒充已核验事实。清单单独存 `article_checklists`，重新生成不重写标签/抽取表。
 8. **单篇失败不拖垮批次，但「没拿到正文」不算成功。** 见 §4 并发模型的第 4、5 条。
@@ -633,7 +640,7 @@ docker compose up -d --force-recreate && curl -f http://127.0.0.1:8020/health
 - `tags_for_category(categories, tags, category_id) -> list[TagDef]`：该类白名单与全量词表的交集，空列表表示该类不打二级标签；
 - `tags_for_unclassified(tags) -> list[TagDef]`：兜底类专用，只保留 `OTHER_RULE_GROUPS = {"domain"}` 的行业标签；
 - `tag_article(settings, llm, tags, title, body) -> tuple[list[TagHit], str]`：engine 为 `llm` 或 `rules`；**传入的 `tags` 必须是已按大类收窄的范围**，不要把全量词表直接传进来；
-- `extract_article(settings, llm, schemas, hits, title, body, *, published_at_utc: str | None, published_at: str | None) -> list[ExtractionResult]`：未命中 `trigger_tags` 返回空列表；
+- `extract_article(settings, llm, schemas, hits, title, body, *, published_at_utc: str | None, published_at: str | None, category: str = "") -> list[ExtractionResult]`：category 非空时只跑该大类的 schema，不跨类套模板；category 为空时退回旧的 `trigger_tags` 路由；
 - `build_checklist(llm, title, body, fields, *, raw_texts=None, verified=None, body_chars=6000) -> ChecklistResult`；
 - `analyze_batch(settings, *, limit: int, force: bool = False, concurrency: int | None = None) -> dict`：返回 `{run_id, mode, scanned, analyzed, skipped, errors, tag_engines, llm_enabled}`；批次开始时读一次 `load_categories()`，整个批次共用同一份分类词表；
 - `db.save_analysis(..., commit: bool = True)` / `db.save_checklist(..., commit: bool = True)`：`commit=False` 由调用方统一提交，且必须处于同一事务；

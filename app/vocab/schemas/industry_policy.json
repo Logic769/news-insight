@@ -1,0 +1,54 @@
+{
+  "schema_id": "industry_policy",
+  "name": "行业政策关键信息",
+  "description": "从产业规划、实施意见、管理办法、标准规范等政策文件中抽取政策要点。原文没有的字段必须返回 null，禁止推测。",
+  "category": "industry_policy",
+  "trigger_tags": [],
+  "fields": [
+    {
+      "name": "policy_name",
+      "type": "string",
+      "description": "政策文件、规划、实施意见或管理办法的正式名称"
+    },
+    {
+      "name": "issuing_authority",
+      "type": "string",
+      "description": "发布机关或联合发文单位"
+    },
+    {
+      "name": "document_number",
+      "type": "string",
+      "description": "政策文号，如“国办发〔2026〕1号”；原文没有则 null"
+    },
+    {
+      "name": "policy_type",
+      "type": "string",
+      "description": "政策类型，如实施意见、管理办法、行动计划、规划、标准规范、试点方案"
+    },
+    {
+      "name": "effective_date",
+      "type": "date",
+      "description": "施行或生效日期，归一化为 YYYY-MM-DD；没有明确日期则 null"
+    },
+    {
+      "name": "validity_period",
+      "type": "string",
+      "description": "有效期或执行期限的原文表述，如“自2026年1月1日起施行，有效期5年”"
+    },
+    {
+      "name": "applicable_scope",
+      "type": "string",
+      "description": "适用的地区、行业、主体或情形"
+    },
+    {
+      "name": "key_measures",
+      "type": "array",
+      "description": "政策提出的主要举措、重点任务或支持措施，逐项列出"
+    },
+    {
+      "name": "target_industries",
+      "type": "array",
+      "description": "政策明确支持或涉及的行业领域、技术方向，逐项列出"
+    }
+  ]
+}

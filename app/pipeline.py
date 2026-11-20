@@ -146,6 +146,7 @@ def _analyze_one(
             art.body,
             published_at_utc=art.published_at_utc,
             published_at=art.published_at,
+            category=result.category,
         )
         result.results = results
         app_result = next(
