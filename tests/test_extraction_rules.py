@@ -210,12 +210,11 @@ def test_deadline_still_rolls_over_to_next_year():
 
 
 def test_deadline_llm_still_rolls_over_without_explicit_year():
-    """原文只写「截止1月10日」时截止日仍须推进到次年，防止 allow_past 误伤 deadline。"""
-    # 注意别写「截止1月10日」：_pick_range 会把这类带截止语义的单日期当成
-    # 起止同一的区间，走右端分支、绕过 allow_past，就测不出误伤了。
-    # 模型也给不出年份（非 ISO 值）时才真正走 normalize_deadline 的跨年分支：
-    # 若给完整 ISO，allow_past 的「采信模型日期」分支会把它接住，测不出误伤。
-    # 也别写「截止1月10日」：_pick_range 会把带截止语义的单日期当区间、走右端分支。
+    """原文只写「1月10日」时截止日仍须推进到次年，防止 allow_past 误伤 deadline。"""
+    # 这里刻意不用「截止1月10日」：_pick_range 会把带截止语义的单日期当成起止
+    # 同一的区间、走右端分支，由下面 test_deadline_single_date_still_rolls_over_
+    # without_past_ok 单独覆盖。模型值用非 ISO（「1月10日」）才真正走
+    # normalize_deadline 的跨年分支。
     raw = "1月10日"
     body = "请于" + raw + "前提交材料。"
     result = extract_with_llm(
@@ -290,3 +289,21 @@ def test_past_ok_deadline_single_date_keeps_past_year():
     )
     field = {f.name: f for f in result.fields}["deadline"]
     assert field.value == "2026-01-10"
+
+
+def test_deadline_single_date_still_rolls_over_without_past_ok():
+    """未声明 past_ok 时，带「截止」的单日期仍按截止语义推进到次年。"""
+    raw = "截止1月10日"
+    body = "请于" + raw + "前提交材料。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2027-01-10"
+    assert field.confidence <= 0.5
+    assert field.verified is False
