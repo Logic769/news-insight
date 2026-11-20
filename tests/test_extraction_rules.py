@@ -307,3 +307,38 @@ def test_deadline_single_date_still_rolls_over_without_past_ok():
     assert field.value == "2027-01-10"
     assert field.confidence <= 0.5
     assert field.verified is False
+
+
+def test_range_end_never_precedes_start_date_with_past_ok():
+    """past_ok 只允许右端早于发布时间，不允许右端早于区间左端。"""
+    raw = "截止时间：2026年12月20日至1月10日"
+    body = raw + "，逾期不予受理。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _past_ok_schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2027-01-10"
+    assert field.confidence <= 0.5
+    assert field.verified is False
+
+
+def test_range_end_keeps_retroactive_same_year_interval():
+    """「2026年1月1日至1月10日」这类同年区间不能被 180 天启发推到次年。"""
+    raw = "截止时间：2026年1月1日至1月10日"
+    body = raw + "，逾期不予受理。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2026-01-10"
+    assert field.verified is True
