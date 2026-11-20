@@ -148,6 +148,22 @@ def _plausible_model_date(value: str, base: dt.date | None) -> bool:
     return base is None or abs(parsed.year - base.year) <= _MODEL_DATE_YEAR_WINDOW
 
 
+def _model_date_matches_text(value: str, raw_text: str) -> bool:
+    """模型给出的 ISO 日期是否是原文「M月D日」按年份的等价写法。
+
+    只有原文确实是缺年份的月日表达、且模型给出的月日与原文一致时才成立；
+    相对日期（「自发布之日起30日内」）没有月日可对齐，必须按发布时间重算。
+    """
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", raw_text or "")
+    if not m:
+        return False
+    try:
+        parsed = dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return (parsed.month, parsed.day) == (int(m.group(1)), int(m.group(2)))
+
+
 def normalize_deadline(
     raw_text: str, base: dt.date | None, *, allow_past: bool = False
 ) -> str | None:
@@ -265,13 +281,20 @@ def extract_with_llm(
             # 几乎总是「开始至结束」，而 LLM 习惯把起点当成截止日。
             # 只对 deadline（或 schema 显式标了 range_end 的字段）生效：评审时间
             # 这类字段的起点反而更有意义。
+            # 生效日期与截止日期的年份语义不同：前者允许早于发布日（追溯生效），
+            # 不能套用截止日期的跨年推进。字段名之外，schema 也可用 past_ok 显式声明。
+            # 必须在区间解析之前确定：声明 past_ok 的 deadline 单日期（「截止1月10日」
+            # 会被 _pick_range 当成起止同一的区间）同样不该被推进到次年。
+            allow_past = name == "effective_date" or bool(spec.get("past_ok"))
             range_parts = (
                 _pick_range(raw_text)
                 if name == "deadline" or spec.get("range_end")
                 else None
             )
             end_value = (
-                _resolve_range_end(range_parts[0], range_parts[1], base)
+                _resolve_range_end(
+                    range_parts[0], range_parts[1], base, allow_past=allow_past
+                )
                 if range_parts
                 else None
             )
@@ -288,19 +311,18 @@ def extract_with_llm(
                     conf = min(conf, 0.5)
                     date_mismatch = True
             else:
-                # 生效日期与截止日期的年份语义不同：前者允许早于发布日（追溯生效），
-                # 不能套用截止日期的跨年推进。字段名之外，schema 也可用 past_ok 显式声明。
-                allow_past = name == "effective_date" or bool(spec.get("past_ok"))
                 iso_value = re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value))
                 if (
                     allow_past
                     and iso_value
                     and not re.search(r"\d{4}\s*[-/年]", raw_text)
+                    and _model_date_matches_text(str(value), raw_text)
                     and _plausible_model_date(str(value), base)
                 ):
                     # 原文只写「1月1日」时，按基准年补齐会把追溯生效挪到错误的年份；
-                    # 模型给出的完整日期比这条启发更接近原意，直接采信——但先过日历
-                    # 合法性与年份窗口，编错年份的幻觉值走下面的重算降级。
+                    # 模型给出的完整日期比这条启发更接近原意，直接采信——但要求原文
+                    # 确实缺年份、模型月日与原文一致、日期合法且年份在窗口内，
+                    # 否则（含相对日期）一律按原文与发布时间重算并降级。
                     derived = str(value)
                 else:
                     # 以原文为准重算：模型自算的 ISO 日期如果与原文对不上，降级可信度
@@ -389,13 +411,15 @@ _APPLICATION_RANGE_RE = re.compile(
 )
 
 
-def _resolve_range_end(start_raw: str, end_raw: str, base: dt.date | None) -> str | None:
+def _resolve_range_end(
+    start_raw: str, end_raw: str, base: dt.date | None, *, allow_past: bool = False
+) -> str | None:
     """把「A 至 B」的右端 B 归一化为 ISO 日期；无法确定时返回 None。
 
     右端有三种写法：完整日期（不依赖 base）、「M月D日」（按 base 年推断）、
     以及只写「日」的省略形式（借用左端的年月补齐）。
     """
-    end = normalize_deadline(end_raw, base)
+    end = normalize_deadline(end_raw, base, allow_past=allow_past)
     if end is not None:
         return end
     m = re.fullmatch(r"\s*(\d{1,2})\s*日\s*", end_raw or "")
@@ -416,8 +440,8 @@ def _resolve_range_end(start_raw: str, end_raw: str, base: dt.date | None) -> st
         candidate = dt.date(base.year, int(sm.group(1)), day)
     except ValueError:
         return None
-    # 与 normalize_deadline 一致的 180 天跨年启发
-    if candidate < base - dt.timedelta(days=180):
+    # 与 normalize_deadline 一致的 180 天跨年启发（allow_past 时不推进）
+    if not allow_past and candidate < base - dt.timedelta(days=180):
         try:
             candidate = candidate.replace(year=base.year + 1)
         except ValueError:

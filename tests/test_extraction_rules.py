@@ -242,3 +242,51 @@ def test_effective_date_without_model_iso_uses_base_year():
     """模型没给完整日期时按基准年补齐，同样不做跨年推进。"""
     field = _policy_field("1月1日", "自1月1日起施行")
     assert field.value == "2026-01-01"
+
+
+def test_effective_date_relative_phrase_uses_publish_base():
+    """「自发布之日起30日内」没有月日可对齐，必须按发布时间重算，不能采信模型 ISO。"""
+    field = _policy_field("2026-12-31", "自发布之日起30日内")
+    assert field.value == "2026-10-01"
+    assert field.confidence <= 0.4
+    assert field.verified is False
+
+
+def test_effective_date_rejects_month_day_mismatch():
+    """模型给 2026-03-15 而原文只写「1月1日」：月日对不上，不能采信模型补齐的年份。"""
+    field = _policy_field("2026-03-15", "自1月1日起施行")
+    assert field.value == "2026-01-01"
+    assert field.confidence <= 0.4
+    assert field.verified is False
+
+
+def _past_ok_schema() -> ExtractSchema:
+    return ExtractSchema(
+        schema_id="past_ok_probe",
+        name="带 past_ok 的截止字段",
+        trigger_tags=(),
+        fields=(
+            {
+                "name": "deadline",
+                "type": "date",
+                "description": "截止日期",
+                "past_ok": True,
+            },
+        ),
+    )
+
+
+def test_past_ok_deadline_single_date_keeps_past_year():
+    """声明 past_ok 的 deadline 单日期不能走区间路径被推进到次年。"""
+    raw = "截止1月10日"
+    body = "请于" + raw + "前提交材料。"
+    result = extract_with_llm(
+        _llm_answering("deadline", "2026-01-10", raw),
+        _past_ok_schema(),
+        "申报通知",
+        body,
+        base=dt.date(2026, 12, 20),
+        body_chars=1000,
+    )
+    field = {f.name: f for f in result.fields}["deadline"]
+    assert field.value == "2026-01-10"
