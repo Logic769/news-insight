@@ -130,8 +130,32 @@ def _cn_to_int(token: str) -> int | None:
     return _CN_NUM.get(token)
 
 
-def normalize_deadline(raw_text: str, base: dt.date | None) -> str | None:
-    """Best-effort normalization of a Chinese deadline phrase to YYYY-MM-DD."""
+# 采信模型 ISO 日期的年份容差：生效日期通常与发布年相差不超过一年（当年或次年施行），
+# 超出这个范围的多半是模型编错年份。
+_MODEL_DATE_YEAR_WINDOW = 1
+
+
+def _plausible_model_date(value: str, base: dt.date | None) -> bool:
+    """模型给出的完整日期能否用于「原文没写年份」的采信分支。
+
+    该分支绕过了「按原文重算」，至少要保证日期真实存在（2026-02-30 不是日期）、
+    且年份离基准日不远；否则退回按原文重算并降级，避免把模型幻觉当成高置信事实。
+    """
+    try:
+        parsed = dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return base is None or abs(parsed.year - base.year) <= _MODEL_DATE_YEAR_WINDOW
+
+
+def normalize_deadline(
+    raw_text: str, base: dt.date | None, *, allow_past: bool = False
+) -> str | None:
+    """Best-effort normalization of a Chinese date phrase to YYYY-MM-DD.
+
+    ``allow_past`` 用于生效日期这类可以早于发布日的字段：它们不能套用
+    截止日期的「早于基准 180 天即视为跨年」启发。
+    """
     text = (raw_text or "").strip()
     if not text:
         return None
@@ -156,8 +180,9 @@ def normalize_deadline(raw_text: str, base: dt.date | None) -> str | None:
             candidate = dt.date(base.year, int(m.group(1)), int(m.group(2)))
         except ValueError:
             return None
-        # 12月发布却写 1月截止 -> 跨年
-        if candidate < base - dt.timedelta(days=180):
+        # 12月发布却写 1月截止 -> 跨年。生效日期可以追溯（政策 9 月发布、
+        # 原文「自1月1日起施行」指的是当年 1 月 1 日），不做这条推进。
+        if not allow_past and candidate < base - dt.timedelta(days=180):
             try:
                 candidate = candidate.replace(year=base.year + 1)
             except ValueError:  # 2月29日跨到非闰年
@@ -263,10 +288,25 @@ def extract_with_llm(
                     conf = min(conf, 0.5)
                     date_mismatch = True
             else:
-                # 以原文为准重算：模型自算的 ISO 日期如果与原文对不上，降级可信度
-                derived = normalize_deadline(raw_text, base) or normalize_deadline(
-                    f"{value} {raw_text}", base
-                )
+                # 生效日期与截止日期的年份语义不同：前者允许早于发布日（追溯生效），
+                # 不能套用截止日期的跨年推进。字段名之外，schema 也可用 past_ok 显式声明。
+                allow_past = name == "effective_date" or bool(spec.get("past_ok"))
+                iso_value = re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value))
+                if (
+                    allow_past
+                    and iso_value
+                    and not re.search(r"\d{4}\s*[-/年]", raw_text)
+                    and _plausible_model_date(str(value), base)
+                ):
+                    # 原文只写「1月1日」时，按基准年补齐会把追溯生效挪到错误的年份；
+                    # 模型给出的完整日期比这条启发更接近原意，直接采信——但先过日历
+                    # 合法性与年份窗口，编错年份的幻觉值走下面的重算降级。
+                    derived = str(value)
+                else:
+                    # 以原文为准重算：模型自算的 ISO 日期如果与原文对不上，降级可信度
+                    derived = normalize_deadline(
+                        raw_text, base, allow_past=allow_past
+                    ) or normalize_deadline(f"{value} {raw_text}", base, allow_past=allow_past)
             if derived is None:
                 LOG.warning("日期字段 %s 无法归一化: %r", name, value)
                 continue
